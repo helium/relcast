@@ -79,7 +79,7 @@ start(ActorID, ActorIDs, Module, Arguments) ->
 
 deliver(Message, FromActorID, State = #state{module=Module, key_count=KeyCount, modulestate=ModuleState, db=DB, bitfieldsize=BitfieldSize}) ->
     Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
-    ok = rocksdb:put(DB, Key, <<1:1/bits, FromActorID:BitfieldSize/integer, Message/binary>>, [{sync, true}]),
+    ok = rocksdb:put(DB, Key, <<1:1/integer, FromActorID:BitfieldSize/integer, Message/binary>>, [{sync, true}]),
     case Module:handle_message(Message, FromActorID, ModuleState) of
         defer ->
             %% leave the message queued but we can ACK it
@@ -106,9 +106,9 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB}) ->
     case maps:get(ForActorID, State#state.pending_acks, undefined) of
         {Ref, Key} ->
             case rocksdb:get(DB, Key, []) of
-                {ok, <<1:1/bits, ForActorID:15/integer, Value/binary>>} ->
+                {ok, <<1:1/integer, ForActorID:15/integer, Value/binary>>} ->
                     {ok, Ref, Value, State};
-                {ok, <<0:1/bits, _:(BitfieldSize)/integer, Value/binary>>} ->
+                {ok, <<0:1/integer, _:(BitfieldSize)/integer, Value/binary>>} ->
                     {ok, Ref, Value, State};
                 not_found ->
                     %% something strange is happening, try again
@@ -130,16 +130,16 @@ ack(FromActorID, Ref, State = #state{bitfieldsize=BitfieldSize, db=DB}) ->
     case maps:get(FromActorID, State#state.pending_acks, undefined) of
         {Ref, Key} ->
             case rocksdb:get(DB, Key, []) of
-                {ok, <<1:1/bits, ForActorID:15/integer, Value/binary>>} ->
+                {ok, <<1:1/integer, FromActorID:15/integer, _Value/binary>>} ->
                     %% unicast message, fine to delete now
                     ok = rocksdb:delete(DB, Key, [{sync, true}]);
-                {ok, <<0:1/bits, SentTo:(BitfieldSize)/integer, Value/binary>>} ->
+                {ok, <<0:1/integer, SentTo:(BitfieldSize)/integer, _Value/binary>>} ->
                     %% multicast message, see if all the bits have gone 0
                     case SentTo bxor (1 bsl (State#state.bitfieldsize - FromActorID)) of
                         0 ->
                             %% time to delete
                             ok = rocksdb:delete(DB, Key, [{sync, true}]);
-                        Remaining ->
+                        _Remaining ->
                             %% flip the bit for this actor
                             ActorIDStr = io_lib:format("+~b", [FromActorID+1]),
                             ok = rocksdb:merge(DB, <<"bitmap">>, list_to_binary(ActorIDStr), [{sync, true}])
@@ -164,12 +164,12 @@ handle_actions([], _Batch, State) ->
     {ok, State};
 handle_actions([{multicast, Message}|Tail], Batch, State = #state{key_count=KeyCount, bitfieldsize=BitfieldSize}) ->
     Bitfield = make_bitfield(BitfieldSize),
-    rocksdb:batch_put(Batch, make_outbound_key(KeyCount), <<0:1/bits, Bitfield:BitfieldSize/bits, Message/binary>>),
+    rocksdb:batch_put(Batch, make_outbound_key(KeyCount), <<0:1/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
     handle_actions(Tail, Batch, State#state{key_count=KeyCount+1});
 handle_actions([{unicast, ToActorID, Message}|Tail], Batch, State = #state{key_count=KeyCount}) ->
-    rocksdb:batch_put(Batch, make_outbound_key(KeyCount), <<1:1/bits, ToActorID:15/integer, Message/binary>>),
+    rocksdb:batch_put(Batch, make_outbound_key(KeyCount), <<1:1/integer, ToActorID:15/integer, Message/binary>>),
     handle_actions(Tail, Batch, State#state{key_count=KeyCount+1});
-handle_actions([{stop, Timeout}|Tail], _Batch, State) ->
+handle_actions([{stop, Timeout}|_Tail], _Batch, State) ->
     {stop, Timeout, State}.
 
 make_bitfield(BitfieldSize) ->
@@ -212,11 +212,11 @@ find_next_outbound(ActorID, StartKey, DB, ActorCount) ->
 find_next_outbound_(_ActorId, {error, _}, Iter, _ActorCount) ->
     rocksdb:iterator_close(Iter),
     not_found;
-find_next_outbound_(ActorID, {ok, Key, <<1:1/bits, ActorID:15/integer, Value/binary>>}, Iter, _ActorCount) ->
+find_next_outbound_(ActorID, {ok, Key, <<1:1/integer, ActorID:15/integer, Value/binary>>}, Iter, _ActorCount) ->
     %% unicast message for this actor
     rocksdb:iterator_close(Iter),
     {Key, Value};
-find_next_outbound_(ActorID, {ok, Key, <<1:1/bits, Tail/binary>>}, Iter, ActorCount) ->
+find_next_outbound_(ActorID, {ok, Key, <<1:1/integer, Tail/binary>>}, Iter, ActorCount) ->
     <<ActorMask:ActorCount/integer-unsigned-big, Value/binary>> = Tail,
     case ActorMask band (1 bsl (ActorCount - ActorID)) of
         0 ->
