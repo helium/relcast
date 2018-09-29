@@ -1,5 +1,37 @@
 -module(relcast).
 
+%% Relcast's job is ensure a consistent state for consensus protocols. It
+%% provides atomic updates to the consensus state, the inbound message queue and
+%% the outbound message queue. It does this by serializing all inbound messages
+%% to disk before attempting to process them, by serializing the new module
+%% state and any outbound messages to disk and deleting the inbound message
+%% after processing the message. Assuming no disk failures, the Erlang process,
+%% the Erlang VM or the host operating system should be able to fail at any time
+%% and recover where it left off.
+%%
+%% Relcast does this using 3 kinds of keys
+%%
+%% * <<"module_state">> - this key stores the latest serialized state of the callback
+%%                        module's state. It is only read back from disk on recovery.
+%%                        This key is overwritten every time the module handles
+%%                        a message or an event.
+%% * <<"oXXXXXXXXXX">>  - an outbound key, representing a message this instance
+%%                        wishes to send to another peer.
+%% * <<"iXXXXXXXXXX">>  - an inbound key, this represents a message arriving
+%%                        that has not been handled yet.
+%%
+%%  Outbound values come in 2 types; unicast and multicast.
+%%
+%%  Unicast values look like this: <<1:1/bits, ActorID:15/integer, Value/binary>>
+%%  and are only intended for delivery to a single peer, identified by ActorID.
+%%  Once the designated Actor has ACKed the message, the key can be deleted.
+%%
+%%  Multicast values look like this:
+%%  <<0:1/bits, ActorBitMask:BitmaskSize/integer, Value/binary>> and are
+%%  intended to be delivered to every other actor in the consensus group. Each
+%%  time a send to one of the peers is ACKed, the bit for that actor is set to
+%%  0. Once all the bits have been set to 0, the key can be deleted.
+
 %% API exports
 -export([]).
 
