@@ -21,7 +21,9 @@
 %%                        that has not been handled yet.
 %%
 %%  The 10 Xs in the inbound and outbound keys represent a strictly monotonic
-%%  counter that can hold 2^32 messages.
+%%  counter that can hold 2^32 messages. They are prefixed with their direction
+%%  so we can efficiently iterate over them independently. The 32 bit integer is
+%%  printed in left zero padded decimal so that the keys sort lexiographically.
 %%
 %%  Inbound values are stored in the form <<ActorID:16/integer, Value/binary>>.
 %%
