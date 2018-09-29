@@ -20,6 +20,11 @@
 %% * <<"iXXXXXXXXXX">>  - an inbound key, this represents a message arriving
 %%                        that has not been handled yet.
 %%
+%%  The 10 Xs in the inbound and outbound keys represent a strictly monotonic
+%%  counter that can hold 2^32 messages.
+%%
+%%  Inbound values are stored in the form <<ActorID:16/integer, Value/binary>>.
+%%
 %%  Outbound values come in 2 types; unicast and multicast.
 %%
 %%  Unicast values look like this: <<1:1/bits, ActorID:15/integer, Value/binary>>
@@ -111,7 +116,7 @@ start(ActorID, ActorIDs, Module, Arguments) ->
 
 deliver(Message, FromActorID, State = #state{module=Module, key_count=KeyCount, modulestate=ModuleState, db=DB, bitfieldsize=BitfieldSize}) ->
     Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
-    ok = rocksdb:put(DB, Key, <<1:1/integer, FromActorID:BitfieldSize/integer, Message/binary>>, [{sync, true}]),
+    ok = rocksdb:put(DB, Key, <<FromActorID:16/integer, Message/binary>>, [{sync, true}]),
     case Module:handle_message(Message, FromActorID, ModuleState) of
         defer ->
             %% leave the message queued but we can ACK it
