@@ -10,7 +10,7 @@
 -callback restore(OldState :: term(), NewState :: term()) -> {ok, State :: term()}.
 -callback serialize(State :: term()) -> Binary :: binary().
 -callback deserialize(Binary :: binary()) -> State :: term().
--callback handle_message(Message :: binary(), ActorId :: pos_integer(), State :: term()) ->
+-callback handle_message(Message :: message(), ActorId :: pos_integer(), State :: term()) ->
     {NewState :: term(), Actions :: actions() | defer}.
 -callback handle_call(Request :: term(), From :: {pid(), Tag :: term()},
                      State :: term()) ->
@@ -25,9 +25,18 @@
    {noreply, NewState :: term(), timeout()} |
 {stop, Reason :: term(), NewState :: term()}.
 
--type actions() :: [ {send, multicast, Message :: binary()} |
-                     {send, unicast, To :: pos_integer(), Message :: binary()} |
+-type actions() :: [ {send, Message :: message()} |
                      {stop, Timeout :: timeout()} | new_epoch ].
+
+-type message() ::
+        {unicast, Index::pos_integer(), Msg::message_value()} |
+        {multicast, Msg::message_value()}.
+
+-type message_key_prefix() :: <<_:128>>.
+-type message_value() ::
+        {message_key_prefix(), binary()} |
+        binary().
+
 %%====================================================================
 %% Callback functions
 %%====================================================================
@@ -37,15 +46,18 @@
           module,
           modulestate,
           id,
-          ids
+          ids,
           last_sent = #{},
-          pending_acks = #{}
+          pending_acks = #{},
+          key_count = 0
          }).
 
 -export([start/3, queue/3, take/2, ack/2]).
 
 start(ActorID, ActorIDs, Module, Arguments) ->
-    {ok, DB} = rocksdb:open(...),
+    DataDir = proplists:get_value(data_dir, Arguments),
+    DBOptions = db_options(),
+    {ok, DB} = rocksdb:open(DataDir, DBOptions),
     case erlang:apply(Module, init, Arguments) of
         {ok, ModuleState0} ->
             ModuleState = case rocksdb:get(DB, <<"module_state">>) of
@@ -62,8 +74,8 @@ start(ActorID, ActorIDs, Module, Arguments) ->
             error
     end.
 
-deliver(Message, FromActorID, State = #state{module=Module, modulestate=ModuleState, db=DB}) ->
-    Key = make_message_key(), %% some kind of predictable, monotonic key
+deliver(Message, FromActorID, State = #state{module=Module, key_count=KeyCount, modulestate=ModuleState, db=DB}) ->
+    Key = make_message_key(KeyCount), %% some kind of predictable, monotonic key
     rocksdb:store(DB, Key, <<FromActorID:16/integer, Message/binary>>),
     case Module:handle_message(Message, FromActorID, ModuleState) of
         defer ->
@@ -74,7 +86,6 @@ deliver(Message, FromActorID, State = #state{module=Module, modulestate=ModuleSt
             rocksdb:store(DB, <<"module_state">>, Module:serialize(NewModuleState)),
             {ok, NewState#state{modulestate=NewModuleState}}
     end.
-
 
 take(ForActorID, State) ->
     %% we need to find the first "unacked" message for this actor
@@ -101,6 +112,7 @@ ack(FromActorID, Ref, State) ->
             {ok, State}
     end.
 
+
 %%====================================================================
 %% Internal functions
 %%====================================================================
@@ -117,3 +129,10 @@ handle_actions([{unicast, ToActorID, Message}|Tail], State) ->
     handle_actions(Tail, State);
 handle_actions([{stop, Timeout}|Tail], State) ->
     {stop, Timeout}.
+
+db_options() ->
+    [
+     {create_if_missing, true},
+     {max_open_files, 1024},
+     {max_log_file_size, 100*1024*1024}
+    ].
