@@ -11,7 +11,7 @@
 %%
 %% Relcast does this using 3 kinds of keys
 %%
-%% * <<"module_state">> - this key stores the latest serialized state of the callback
+%% * <<"stored_module_state">> - this key stores the latest serialized state of the callback
 %%                        module's state. It is only read back from disk on recovery.
 %%                        This key is overwritten every time the module handles
 %%                        a message or an event.
@@ -95,7 +95,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     {ok, DB} = rocksdb:open(DataDir, DBOptions),
     case erlang:apply(Module, init, Arguments) of
         {ok, ModuleState0} ->
-            ModuleState = case rocksdb:get(DB, <<"module_state">>, []) of
+            ModuleState = case rocksdb:get(DB, <<"stored_module_state">>, []) of
                               {ok, SerializedModuleState} ->
                                   OldModuleState = Module:deserialize(SerializedModuleState),
                                   {ok, RestoredModuleState} = Module:restore(OldModuleState, ModuleState0),
@@ -109,7 +109,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
             handle_pending_inbound(#state{module=Module, id=ActorID,
                                                ids=ActorIDs,
                                                modulestate=ModuleState, db=DB,
-                                               key_count=LastKey,
+                                               key_count=LastKey+1,
                                                bitfieldsize=BitFieldSize});
         _ ->
             error
@@ -121,11 +121,16 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
     %% write new output messages & update the state atomically
     case handle_actions(Actions, Batch, State#state{modulestate=NewModuleState}) of
         {ok, NewState} ->
-            ok = rocksdb:batch_put(Batch, <<"module_state">>, Module:serialize(NewState#state.modulestate)),
+            ok = rocksdb:batch_put(Batch, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
             ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
-            {Reply, NewState#state{modulestate=NewModuleState}};
+            case handle_pending_inbound(NewState#state{modulestate=NewModuleState}) of
+                {ok, NewerState} ->
+                    {Reply, NewerState};
+                {stop, Timeout, NewerState} ->
+                    {stop, Reply, Timeout, NewerState}
+            end;
         {stop, Timeout, NewState} ->
-            ok = rocksdb:batch_put(Batch, <<"module_state">>, Module:serialize(NewState#state.modulestate)),
+            ok = rocksdb:batch_put(Batch, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
             ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
             {stop, Reply, Timeout, NewState#state{modulestate=NewModuleState}}
     end.
@@ -134,17 +139,15 @@ deliver(Message, FromActorID, State0 = #state{key_count=KeyCount, db=DB}) ->
     Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
     ok = rocksdb:put(DB, Key, <<FromActorID:16/integer, Message/binary>>, [{sync, true}]),
     State = State0#state{key_count=KeyCount+1},
-    case handle_message(Key, FromActorID, Message, State) of
-        defer ->
-            %% leave the message queued but we can ACK it
-            %% TODO potentially cap the number of defers we ack
-            {ok, State};
-        {ok, State} ->
-            %% message didn't change the state
-            {ok, State};
+    case handle_pending_inbound(State) of
         {ok, NewState} ->
-            %% see if the new message unblocked any others
-            handle_pending_inbound(NewState);
+            case rocksdb:get(DB, Key, []) of
+                {ok, <<FromActorID:16/integer, Message/binary>>} ->
+                    %% key is still there, we deferred it
+                    {defer, NewState};
+                _ ->
+                    {ok, NewState}
+            end;
         {stop, Timeout, NewState} ->
             {stop, Timeout, NewState}
     end.
@@ -245,7 +248,8 @@ handle_pending_inbound(State) ->
 find_next_inbound({error, _}, Iter, _, State) ->
     ok = rocksdb:iterator_close(Iter),
     {ok, State};
-find_next_inbound({ok, Key, <<FromActorID:16/integer, Msg>>}, Iter, Deferring, State) ->
+find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/binary>>}, Iter, Deferring, State) ->
+    ct:pal("loop ~p", [FromActorID]),
     case lists:member(FromActorID, Deferring) of
         false ->
             case handle_message(Key, FromActorID, Msg, State) of
@@ -264,12 +268,18 @@ find_next_inbound({ok, Key, <<FromActorID:16/integer, Msg>>}, Iter, Deferring, S
               find_next_inbound(rocksdb:iterator_move(Iter, next), Iter,
                                 Deferring, State)
     end;
-find_next_inbound({ok, _Key, _Value}, Iter, Deferring, State) ->
-    %% XXX I'm unsure why this is needed, the iterators should not see
-    %% non-inbound keys?
-    io:format("skipping ~p~n", [_Key]),
-    find_next_inbound(rocksdb:iterator_move(Iter, next), Iter,
-                      Deferring, State).
+find_next_inbound({ok, Key, _Value}, Iter, Deferring, State) ->
+    %% XXX erlang-rocksb doesn't actually support the iterate_upper_bound option yet so we will see keys past the end of the range
+    case Key > max_inbound_key() of
+        true ->
+            ok = rocksdb:iterator_close(Iter),
+            {ok, State};
+        false ->
+            %% this should not happen
+            ct:pal("skipping ~p ~p~n", [Key, _Value]),
+            find_next_inbound(rocksdb:iterator_move(Iter, next), Iter,
+                              Deferring, State)
+    end.
 
 
 handle_message(Key, FromActorID, Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) ->
@@ -282,11 +292,11 @@ handle_message(Key, FromActorID, Message, State = #state{module=Module, modulest
             ok = rocksdb:batch_delete(Batch, Key),
             case handle_actions(Actions, Batch, State#state{modulestate=NewModuleState}) of
                 {ok, NewState} ->
-                    ok = rocksdb:batch_put(Batch, <<"module_state">>, Module:serialize(NewState#state.modulestate)),
+                    ok = rocksdb:batch_put(Batch, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
                     {ok, NewState#state{modulestate=NewModuleState}};
                 {stop, Timeout, NewState} ->
-                    ok = rocksdb:batch_put(Batch, <<"module_state">>, Module:serialize(NewState#state.modulestate)),
+                    ok = rocksdb:batch_put(Batch, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
                     {stop, Timeout, NewState#state{modulestate=NewModuleState}}
             end
@@ -296,13 +306,14 @@ handle_message(Key, FromActorID, Message, State = #state{module=Module, modulest
 handle_actions([], _Batch, State) ->
     {ok, State};
 handle_actions([{multicast, Message}|Tail], Batch, State =
-               #state{key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, module=Module, modulestate=ModuleState}) ->
+               #state{key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID}) ->
     Bitfield = make_bitfield(BitfieldSize, State#state.ids, ID),
     rocksdb:batch_put(Batch, make_outbound_key(KeyCount), <<0:1/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
-    %% handle our own copy of the message
-    {NewModuleState, NewActions} = Module:handle_message(Message, ID, ModuleState),
-    rocksdb:batch_put(Batch, make_inbound_key(KeyCount+1), <<1:1/integer, ID:15/integer, Message/binary>>),
-    handle_actions(Tail++NewActions, Batch, State#state{key_count=KeyCount+2, modulestate=NewModuleState});
+    %% queue our own copy of the message
+    %% we can't handle it here because it's possible it would be out-of-order relative to other inbound
+    %% queued messages from ourself that got deferred
+    rocksdb:batch_put(Batch, make_inbound_key(KeyCount+1), <<ID:16/integer, Message/binary>>),
+    handle_actions(Tail, Batch, State#state{key_count=KeyCount+2});
 handle_actions([{unicast, ToActorID, Message}|Tail], Batch, State = #state{key_count=KeyCount}) ->
     rocksdb:batch_put(Batch, make_outbound_key(KeyCount), <<1:1/integer, ToActorID:15/integer, Message/binary>>),
     handle_actions(Tail, Batch, State#state{key_count=KeyCount+1});
@@ -342,21 +353,35 @@ round_to_nearest_byte(Bits) ->
 %% get the maximum key ID used
 get_last_key(DB) ->
     {ok, InIter} = rocksdb:iterator(DB, [{iterate_upper_bound, max_inbound_key()}]),
-    MaxInbound = case rocksdb:iterator_move(InIter, last) of
+    %% XXX iterate_upper_bound doesn't work, so we can't use it.
+    %% instead we seek to the last possible key, and if that is not present,
+    %% seek to the previous key
+    MaxInbound = case rocksdb:iterator_move(InIter, max_inbound_key()) of
         {ok, <<"i", InNum:10/binary>>, _} ->
             list_to_integer(binary_to_list(InNum));
         _ ->
-            0
+            case rocksdb:iterator_move(InIter, prev) of
+                {ok, <<"i", InNum:10/binary>>, _} ->
+                    list_to_integer(binary_to_list(InNum));
+                _ ->
+                    0
+            end
     end,
     rocksdb:iterator_close(InIter),
     {ok, OutIter} = rocksdb:iterator(DB, [{iterate_upper_bound, max_outbound_key()}]),
-    MaxOutbound = case rocksdb:iterator_move(OutIter, last) of
+    MaxOutbound = case rocksdb:iterator_move(OutIter, max_outbound_key()) of
         {ok, <<"o", OutNum:10/binary>>, _} ->
             list_to_integer(binary_to_list(OutNum));
         _ ->
-            0
+            case rocksdb:iterator_move(OutIter, prev) of
+                {ok, <<"o", OutNum:10/binary>>, _} ->
+                    list_to_integer(binary_to_list(OutNum));
+                _ ->
+                    0
+            end
     end,
     rocksdb:iterator_close(OutIter),
+    ct:pal("last key ~p ~p", [MaxInbound, MaxOutbound]),
     max(MaxInbound, MaxOutbound).
 
 %% iterate the outbound messages until we find one for this ActorID
@@ -368,11 +393,11 @@ find_next_outbound(ActorID, StartKey, DB, ActorCount) ->
 find_next_outbound_(_ActorId, {error, _}, Iter, _ActorCount) ->
     rocksdb:iterator_close(Iter),
     not_found;
-find_next_outbound_(ActorID, {ok, Key, <<1:1/integer, ActorID:15/integer, Value/binary>>}, Iter, _ActorCount) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:1/integer, ActorID:15/integer, Value/binary>>}, Iter, _ActorCount) ->
     %% unicast message for this actor
     rocksdb:iterator_close(Iter),
     {Key, Value};
-find_next_outbound_(ActorID, {ok, Key, <<0:1/integer, Tail/bits>>}, Iter, ActorCount) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:1/integer, Tail/bits>>}, Iter, ActorCount) ->
     <<ActorMask:ActorCount/integer-unsigned-big, Value/binary>> = Tail,
     case ActorMask band (1 bsl (ActorCount - ActorID)) of
         0 ->
@@ -382,7 +407,11 @@ find_next_outbound_(ActorID, {ok, Key, <<0:1/integer, Tail/bits>>}, Iter, ActorC
             %% multicast message with the high bit set for this actor
             rocksdb:iterator_close(Iter),
             {Key, Value}
-    end.
+    end;
+find_next_outbound_(_ActorID, {ok, _Key, _Value}, Iter, _ActorCount) ->
+    %% we hit the upper bound of the outbound messages
+    rocksdb:iterator_close(Iter),
+    not_found.
 
 min_inbound_key() ->
     <<"i0000000000">>.
@@ -397,6 +426,7 @@ max_outbound_key() ->
     <<"o4294967296">>.
 
 make_inbound_key(KeyCount) ->
+    ct:pal("make inbound key ~p", [KeyCount]),
     list_to_binary(io_lib:format("i~10..0b", [KeyCount])).
 
 make_outbound_key(KeyCount) ->

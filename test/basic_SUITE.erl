@@ -9,11 +9,13 @@
 
 -export([
     basic/1,
-    stop_resume/1
+    stop_resume/1,
+    defer/1,
+    defer_stop_resume/1
 ]).
 
 all() ->
-    [basic, stop_resume].
+    [basic, stop_resume, defer, defer_stop_resume].
 
 basic(_Config) ->
     Actors = lists:seq(1, 3),
@@ -79,4 +81,72 @@ stop_resume(_Config) ->
     {ok, RC1_14} = relcast:ack(3, Ref5, RC1_13),
     not_found = relcast:take(2, RC1_14),
     relcast:stop(normal, RC1_14),
+    ok.
+
+defer(_Config) ->
+    Actors = lists:seq(1, 3),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data3"}]),
+    %% try to put an entry in the seq map, it will be deferred because the
+    %% relcast is in round 0
+    {defer, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1),
+    {0, _} = relcast:command(round, RC1_2),
+    {#{}, _} = relcast:command(seqmap, RC1_2),
+    {ok, RC1_3} = relcast:command(next_round, RC1_2),
+    {Map, _} = relcast:command(seqmap, RC1_3),
+    [{2, 1}] = maps:to_list(Map),
+    %% queue up several seq messages. all are valid but only the first can apply
+    %% right now
+    {ok, RC1_4} = relcast:deliver(<<"seq", 1:8/integer>>, 3, RC1_3),
+    {defer, RC1_5} = relcast:deliver(<<"seq", 2:8/integer>>, 3, RC1_4),
+    {defer, RC1_5a} = relcast:deliver(<<"seq", 3:8/integer>>, 3, RC1_5),
+    %% also attempt to queue a sequence number for 2 with a break, so it's not
+    %% valid - this should not be deferred
+    {ok, RC1_6} = relcast:deliver(<<"seq", 3:8/integer>>, 2, RC1_5a),
+    {Map2, _} = relcast:command(seqmap, RC1_6),
+    [{2, 1}, {3, 1}] = lists:sort(maps:to_list(Map2)),
+    %% increment the round, the seqmap should increment for 3
+    {ok, RC1_7} = relcast:command(next_round, RC1_6),
+    {Map3, _} = relcast:command(seqmap, RC1_7),
+    [{2, 1}, {3, 2}] = lists:sort(maps:to_list(Map3)),
+    %% increment it again, it should increment seqmap for 3 again
+    {ok, RC1_8} = relcast:command(next_round, RC1_7),
+    {Map4, _} = relcast:command(seqmap, RC1_8),
+    [{2, 1}, {3, 3}] = lists:sort(maps:to_list(Map4)),
+    relcast:stop(normal, RC1_8),
+    ok.
+
+defer_stop_resume(_Config) ->
+    Actors = lists:seq(1, 3),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data4"}]),
+    %% try to put an entry in the seq map, it will be deferred because the
+    %% relcast is in round 0
+    {defer, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1),
+    {0, _} = relcast:command(round, RC1_2),
+    {#{}, _} = relcast:command(seqmap, RC1_2),
+    {ok, RC1_3} = relcast:command(next_round, RC1_2),
+    {Map, _} = relcast:command(seqmap, RC1_3),
+    [{2, 1}] = maps:to_list(Map),
+    %% queue up several seq messages. all are valid but only the first can apply
+    %% right now
+    {ok, RC1_4} = relcast:deliver(<<"seq", 1:8/integer>>, 3, RC1_3),
+    {defer, RC1_5} = relcast:deliver(<<"seq", 2:8/integer>>, 3, RC1_4),
+    {defer, RC1_5a} = relcast:deliver(<<"seq", 3:8/integer>>, 3, RC1_5),
+    %% stop and resume the relcast here to make sure we recover all our states
+    %% correctly
+    relcast:stop(normal, RC1_5a),
+    {ok, RC1_5b} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data4"}]),
+    %% also attempt to queue a sequence number for 2 with a break, so it's not
+    %% valid - this should not be deferred
+    {ok, RC1_6} = relcast:deliver(<<"seq", 3:8/integer>>, 2, RC1_5b),
+    {Map2, _} = relcast:command(seqmap, RC1_6),
+    [{2, 1}, {3, 1}] = lists:sort(maps:to_list(Map2)),
+    %% increment the round, the seqmap should increment for 3
+    {ok, RC1_7} = relcast:command(next_round, RC1_6),
+    {Map3, _} = relcast:command(seqmap, RC1_7),
+    [{2, 1}, {3, 2}] = lists:sort(maps:to_list(Map3)),
+    %% increment it again, it should increment seqmap for 3 again
+    {ok, RC1_8} = relcast:command(next_round, RC1_7),
+    {Map4, _} = relcast:command(seqmap, RC1_8),
+    [{2, 1}, {3, 3}] = lists:sort(maps:to_list(Map4)),
+    relcast:stop(normal, RC1_8),
     ok.
