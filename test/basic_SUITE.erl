@@ -11,11 +11,13 @@
     basic/1,
     stop_resume/1,
     defer/1,
-    defer_stop_resume/1
+    defer_stop_resume/1,
+    epochs/1,
+    epochs_gc/1
 ]).
 
 all() ->
-    [basic, stop_resume, defer, defer_stop_resume].
+    [basic, stop_resume, defer, defer_stop_resume, epochs, epochs_gc].
 
 basic(_Config) ->
     Actors = lists:seq(1, 3),
@@ -150,3 +152,78 @@ defer_stop_resume(_Config) ->
     [{2, 1}, {3, 3}] = lists:sort(maps:to_list(Map4)),
     relcast:stop(normal, RC1_8),
     ok.
+
+epochs(_Config) ->
+    Actors = lists:seq(1, 3),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data5"}]),
+    {ok, RC1_1a} = relcast:deliver(<<"hello">>, 2, RC1),
+    %% try to put an entry in the seq map, it will be deferred because the
+    %% relcast is in round 0
+    {defer, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1_1a),
+    {0, _} = relcast:command(round, RC1_2),
+    %% go to the next epoch
+    {ok, RC1_3} = relcast:command(next_epoch, RC1_2),
+    %% queue up another deferred message
+    {defer, RC1_4} = relcast:deliver(<<"seq", 2:8/integer>>, 2, RC1_3),
+    %% go to the next round
+    {ok, RC1_5} = relcast:command(next_round, RC1_4),
+    %% check the deferred message from the previous epoch gets handled
+    {Map, _} = relcast:command(seqmap, RC1_5),
+    [{2, 1}] = maps:to_list(Map),
+    %% go to the next round
+    {ok, RC1_6} = relcast:command(next_round, RC1_5),
+    {2, _} = relcast:command(round, RC1_6),
+    %% check the deferred message from the current epoch gets handled
+    {Map2, _} = relcast:command(seqmap, RC1_6),
+    [{2, 2}] = maps:to_list(Map2),
+    %% still outbound data queued from the first epoch
+    {ok, Ref, <<"ehlo">>, RC1_7} = relcast:take(2, RC1_6),
+    {ok, RC1_8} = relcast:ack(2, Ref, RC1_7),
+    {ok, _Ref2, <<"hai">>, RC1_9} = relcast:take(2, RC1_8),
+    relcast:stop(normal, RC1_9),
+    {ok, CFs} = rocksdb:list_column_families("data5", []),
+    ["default", "epoch0000000000", "epoch0000000001"] = CFs,
+    %% reopen the relcast and make sure it didn't delete any wrong column
+    %% families
+    {ok, RC1_10} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
+    relcast:stop(normal, RC1_10),
+    {ok, CFs} = rocksdb:list_column_families("data5", []),
+    ok.
+
+epochs_gc(_Config) ->
+    Actors = lists:seq(1, 3),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
+    %% try to put an entry in the seq map, it will be deferred because the
+    %% relcast is in round 0
+    {ok, RC1_1a} = relcast:deliver(<<"hello">>, 2, RC1),
+    {defer, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1_1a),
+    {0, _} = relcast:command(round, RC1_2),
+    %% go to the next epoch
+    {ok, RC1_3} = relcast:command(next_epoch, RC1_2),
+    %% go to the next epoch, this should GC the original epoch
+    {ok, RC1_4} = relcast:command(next_epoch, RC1_3),
+    %% this is now invalid because we're lacking the previous one
+    {ok, RC1_5} = relcast:deliver(<<"seq", 2:8/integer>>, 2, RC1_4),
+    %% go to the next round
+    {ok, RC1_6} = relcast:command(next_round, RC1_5),
+    %% check the deferred message from the previous epoch gets handled
+    {Map, _} = relcast:command(seqmap, RC1_6),
+    [] = maps:to_list(Map),
+    %% go to the next round
+    {ok, RC1_7} = relcast:command(next_round, RC1_6),
+    {2, _} = relcast:command(round, RC1_7),
+    %% check the deferred message from the previous epoch gets handled
+    {Map2, _} = relcast:command(seqmap, RC1_7),
+    [] = maps:to_list(Map2),
+    %% the data from the original epoch has been GC'd
+    not_found = relcast:take(2, RC1_7),
+    relcast:stop(normal, RC1_7),
+    {ok, CFs} = rocksdb:list_column_families("data6", []),
+    ["default", "epoch0000000001", "epoch0000000002"] = CFs,
+    %% reopen the relcast and make sure it didn't delete any wrong column
+    %% families
+    {ok, RC1_10} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
+    relcast:stop(normal, RC1_10),
+    {ok, CFs} = rocksdb:list_column_families("data6", []),
+    ok.
+

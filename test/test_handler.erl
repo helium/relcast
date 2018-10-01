@@ -22,6 +22,8 @@
 init(ID) ->
     {ok, #state{id=ID}}.
 
+handle_command(next_epoch, State) ->
+    {reply, ok, [new_epoch], State};
 handle_command(round, State) ->
     {reply, State#state.round, [], State};
 handle_command(next_round, State) ->
@@ -35,6 +37,7 @@ handle_command(Msg, State) ->
     {reply, ok, [], State}.
 
 handle_message(<<"seq", Int:8/integer>>, Actor, State = #state{seqmap=Seqmap}) ->
+    ct:pal("seq ~p from ~p", [Int, Actor]),
     case maps:get(Actor, Seqmap, 0) + 1 of
         Int when Int =< State#state.round ->
             {State#state{seqmap=maps:put(Actor, Int, Seqmap)}, []};

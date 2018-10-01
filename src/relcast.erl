@@ -150,13 +150,13 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                          CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 2),
                                          [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
                                          [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
-                                         list_to_tuple([cf_to_epoch(Last)|lists:sublist(CFHs, length(CFHs) - 2, 2)]);
+                                         list_to_tuple([cf_to_epoch(Last)|lists:sublist(CFHs, length(CFHs) + 1 - 2, 2)]);
                                      false ->
                                          %% the last two are non contiguous, gotta prune all but the last one
                                          CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 1),
                                          [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
                                          [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
-                                         {cf_to_epoch(Last), undefined, hd(lists:sublist(CFHs, length(CFHs) - 1, 1))}
+                                         {cf_to_epoch(Last), undefined, hd(lists:sublist(CFHs, length(CFHs) + 1 - 1, 1))}
                                  end
                          end,
     case erlang:apply(Module, init, Arguments) of
@@ -328,7 +328,7 @@ find_next_inbound({error, _}, Iter, _, State) ->
 find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/binary>>}, Iter, Deferring, State) ->
     case lists:member(FromActorID, Deferring) of
         false ->
-            case handle_message(Key, FromActorID, Msg, State) of
+            case handle_message(Key, cf_iterator_id(Iter), FromActorID, Msg, State) of
                 defer ->
                     %% done processing messages from this actor
                     find_next_inbound(cf_iterator_move(Iter, next), Iter,
@@ -357,7 +357,7 @@ find_next_inbound({ok, Key, _Value}, Iter, Deferring, State) ->
     end.
 
 
-handle_message(Key, FromActorID, Message, State = #state{module=Module, modulestate=ModuleState, db=DB, active_cf=CF}) ->
+handle_message(Key, CF, FromActorID, Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) ->
     case Module:handle_message(Message, FromActorID, ModuleState) of
         defer ->
             defer;
@@ -382,8 +382,11 @@ handle_actions([], _Batch, State) ->
     {ok, State};
 handle_actions([new_epoch|Tail], Batch, State) ->
     {ok, NewCF} = rocksdb:create_column_family(State#state.db, make_column_family_name(State#state.epoch + 1), db_options(length(State#state.ids))),
-    ok = rocksdb:drop_column_family(State#state.prev_cf),
-    ok = rocksdb:destroy_column_family(State#state.prev_cf),
+    case State#state.prev_cf of
+        undefined -> ok;
+        _ ->
+            ok = rocksdb:drop_column_family(State#state.prev_cf)
+    end,
     %% when we're done handling actions, we will write the module state (and all subsequent outbound messages from this point on)
     %% into the active CF, which is this new one now
     handle_actions(Tail, Batch, State#state{key_count=0, active_cf=NewCF, prev_cf=State#state.active_cf, epoch=State#state.epoch + 1});
@@ -450,7 +453,7 @@ get_last_key(DB, CF) ->
             end
     end,
     rocksdb:iterator_close(InIter),
-    {ok, OutIter} = rocksdb:iterator(DB, [{iterate_upper_bound, max_outbound_key()}]),
+    {ok, OutIter} = rocksdb:iterator(DB, CF, [{iterate_upper_bound, max_outbound_key()}]),
     MaxOutbound = case rocksdb:iterator_move(OutIter, max_outbound_key()) of
         {ok, <<"o", OutNum:10/binary>>, _} ->
             list_to_integer(binary_to_list(OutNum));
@@ -551,7 +554,16 @@ cf_iterator(State, MsgType, Args) when MsgType == inbound; MsgType == outbound -
 cf_iterator_move(Ref, Args) ->
     Iterator = erlang:get(Ref),
     case rocksdb:iterator_move(Iterator#iterator.iterator, Args) of
-        {error, _} when Iterator#iterator.next_cf /= undefined ->
+        {ok, <<"i", _/binary>>, _Value} = Res when Iterator#iterator.message_type == inbound ->
+            Res;
+        {ok, <<"o", _/binary>>, _Value} = Res when Iterator#iterator.message_type == outbound ->
+            Res;
+        {error, _} = Res when Iterator#iterator.next_cf == undefined ->
+            Res;
+        {ok, _Key, _Value} when Iterator#iterator.next_cf == undefined ->
+            {error, invalid_iterator};
+        _ ->
+            %% error or out-of-range key
             %% try the next column family
             ok = rocksdb:iterator_close(Iterator#iterator.iterator),
             {ok, Iter} = rocksdb:iterator(Iterator#iterator.db, Iterator#iterator.next_cf, Iterator#iterator.args),
@@ -561,9 +573,7 @@ cf_iterator_move(Ref, Args) ->
                     rocksdb:iterator_move(Iter, min_inbound_key());
                 outbound ->
                     rocksdb:iterator_move(Iter, min_outbound_key())
-            end;
-        Res ->
-            Res
+            end
     end.
 
 -spec cf_iterator_id(reference()) -> rocksdb:cf_handle().
