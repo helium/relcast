@@ -72,7 +72,7 @@
 -callback terminate(Reason :: term(), NewState :: term()) -> any().
 -optional_callbacks([terminate/2]).
 
--type actions() :: [ {send, Message :: message()} |
+-type actions() :: [ Message :: message() |
                      {stop, Timeout :: timeout()} | new_epoch ].
 
 -type message() ::
