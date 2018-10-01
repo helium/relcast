@@ -225,5 +225,26 @@ epochs_gc(_Config) ->
     {ok, RC1_10} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
     relcast:stop(normal, RC1_10),
     {ok, CFs} = rocksdb:list_column_families("data6", []),
+    %% Re-add the old epoch 0 CF and check it gets removed
+    {ok, DB, _} = rocksdb:open_with_cf("data6", [{create_if_missing, true}],
+                                       [{"default", []},
+                                        {"epoch0000000001", []},
+                                        {"epoch0000000002", []}]),
+    {ok, _Epoch0} = rocksdb:create_column_family(DB, "epoch0000000000", []),
+    rocksdb:close(DB),
+    {ok, RC1_11} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
+    relcast:stop(normal, RC1_11),
+    {ok, CFs} = rocksdb:list_column_families("data6", []),
+    %% delete epoch 1, re-add epoch 0 and check 0 is pruned again because it's non-contiguous
+    {ok, DB2, [_, Epoch1, _]} = rocksdb:open_with_cf("data6", [{create_if_missing, true}],
+                                       [{"default", []},
+                                        {"epoch0000000001", []},
+                                        {"epoch0000000002", []}]),
+    {ok, _} = rocksdb:create_column_family(DB2, "epoch0000000000", []),
+    ok = rocksdb:drop_column_family(Epoch1),
+    rocksdb:close(DB2),
+    {ok, RC1_12} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
+    relcast:stop(normal, RC1_12),
+    {ok, ["default", "epoch0000000002"]} = rocksdb:list_column_families("data6", []),
     ok.
 

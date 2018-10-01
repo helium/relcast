@@ -37,7 +37,9 @@
 %%  <<0:1/bits, ActorBitMask:BitmaskSize/integer, Value/binary>> and are
 %%  intended to be delivered to every other actor in the consensus group. Each
 %%  time a send to one of the peers is ACKed, the bit for that actor is set to
-%%  0. Once all the bits have been set to 0, the key can be deleted.
+%%  0. Once all the bits have been set to 0, the key can be deleted. The bitmask
+%%  is stored least significant bit first and is padded to be a multiple of 8
+%%  (along with the leading 0 bit) so the message is always byte aligned.
 %%
 %%  Epochs
 %%  Relcast has the notion of epochs for protocols that have the property of "if
@@ -50,7 +52,7 @@
 %%
 %%  To do this, relcast uses rocksdb's column families feature. On initial
 %%  startup it creates the column family "epoch0000000000". Each 'new_epoch'
-%%  action the epoch counter is incremented by one. 2^32 epochs are supposed
+%%  action the epoch counter is incremented by one. 2^32 epochs are allowed
 %%  before the counter wraps. Don't have 4 billion epochs, please.
 
 %% API exports
@@ -149,13 +151,11 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                          %% the last two are contiguous, delete all but those
                                          CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 2),
                                          [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
-                                         [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
                                          list_to_tuple([cf_to_epoch(Last)|lists:sublist(CFHs, length(CFHs) + 1 - 2, 2)]);
                                      false ->
                                          %% the last two are non contiguous, gotta prune all but the last one
                                          CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 1),
                                          [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
-                                         [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
                                          {cf_to_epoch(Last), undefined, hd(lists:sublist(CFHs, length(CFHs) + 1 - 1, 1))}
                                  end
                          end,
