@@ -334,6 +334,8 @@ find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/bi
                     find_next_inbound(cf_iterator_move(Iter, next), Iter,
                                       [FromActorID|Deferring], State);
                 {ok, NewState} ->
+                    %% refresh the iterator so it sees any new keys we wrote
+                    cf_iterator_refresh(Iter),
                     find_next_inbound(cf_iterator_move(Iter, next), Iter,
                                       Deferring, NewState);
                 {stop, Timeout, NewState} ->
@@ -482,6 +484,9 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:1/integer, ActorI
     CF = cf_iterator_id(Iter),
     cf_iterator_close(Iter),
     {Key, CF, Value};
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:1/integer, _/bits>>}, Iter, ActorCount) ->
+    %% unicast message for someone else
+    find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, ActorCount);
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:1/integer, Tail/bits>>}, Iter, ActorCount) ->
     <<ActorMask:ActorCount/integer-unsigned-big, Value/binary>> = Tail,
     case ActorMask band (1 bsl (ActorCount - ActorID)) of
@@ -581,9 +586,12 @@ cf_iterator_id(Ref) ->
     Iterator = erlang:get(Ref),
     Iterator#iterator.cf.
 
+cf_iterator_refresh(Ref) ->
+    Iterator = erlang:get(Ref),
+    rocksdb:iterator_refresh(Iterator#iterator.iterator).
+
 -spec cf_iterator_close(reference()) -> ok.
 cf_iterator_close(Ref) ->
     Iterator = erlang:get(Ref),
     erlang:erase(Ref),
     rocksdb:iterator_close(Iterator#iterator.iterator).
-
