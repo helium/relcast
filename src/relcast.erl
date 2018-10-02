@@ -195,7 +195,7 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
         {ok, NewState} ->
             ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
             ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
-            case handle_pending_inbound(NewState#state{modulestate=NewModuleState}) of
+            case handle_pending_inbound(NewState) of
                 {ok, NewerState} ->
                     {Reply, NewerState};
                 {stop, Timeout, NewerState} ->
@@ -204,7 +204,7 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
         {stop, Timeout, NewState} ->
             ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
             ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
-            {stop, Reply, Timeout, NewState#state{modulestate=NewModuleState}}
+            {stop, Reply, Timeout, NewState}
     end.
 
 -spec deliver(binary(), pos_integer(), #state{}) -> {ok, #state{}} | {stop, pos_integer(), #state{}}.
@@ -369,11 +369,11 @@ handle_message(Key, CF, FromActorID, Message, State = #state{module=Module, modu
                 {ok, NewState} ->
                     ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
-                    {ok, NewState#state{modulestate=NewModuleState}};
+                    {ok, NewState};
                 {stop, Timeout, NewState} ->
                     ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
-                    {stop, Timeout, NewState#state{modulestate=NewModuleState}}
+                    {stop, Timeout, NewState}
             end
     end.
 
