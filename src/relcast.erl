@@ -244,10 +244,10 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB}) ->
         _ ->
             {CF, StartKey} = maps:get(ForActorID, State#state.last_sent, {prev_cf(State), min_outbound_key()}), %% default to the "first" key"
             %% iterate until we find a key for this actor
-            case find_next_outbound(ForActorID, StartKey, State, State#state.bitfieldsize) of
-                {Key, CF, Msg} ->
+            case find_next_outbound(ForActorID, CF, StartKey, State, State#state.bitfieldsize) of
+                {Key, CF2, Msg} ->
                     Ref = make_ref(),
-                    {ok, Ref, Msg, State#state{pending_acks=maps:put(ForActorID, {Ref, CF, Key}, State#state.pending_acks)}};
+                    {ok, Ref, Msg, State#state{pending_acks=maps:put(ForActorID, {Ref, CF2, Key}, State#state.pending_acks)}};
                 not_found ->
                     not_found
             end
@@ -308,7 +308,7 @@ handle_pending_inbound(State) ->
     %% out of messages to examine. If we are successful in handling any inbound
     %% messages during the run, we should loop back to the oldest messages and
     %% try to handle them again, as the module may now be ready to handle them.
-    {ok, Iter} = cf_iterator(State, inbound, [{iterate_upper_bound, max_inbound_key()}]),
+    {ok, Iter} = cf_iterator(State, prev_cf(State), inbound, [{iterate_upper_bound, max_inbound_key()}]),
     Res = cf_iterator_move(Iter, {seek, min_inbound_key()}),
     Deferring = [],
     case find_next_inbound(Res, Iter, Deferring, State) of
@@ -471,8 +471,8 @@ get_last_key(DB, CF) ->
     max(MaxInbound, MaxOutbound).
 
 %% iterate the outbound messages until we find one for this ActorID
-find_next_outbound(ActorID, StartKey, State, ActorCount) ->
-    {ok, Iter} = cf_iterator(State, outbound, [{iterate_upper_bound, max_outbound_key()}]),
+find_next_outbound(ActorID, CF, StartKey, State, ActorCount) ->
+    {ok, Iter} = cf_iterator(State, CF, outbound, [{iterate_upper_bound, max_outbound_key()}]),
     Res = cf_iterator_move(Iter, StartKey),
     find_next_outbound_(ActorID, Res, Iter, ActorCount).
 
@@ -542,14 +542,19 @@ prev_cf(State) ->
 %% * you only iterate inbound/outbound messages
 %% * jumps across column families will start in the next
 %%   column family at the first key inbound/outbound key
--spec cf_iterator(#state{}, inbound | outbound, list()) -> {ok, reference()}.
-cf_iterator(State, MsgType, Args) when MsgType == inbound; MsgType == outbound ->
+-spec cf_iterator(#state{}, rocksdb:cf_handle(), inbound | outbound, list()) -> {ok, reference()}.
+cf_iterator(State, CF, MsgType, Args) when MsgType == inbound; MsgType == outbound ->
     Ref = make_ref(),
-    {CF, NextCF} = case State#state.prev_cf of
-                       undefined ->
-                           {State#state.active_cf, undefined};
-                       _ ->
-                           {State#state.prev_cf, State#state.active_cf}
+    {CF, NextCF} = case {State#state.prev_cf, State#state.active_cf} of
+                       {undefined, Active} ->
+                           %% only one CF
+                           {Active, undefined};
+                       {CF, Active} ->
+                           %% we want to start on the previous CF
+                           {CF, Active};
+                       {_, CF} ->
+                           %% we want to start on the current CF
+                           {CF, undefined}
                    end,
     {ok, Iter} = rocksdb:iterator(State#state.db, CF, Args),
     erlang:put(Ref, #iterator{db=State#state.db, iterator=Iter, args=Args, cf=CF, next_cf=NextCF, message_type=MsgType}),
