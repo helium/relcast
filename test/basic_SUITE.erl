@@ -54,6 +54,9 @@ stop_resume(_Config) ->
     {false, _} = relcast:command(is_done, RC1),
     {ok, RC1_2} = relcast:deliver(<<"hello">>, 2, RC1),
     {true, _} = relcast:command(is_done, RC1_2),
+    {_, [], Outbound} = relcast:status(RC1_2),
+    [<<"ehlo">>, <<"hai">>] = maps:get(2, Outbound),
+    [<<"hai">>] = maps:get(3, Outbound),
     {ok, Ref, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
     %% same result if we take() again for this actor
     {ok, Ref, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_3),
@@ -91,6 +94,8 @@ defer(_Config) ->
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
     {defer, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1),
+    {_, [{2, <<"seq", 1:8/integer>>}], Outbound} = relcast:status(RC1_2),
+    0 = maps:size(Outbound),
     {0, _} = relcast:command(round, RC1_2),
     {#{}, _} = relcast:command(seqmap, RC1_2),
     {ok, RC1_3} = relcast:command(next_round, RC1_2),

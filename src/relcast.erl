@@ -112,7 +112,7 @@
           message_type :: inbound | outbound
          }).
 
--export([start/5, command/2, deliver/3, take/2, ack/3, stop/2]).
+-export([start/5, command/2, deliver/3, take/2, ack/3, stop/2, status/1]).
 
 -spec start(pos_integer(), [pos_integer(),...], atom(), list(), list()) -> error | {ok, #state{}} | {stop, pos_integer(), #state{}}.
 start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
@@ -294,6 +294,13 @@ stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
     end,
     rocksdb:close(State#state.db).
 
+-spec status(#state{}) -> {ModuleState :: any(), InboundQueue ::
+                           [{pos_integer(), binary()}], OutboundQueue ::
+                           #{pos_integer() => [binary()]}}.
+status(State = #state{modulestate=ModuleState}) ->
+    {ok, Iter} = cf_iterator(State, prev_cf(State), both, [{iterate_upper_bound, max_outbound_key()}]),
+    {InboundQueue, OutboundQueue} = build_status(cf_iterator_move(Iter, {seek, min_inbound_key()}), Iter, State#state.bitfieldsize, [], #{}),
+    {ModuleState, InboundQueue, OutboundQueue}.
 
 %%====================================================================
 %% Internal functions
@@ -536,14 +543,47 @@ prev_cf(State) ->
             CF
     end.
 
+build_status({error, _}, Iter, _BFS, InboundQueue, OutboundQueue) ->
+    cf_iterator_close(Iter),
+    {lists:reverse(InboundQueue), maps:map(fun(_K, V) -> lists:reverse(V) end, OutboundQueue)};
+build_status({ok, <<"i", _/binary>>, <<FromActorID:16/integer, Msg/binary>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
+    build_status(cf_iterator_move(Iter, next), Iter, BFS, [{FromActorID, Msg}|InboundQueue], OutboundQueue);
+build_status({ok, <<"o", _/binary>>, <<1:1/integer, ActorID:15/integer, Value/binary>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
+    %% unicast message
+    build_status(cf_iterator_move(Iter, next), Iter, BFS, InboundQueue, prepend_message([ActorID], Value, OutboundQueue));
+build_status({ok, <<"o", _/binary>>, <<0:1/integer, Tail/bits>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
+    <<ActorMask:BFS/bits, Value/binary>> = Tail,
+    ActorIDs = actor_list(ActorMask, 1, []),
+    build_status(cf_iterator_move(Iter, next), Iter, BFS, InboundQueue, prepend_message(ActorIDs, Value, OutboundQueue));
+build_status({ok, _Key, _Value}, Iter, BFS, InboundQueue, OutboundQueue) ->
+    build_status(cf_iterator_move(Iter, next), Iter, BFS, InboundQueue, OutboundQueue).
+
+prepend_message(Actors, Message, Map) ->
+    ExtraMap = [{K, []} || K <- (Actors -- maps:keys(Map))],
+    maps:map(fun(K, V) ->
+                     case lists:member(K, Actors) of
+                         true ->
+                             [Message|V];
+                         false ->
+                             V
+                     end
+             end, maps:merge(maps:from_list(ExtraMap), Map)).
+
+actor_list(<<>>, _, List) ->
+    List;
+actor_list(<<1:1/integer, Tail/bits>>, I, List) ->
+    actor_list(Tail, I+1, [I|List]);
+actor_list(<<0:1/integer, Tail/bits>>, I, List) ->
+    actor_list(Tail, I+1, List).
+
 %% wrapper around rocksdb iterators that will iterate across column families.
 %% Requirements to use this:
 %% * you only iterate forwards
 %% * you only iterate inbound/outbound messages
 %% * jumps across column families will start in the next
 %%   column family at the first key inbound/outbound key
--spec cf_iterator(#state{}, rocksdb:cf_handle(), inbound | outbound, list()) -> {ok, reference()}.
-cf_iterator(State, CF, MsgType, Args) when MsgType == inbound; MsgType == outbound ->
+-spec cf_iterator(#state{}, rocksdb:cf_handle(), inbound | outbound | both, list()) -> {ok, reference()}.
+cf_iterator(State, CF, MsgType, Args) when MsgType == inbound; MsgType == outbound; MsgType == both ->
     Ref = make_ref(),
     {CF, NextCF} = case {State#state.prev_cf, State#state.active_cf} of
                        {undefined, Active} ->
@@ -563,10 +603,11 @@ cf_iterator(State, CF, MsgType, Args) when MsgType == inbound; MsgType == outbou
 -spec cf_iterator_move(reference(), next | {seek, binary()} | binary()) -> {ok, Key::binary(), Value::binary()} | {ok, Key::binary()} | {error, invalid_iterator} | {error, iterator_closed}.
 cf_iterator_move(Ref, Args) ->
     Iterator = erlang:get(Ref),
+    Type = Iterator#iterator.message_type,
     case rocksdb:iterator_move(Iterator#iterator.iterator, Args) of
-        {ok, <<"i", _/binary>>, _Value} = Res when Iterator#iterator.message_type == inbound ->
+        {ok, <<"i", _/binary>>, _Value} = Res when Type == inbound; Type == both ->
             Res;
-        {ok, <<"o", _/binary>>, _Value} = Res when Iterator#iterator.message_type == outbound ->
+        {ok, <<"o", _/binary>>, _Value} = Res when Type == outbound; Type == both ->
             Res;
         {error, _} = Res when Iterator#iterator.next_cf == undefined ->
             Res;
@@ -580,6 +621,8 @@ cf_iterator_move(Ref, Args) ->
             erlang:put(Ref, Iterator#iterator{next_cf=undefined, cf=Iterator#iterator.next_cf, iterator=Iter}),
             case Iterator#iterator.message_type of
                 inbound ->
+                    rocksdb:iterator_move(Iter, min_inbound_key());
+                both ->
                     rocksdb:iterator_move(Iter, min_inbound_key());
                 outbound ->
                     rocksdb:iterator_move(Iter, min_outbound_key())
