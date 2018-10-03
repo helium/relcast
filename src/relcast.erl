@@ -271,8 +271,10 @@ ack(FromActorID, Ref, State = #state{bitfieldsize=BitfieldSize, db=DB}) ->
                             ok = rocksdb:delete(DB, CF, Key, [{sync, true}]);
                         _Remaining ->
                             %% flip the bit for this actor
-                            ActorIDStr = io_lib:format("-~b", [FromActorID]),
-                            ok = rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), [{sync, true}])
+                            %% XXX the merge operator seems buggy
+                            %ActorIDStr = io_lib:format("-~b", [FromActorID]),
+                            %ok = rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), [{sync, true}])
+                            ok = rocksdb:put(DB, CF, Key, <<0:1/integer, (_Remaining bsl Padding):BitfieldSize/integer, _Value/binary>>, [{sync, true}])
                     end;
                 not_found ->
                     %% something strange is happening
