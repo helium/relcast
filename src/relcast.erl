@@ -256,7 +256,7 @@ deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_c
             full
     end.
 
--spec take(pos_integer, #state{}) -> not_found | {ok, reference(), binary(), #state{}}.
+-spec take(pos_integer, #state{}) -> {not_found, #state{}} | {ok, reference(), binary(), #state{}}.
 take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB}) ->
     %% we need to find the first "unacked" message for this actor
     %% we should remember the last acked message for this actor ID and start there
