@@ -93,7 +93,7 @@ defer(_Config) ->
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data3"}]),
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
-    {defer, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1),
+    {ok, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1),
     {_, [{2, <<"seq", 1:8/integer>>}], Outbound} = relcast:status(RC1_2),
     0 = maps:size(Outbound),
     {0, _} = relcast:command(round, RC1_2),
@@ -104,8 +104,8 @@ defer(_Config) ->
     %% queue up several seq messages. all are valid but only the first can apply
     %% right now
     {ok, RC1_4} = relcast:deliver(<<"seq", 1:8/integer>>, 3, RC1_3),
-    {defer, RC1_5} = relcast:deliver(<<"seq", 2:8/integer>>, 3, RC1_4),
-    {defer, RC1_5a} = relcast:deliver(<<"seq", 3:8/integer>>, 3, RC1_5),
+    {ok, RC1_5} = relcast:deliver(<<"seq", 2:8/integer>>, 3, RC1_4),
+    {ok, RC1_5a} = relcast:deliver(<<"seq", 3:8/integer>>, 3, RC1_5),
     %% also attempt to queue a sequence number for 2 with a break, so it's not
     %% valid - this should not be deferred
     {ok, RC1_6} = relcast:deliver(<<"seq", 3:8/integer>>, 2, RC1_5a),
@@ -127,7 +127,7 @@ defer_stop_resume(_Config) ->
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data4"}]),
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
-    {defer, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1),
+    {ok, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1),
     {0, _} = relcast:command(round, RC1_2),
     {#{}, _} = relcast:command(seqmap, RC1_2),
     {ok, RC1_3} = relcast:command(next_round, RC1_2),
@@ -136,8 +136,8 @@ defer_stop_resume(_Config) ->
     %% queue up several seq messages. all are valid but only the first can apply
     %% right now
     {ok, RC1_4} = relcast:deliver(<<"seq", 1:8/integer>>, 3, RC1_3),
-    {defer, RC1_5} = relcast:deliver(<<"seq", 2:8/integer>>, 3, RC1_4),
-    {defer, RC1_5a} = relcast:deliver(<<"seq", 3:8/integer>>, 3, RC1_5),
+    {ok, RC1_5} = relcast:deliver(<<"seq", 2:8/integer>>, 3, RC1_4),
+    {ok, RC1_5a} = relcast:deliver(<<"seq", 3:8/integer>>, 3, RC1_5),
     %% stop and resume the relcast here to make sure we recover all our states
     %% correctly
     relcast:stop(normal, RC1_5a),
@@ -164,12 +164,12 @@ epochs(_Config) ->
     {ok, RC1_1a} = relcast:deliver(<<"hello">>, 2, RC1),
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
-    {defer, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1_1a),
+    {ok, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1_1a),
     {0, _} = relcast:command(round, RC1_2),
     %% go to the next epoch
     {ok, RC1_3} = relcast:command(next_epoch, RC1_2),
     %% queue up another deferred message
-    {defer, RC1_4} = relcast:deliver(<<"seq", 2:8/integer>>, 2, RC1_3),
+    {ok, RC1_4} = relcast:deliver(<<"seq", 2:8/integer>>, 2, RC1_3),
     %% go to the next round
     {ok, RC1_5} = relcast:command(next_round, RC1_4),
     %% check the deferred message from the previous epoch gets handled
@@ -201,7 +201,7 @@ epochs_gc(_Config) ->
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
     {ok, RC1_1a} = relcast:deliver(<<"hello">>, 2, RC1),
-    {defer, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1_1a),
+    {ok, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1_1a),
     {0, _} = relcast:command(round, RC1_2),
     %% go to the next epoch
     {ok, RC1_3} = relcast:command(next_epoch, RC1_2),
