@@ -22,7 +22,7 @@ all() ->
 basic(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data1"}]),
-    not_found = relcast:take(2, RC1),
+    {not_found, _} = relcast:take(2, RC1),
     {false, _} = relcast:command(is_done, RC1),
     {ok, RC1_2} = relcast:deliver(<<"hello">>, 2, RC1),
     {true, _} = relcast:command(is_done, RC1_2),
@@ -41,16 +41,16 @@ basic(_Config) ->
     {ok, Ref3, <<"hai">>, RC1_8} = relcast:take(3, RC1_7),
     %% ack both of the outstanding messages
     {ok, RC1_9} = relcast:ack(2, Ref2, RC1_8),
-    not_found = relcast:take(2, RC1_9),
+    {not_found, _} = relcast:take(2, RC1_9),
     {ok, RC1_10} = relcast:ack(3, Ref3, RC1_9),
-    not_found = relcast:take(2, RC1_10),
+    {not_found, _} = relcast:take(2, RC1_10),
     relcast:stop(normal, RC1_10),
     ok.
 
 stop_resume(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2"}]),
-    not_found = relcast:take(2, RC1),
+    {not_found, _} = relcast:take(2, RC1),
     {false, _} = relcast:command(is_done, RC1),
     {ok, RC1_2} = relcast:deliver(<<"hello">>, 2, RC1),
     {true, _} = relcast:command(is_done, RC1_2),
@@ -82,9 +82,9 @@ stop_resume(_Config) ->
     {ok, Ref5, <<"hai">>, RC1_12} = relcast:take(2, RC1_11),
     %% ack both of the outstanding messages again
     {ok, RC1_13} = relcast:ack(2, Ref4, RC1_12),
-    not_found = relcast:take(2, RC1_13),
+    {not_found, _} = relcast:take(2, RC1_13),
     {ok, RC1_14} = relcast:ack(3, Ref5, RC1_13),
-    not_found = relcast:take(2, RC1_14),
+    {not_found, _} = relcast:take(2, RC1_14),
     relcast:stop(normal, RC1_14),
     ok.
 
@@ -221,7 +221,7 @@ epochs_gc(_Config) ->
     {Map2, _} = relcast:command(seqmap, RC1_7),
     [] = maps:to_list(Map2),
     %% the data from the original epoch has been GC'd
-    not_found = relcast:take(2, RC1_7),
+    {not_found, _} = relcast:take(2, RC1_7),
     relcast:stop(normal, RC1_7),
     {ok, CFs} = rocksdb:list_column_families("data6", []),
     ["default", "epoch0000000001", "epoch0000000002"] = CFs,

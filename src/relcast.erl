@@ -245,11 +245,13 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB}) ->
             {CF, StartKey} = maps:get(ForActorID, State#state.last_sent, {prev_cf(State), min_outbound_key()}), %% default to the "first" key"
             %% iterate until we find a key for this actor
             case find_next_outbound(ForActorID, CF, StartKey, State, State#state.bitfieldsize) of
+                {not_found, LastKey, CF2} ->
+                    {not_found, State#state{last_sent=maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
                 {Key, CF2, Msg} ->
                     Ref = make_ref(),
                     {ok, Ref, Msg, State#state{pending_acks=maps:put(ForActorID, {Ref, CF2, Key}, State#state.pending_acks)}};
                 not_found ->
-                    not_found
+                    {not_found, State}
             end
     end.
 
@@ -486,8 +488,15 @@ find_next_outbound(ActorID, CF, StartKey, State, ActorCount) ->
     find_next_outbound_(ActorID, Res, Iter, ActorCount).
 
 find_next_outbound_(_ActorId, {error, _}, Iter, _ActorCount) ->
+    %% try to return the *highest* key we saw, so we can try starting here next time
+    Res = case cf_iterator_move(Iter, prev) of
+        {ok, Key, _} ->
+            {not_found, Key, cf_iterator_id(Iter)};
+        _ ->
+            not_found
+    end,
     cf_iterator_close(Iter),
-    not_found;
+    Res;
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:1/integer, ActorID:15/integer, Value/binary>>}, Iter, _ActorCount) ->
     %% unicast message for this actor
     CF = cf_iterator_id(Iter),
