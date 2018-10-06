@@ -13,11 +13,13 @@
     defer/1,
     defer_stop_resume/1,
     epochs/1,
-    epochs_gc/1
+    epochs_gc/1,
+    callback_message/1,
+    self_callback_message/1
 ]).
 
 all() ->
-    [basic, stop_resume, defer, defer_stop_resume, epochs, epochs_gc].
+    [basic, stop_resume, defer, defer_stop_resume, epochs, epochs_gc, callback_message, self_callback_message].
 
 basic(_Config) ->
     Actors = lists:seq(1, 3),
@@ -253,3 +255,31 @@ epochs_gc(_Config) ->
     {ok, ["default", "epoch0000000002"]} = rocksdb:list_column_families("data6", []),
     ok.
 
+
+callback_message(_Config) ->
+    Actors = lists:seq(1, 3),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data7"}]),
+    {ok, RC1_2} = relcast:deliver(<<"greet">>, 2, RC1),
+    {ok, Ref, <<"greetings to 2">>, RC1_3} = relcast:take(2, RC1_2),
+    {ok, Ref2, <<"greetings to 3">>, RC1_4} = relcast:take(3, RC1_3),
+    {ok, RC1_5} = relcast:ack(2, Ref, RC1_4),
+    {ok, RC1_6} = relcast:ack(3, Ref2, RC1_5),
+    {not_found, RC1_7} = relcast:take(2, RC1_6),
+    {not_found, RC1_8} = relcast:take(3, RC1_7),
+    relcast:stop(normal, RC1_8),
+    ok.
+
+self_callback_message(_Config) ->
+    Actors = lists:seq(1, 3),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data8"}]),
+    {false, _} = relcast:command(was_saluted, RC1),
+    {ok, RC1_2} = relcast:deliver(<<"salute">>, 2, RC1),
+    {ok, Ref,  <<"salutations to 2">>, RC1_3} = relcast:take(2, RC1_2),
+    {ok, Ref2, <<"salutations to 3">>, RC1_4} = relcast:take(3, RC1_3),
+    {ok, RC1_5} = relcast:ack(2, Ref, RC1_4),
+    {ok, RC1_6} = relcast:ack(3, Ref2, RC1_5),
+    {not_found, RC1_7} = relcast:take(2, RC1_6),
+    {not_found, RC1_8} = relcast:take(3, RC1_7),
+    {true, _} = relcast:command(was_saluted, RC1_8),
+    relcast:stop(normal, RC1_8),
+    ok.

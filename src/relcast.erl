@@ -2,12 +2,13 @@
 
 %% Relcast's job is ensure a consistent state for consensus protocols. It
 %% provides atomic updates to the consensus state, the inbound message queue and
-%% the outbound message queue. It does this by serializing all inbound messages
-%% to disk before attempting to process them, by serializing the new module
+%% the outbound message queue. It does this by speculatively processing inbound messages,
+%% serializing them to disk if they can't be handled now, by serializing the new module
 %% state and any outbound messages to disk and deleting the inbound message
 %% after processing the message. Assuming no disk failures, the Erlang process,
 %% the Erlang VM or the host operating system should be able to fail at any time
-%% and recover where it left off.
+%% and recover where it left off. All messages have a clear ownership and are not
+%% removed until they've been handled or someone else has taken ownership.
 %%
 %% Relcast does this using 3 kinds of keys
 %%
@@ -31,19 +32,33 @@
 %%  handled immediately and any new state or new outbound messages are stored to
 %%  disk.
 %%
-%%  Outbound values come in 2 types; unicast and multicast.
+%%  Outbound values come in 2 types; unicast, multicast and 'callback'.
 %%
-%%  Unicast values look like this: <<1:1/bits, ActorID:15/integer, Value/binary>>
+%%  Unicast values look like this: <<1:2/bits, ActorID:14/integer, Value/binary>>
 %%  and are only intended for delivery to a single peer, identified by ActorID.
 %%  Once the designated Actor has ACKed the message, the key can be deleted.
 %%
 %%  Multicast values look like this:
-%%  <<0:1/bits, ActorBitMask:BitmaskSize/integer, Value/binary>> and are
+%%  <<0:2/bits, ActorBitMask:BitmaskSize/integer, Value/binary>> and are
 %%  intended to be delivered to every other actor in the consensus group. Each
 %%  time a send to one of the peers is ACKed, the bit for that actor is set to
 %%  0. Once all the bits have been set to 0, the key can be deleted. The bitmask
 %%  is stored least significant bit first and is padded to be a multiple of 8
 %%  (along with the leading 0 bit) so the message is always byte aligned.
+%%
+%%  Callback values look like this:
+%%  <<2:2/bits, ActorBitMask:BitmaskSize/integer, Value/binary>> and are very
+%%  similar to multicast values with one crucial difference. When relcast finds
+%%  that the next message for an actor is a callback message, it invokes
+%%  Module:callback_message(ActorID, Message, ModuleState). This call should
+%%  produce either the actual binary of the message to send or `none` to indicate
+%%  no message should be sent for that actor (in which case the bitfield is cleared
+%%  for that actor immediately and the search for the next message for that actor
+%%  continues. This message type is useful, for example, if you have a message with
+%%  a large common term and some smaller per-user terms that you need to send to
+%%  all actors but don't want to store separetely N times. It could also be useful
+%%  if you don't know if the message will ever be sent and it involves some expensive
+%%  computation or a signature. The module should not be modified as it is not returned.
 %%
 %%  Epochs
 %%  Relcast has the notion of epochs for protocols that have the property of "if
@@ -74,6 +89,8 @@
 -callback handle_command(Request :: term(), State :: term()) ->
    {reply, Reply :: term(), Actions :: actions(), NewState :: term()} |
    {reply, Reply :: term(), ignore}. %% when there's no changes, likely just returning information
+-callback callback_message(ActorID :: pos_integer(), Message :: binary(), State :: term()) ->
+    binary() | none.
 -callback terminate(Reason :: term(), NewState :: term()) -> any().
 -optional_callbacks([terminate/2]).
 
@@ -178,7 +195,8 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                   ModuleState0
                           end,
             LastKey = get_last_key(DB, ActiveCF),
-            BitFieldSize = round_to_nearest_byte(length(ActorIDs)) - 1, %% one bit for unicast/multicast
+            BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
+            ct:pal("bitfieldsize ~p", [BitFieldSize]),
             State = #state{module=Module, id=ActorID,
                            prev_cf = PrevCF,
                            active_cf = ActiveCF,
@@ -269,9 +287,9 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB}) ->
     case maps:get(ForActorID, State#state.pending_acks, undefined) of
         {Ref, CF, Key, _Multicast} ->
             case rocksdb:get(DB, CF, Key, []) of
-                {ok, <<1:1/integer, ForActorID:15/integer, Value/binary>>} ->
+                {ok, <<1:2/integer, ForActorID:14/integer, Value/binary>>} ->
                     {ok, Ref, Value, State};
-                {ok, <<0:1/integer, _:(BitfieldSize)/integer, Value/binary>>} ->
+                {ok, <<0:2/integer, _:(BitfieldSize)/integer, Value/binary>>} ->
                     {ok, Ref, Value, State};
                 not_found ->
                     %% something strange is happening, try again
@@ -306,7 +324,8 @@ ack(FromActorID, Ref, State = #state{db=DB}) ->
                     ok = rocksdb:delete(DB, CF, Key, []);
                 true ->
                     %% flip the bit, we can delete it next time we iterate
-                    ActorIDStr = io_lib:format("-~b", [FromActorID]),
+                    ActorIDStr = io_lib:format("-~b", [FromActorID+1]),
+                    ct:pal("merge ~s", [lists:flatten(ActorIDStr)]),
                     ok = rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), [{sync, true}]);
                 not_found ->
                     %% something strange is happening
@@ -454,7 +473,7 @@ handle_actions([{multicast, Message}|Tail], Batch, State =
                #state{key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
     Key = make_outbound_key(KeyCount),
-    rocksdb:batch_put(Batch, CF, Key, <<0:1/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
+    rocksdb:batch_put(Batch, CF, Key, <<0:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
     %% handle our own copy of the message
     %% deferring your own message is an error
     case Module:handle_message(Message, ID, State#state.modulestate) of
@@ -463,9 +482,27 @@ handle_actions([{multicast, Message}|Tail], Batch, State =
         {ModuleState, Actions} ->
             handle_actions(Actions++Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, key_count=KeyCount+1}))
     end;
+handle_actions([{callback, Message}|Tail], Batch, State =
+               #state{key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
+    Bitfield = make_bitfield(BitfieldSize, IDs, ID),
+    Key = make_outbound_key(KeyCount),
+    rocksdb:batch_put(Batch, CF, Key, <<2:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
+    case Module:callback_message(ID, Message, State#state.modulestate) of
+        none ->
+            handle_actions(Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{key_count=KeyCount+1}));
+        OurMessage when is_binary(OurMessage) ->
+            %% handle our own copy of the message
+            %% deferring your own message is an error
+            case Module:handle_message(OurMessage, ID, State#state.modulestate) of
+                ignore ->
+                    handle_actions(Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{key_count=KeyCount+1}));
+                {ModuleState, Actions} ->
+                    handle_actions(Actions++Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, key_count=KeyCount+1}))
+            end
+    end;
 handle_actions([{unicast, ToActorID, Message}|Tail], Batch, State = #state{key_count=KeyCount, active_cf=CF}) ->
     Key = make_outbound_key(KeyCount),
-    rocksdb:batch_put(Batch, CF, Key, <<1:1/integer, ToActorID:15/integer, Message/binary>>),
+    rocksdb:batch_put(Batch, CF, Key, <<1:2/integer, ToActorID:14/integer, Message/binary>>),
     handle_actions(Tail, Batch, update_next([ToActorID], CF, Key, State#state{key_count=KeyCount+1}));
 handle_actions([{stop, Timeout}|_Tail], _Batch, State) ->
     {stop, Timeout, State}.
@@ -491,17 +528,14 @@ make_bitfield(BitfieldSize, Actors, Actor) ->
                           <<1:1/integer>>
                   end
               end || A <- Actors >>,
-    Padding = << <<0:1/integer>> || _ <- lists:seq(0, BitfieldSize -
-                                                        length(Actors)) >>,
-    <<Bits:(length(Actors))/bits, Padding:(BitfieldSize -
-                                           length(Actors))/bits>>.
+    <<Bits:(length(Actors))/bits, 0:(BitfieldSize - length(Actors))/integer>>.
 
 db_options(NumActors) ->
     [
      {create_if_missing, true},
      {max_open_files, 1024},
      {max_log_file_size, 100*1024*1024},
-     {merge_operator, {bitset_merge_operator, round_to_nearest_byte(NumActors+1)}}
+     {merge_operator, {bitset_merge_operator, round_to_nearest_byte(NumActors+2)}}
     ].
 
 round_to_nearest_byte(Bits) ->
@@ -561,15 +595,15 @@ find_next_outbound_(_ActorId, {error, _}, Iter, _State) ->
     end,
     cf_iterator_close(Iter),
     Res;
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:1/integer, ActorID:15/integer, Value/binary>>}, Iter, _State) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, _State) ->
     %% unicast message for this actor
     CF = cf_iterator_id(Iter),
     cf_iterator_close(Iter),
     {Key, CF, Value, false};
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:1/integer, _/bits>>}, Iter, State) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:2/integer, _/bits>>}, Iter, State) ->
     %% unicast message for someone else
     find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:1/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize}) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize}) ->
     <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
     case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
         0 ->
@@ -587,6 +621,33 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:1/integer, Tail/b
             CF = cf_iterator_id(Iter),
             cf_iterator_close(Iter),
             {Key, CF, Value, true}
+    end;
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<2:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize, module=Module}) ->
+    <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
+    case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
+        0 ->
+            %% not for us, keep looking
+            case ActorMask == 0 of
+                true ->
+                    %% everyone has gotten this message, we can delete it now
+                    ok = rocksdb:delete(State#state.db, cf_iterator_id(Iter), Key, []);
+                false ->
+                    ok
+            end,
+            find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
+        _ ->
+            %% callback message with the high bit set for this actor
+            CF = cf_iterator_id(Iter),
+            case Module:callback_message(ActorID, Value, State#state.modulestate) of
+                none ->
+                    %% nothing for this actor
+                    ActorIDStr = io_lib:format("-~b", [ActorID+1]),
+                    ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), [{sync, true}]),
+                    find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
+                Message ->
+                    cf_iterator_close(Iter),
+                    {Key, CF, Message, true}
+            end
     end;
 find_next_outbound_(_ActorID, {ok, _Key, _Value}, Iter, _State) ->
     %% we hit the upper bound of the outbound messages
@@ -630,10 +691,10 @@ build_status({error, _}, Iter, _BFS, InboundQueue, OutboundQueue) ->
     {lists:reverse(InboundQueue), maps:map(fun(_K, V) -> lists:reverse(V) end, OutboundQueue)};
 build_status({ok, <<"i", _/binary>>, <<FromActorID:16/integer, Msg/binary>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
     build_status(cf_iterator_move(Iter, next), Iter, BFS, [{FromActorID, Msg}|InboundQueue], OutboundQueue);
-build_status({ok, <<"o", _/binary>>, <<1:1/integer, ActorID:15/integer, Value/binary>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
+build_status({ok, <<"o", _/binary>>, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
     %% unicast message
     build_status(cf_iterator_move(Iter, next), Iter, BFS, InboundQueue, prepend_message([ActorID], Value, OutboundQueue));
-build_status({ok, <<"o", _/binary>>, <<0:1/integer, Tail/bits>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
+build_status({ok, <<"o", _/binary>>, <<0:2/integer, Tail/bits>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
     <<ActorMask:BFS/bits, Value/binary>> = Tail,
     ActorIDs = actor_list(ActorMask, 1, []),
     build_status(cf_iterator_move(Iter, next), Iter, BFS, InboundQueue, prepend_message(ActorIDs, Value, OutboundQueue));
