@@ -275,6 +275,7 @@ self_callback_message(_Config) ->
     {false, _} = relcast:command(was_saluted, RC1),
     {ok, RC1_2} = relcast:deliver(<<"salute">>, 2, RC1),
     {ok, Ref,  <<"salutations to 2">>, RC1_3} = relcast:take(2, RC1_2),
+    {ok, Ref,  <<"salutations to 2">>, _} = relcast:take(2, RC1_3),
     {ok, Ref2, <<"salutations to 3">>, RC1_4} = relcast:take(3, RC1_3),
     {ok, RC1_5} = relcast:ack(2, Ref, RC1_4),
     {ok, RC1_6} = relcast:ack(3, Ref2, RC1_5),

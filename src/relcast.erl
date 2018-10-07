@@ -280,7 +280,7 @@ deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_c
     end.
 
 -spec take(pos_integer, #state{}) -> {not_found, #state{}} | {ok, reference(), binary(), #state{}}.
-take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB}) ->
+take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}) ->
     %% we need to find the first "unacked" message for this actor
     %% we should remember the last acked message for this actor ID and start there
     %% check if there's a pending ACK and use that to find the "last" key, if present
@@ -291,6 +291,17 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB}) ->
                     {ok, Ref, Value, State};
                 {ok, <<0:2/integer, _:(BitfieldSize)/integer, Value/binary>>} ->
                     {ok, Ref, Value, State};
+                {ok, <<2:2/integer, _:(BitfieldSize)/integer, Value/binary>>} ->
+                    case Module:callback_message(ForActorID, Value, State#state.modulestate) of
+                        none ->
+                            %% nothing for this actor, flip the bit
+                            ActorIDStr = io_lib:format("-~b", [ForActorID+1]),
+                            ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), [{sync, true}]),
+                            %% keep looking
+                            take(ForActorID, State#state{pending_acks=maps:remove(ForActorID, State#state.pending_acks)});
+                        Message ->
+                            {ok, Ref, Message, State}
+                    end;
                 not_found ->
                     %% something strange is happening, try again
                     take(ForActorID, State#state{pending_acks=maps:remove(ForActorID, State#state.pending_acks)})
