@@ -296,7 +296,7 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
                         none ->
                             %% nothing for this actor, flip the bit
                             ActorIDStr = io_lib:format("-~b", [ForActorID+1]),
-                            ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), [{sync, true}]),
+                            ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), []),
                             %% keep looking
                             take(ForActorID, State#state{pending_acks=maps:remove(ForActorID, State#state.pending_acks)});
                         Message ->
@@ -337,7 +337,7 @@ ack(FromActorID, Ref, State = #state{db=DB}) ->
                     %% flip the bit, we can delete it next time we iterate
                     ActorIDStr = io_lib:format("-~b", [FromActorID+1]),
                     ct:pal("merge ~s", [lists:flatten(ActorIDStr)]),
-                    ok = rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), [{sync, true}]);
+                    ok = rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), []);
                 not_found ->
                     %% something strange is happening
                     ok
@@ -653,7 +653,7 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<2:2/integer, Tail/b
                 none ->
                     %% nothing for this actor
                     ActorIDStr = io_lib:format("-~b", [ActorID+1]),
-                    ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), [{sync, true}]),
+                    ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), []),
                     find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
                 Message ->
                     cf_iterator_close(Iter),

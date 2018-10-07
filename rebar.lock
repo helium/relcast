@@ -1,4 +1,4 @@
 [{<<"rocksdb">>,
   {git,"https://gitlab.com/barrel-db/erlang-rocksdb.git",
-       {ref,"f81f284a409e1030039125f0690a00bb34cc6b2f"}},
+       {ref,"27ba8402f06e7a446184c70ca2019a5ff3cd1612"}},
   0}].
