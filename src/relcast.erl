@@ -32,7 +32,7 @@
 %%  handled immediately and any new state or new outbound messages are stored to
 %%  disk.
 %%
-%%  Outbound values come in 2 types; unicast, multicast and 'callback'.
+%%  Outbound values come in 3 types; unicast, multicast and 'callback'.
 %%
 %%  Unicast values look like this: <<1:2/bits, ActorID:14/integer, Value/binary>>
 %%  and are only intended for delivery to a single peer, identified by ActorID.
@@ -479,7 +479,7 @@ handle_actions([{multicast, Message}|Tail], Batch, State =
                #state{key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
     Key = make_outbound_key(KeyCount),
-    rocksdb:batch_put(Batch, CF, Key, <<0:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
+    ok = rocksdb:batch_put(Batch, CF, Key, <<0:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
     %% handle our own copy of the message
     %% deferring your own message is an error
     case Module:handle_message(Message, ID, State#state.modulestate) of
@@ -492,7 +492,7 @@ handle_actions([{callback, Message}|Tail], Batch, State =
                #state{key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
     Key = make_outbound_key(KeyCount),
-    rocksdb:batch_put(Batch, CF, Key, <<2:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
+    ok = rocksdb:batch_put(Batch, CF, Key, <<2:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
     case Module:callback_message(ID, Message, State#state.modulestate) of
         none ->
             handle_actions(Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{key_count=KeyCount+1}));
@@ -508,7 +508,7 @@ handle_actions([{callback, Message}|Tail], Batch, State =
     end;
 handle_actions([{unicast, ToActorID, Message}|Tail], Batch, State = #state{key_count=KeyCount, active_cf=CF}) ->
     Key = make_outbound_key(KeyCount),
-    rocksdb:batch_put(Batch, CF, Key, <<1:2/integer, ToActorID:14/integer, Message/binary>>),
+    ok = rocksdb:batch_put(Batch, CF, Key, <<1:2/integer, ToActorID:14/integer, Message/binary>>),
     handle_actions(Tail, Batch, update_next([ToActorID], CF, Key, State#state{key_count=KeyCount+1}));
 handle_actions([{stop, Timeout}|_Tail], _Batch, State) ->
     {stop, Timeout, State}.
