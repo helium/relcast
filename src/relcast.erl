@@ -196,7 +196,6 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                           end,
             LastKey = get_last_key(DB, ActiveCF),
             BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
-            ct:pal("bitfieldsize ~p", [BitFieldSize]),
             State = #state{module=Module, id=ActorID,
                            prev_cf = PrevCF,
                            active_cf = ActiveCF,
@@ -295,7 +294,7 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
                     case Module:callback_message(ForActorID, Value, State#state.modulestate) of
                         none ->
                             %% nothing for this actor, flip the bit
-                            ActorIDStr = io_lib:format("-~b", [ForActorID+1]),
+                            ActorIDStr = ["-", integer_to_list(ForActorID+1)],
                             ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), []),
                             %% keep looking
                             take(ForActorID, State#state{pending_acks=maps:remove(ForActorID, State#state.pending_acks)});
@@ -335,12 +334,8 @@ ack(FromActorID, Ref, State = #state{db=DB}) ->
                     ok = rocksdb:delete(DB, CF, Key, []);
                 true ->
                     %% flip the bit, we can delete it next time we iterate
-                    ActorIDStr = io_lib:format("-~b", [FromActorID+1]),
-                    ct:pal("merge ~s", [lists:flatten(ActorIDStr)]),
-                    ok = rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), []);
-                not_found ->
-                    %% something strange is happening
-                    ok
+                    ActorIDStr = ["-", integer_to_list(FromActorID+1)],
+                    ok = rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), [])
             end,
             NewPending = maps:remove(FromActorID, State#state.pending_acks),
             {ok, State#state{pending_acks=NewPending, last_sent=maps:put(FromActorID, {CF, Key}, State#state.last_sent)}};
@@ -652,7 +647,7 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<2:2/integer, Tail/b
             case Module:callback_message(ActorID, Value, State#state.modulestate) of
                 none ->
                     %% nothing for this actor
-                    ActorIDStr = io_lib:format("-~b", [ActorID+1]),
+                    ActorIDStr = ["-", integer_to_list(ActorID+1)],
                     ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), []),
                     find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
                 Message ->
