@@ -1,5 +1,5 @@
--module(relcast).
 
+%% @doc
 %% Relcast's job is ensure a consistent state for consensus protocols. It
 %% provides atomic updates to the consensus state, the inbound message queue and
 %% the outbound message queue. It does this by speculatively processing inbound messages,
@@ -12,13 +12,15 @@
 %%
 %% Relcast does this using 3 kinds of keys
 %%
-%% * <<"stored_module_state">> - this key stores the latest serialized state of the
+%% * `<<"stored_module_state">>' - this key stores the latest serialized state of the
 %%                        callback module's state. It is only read back from disk on
 %%                        recovery. This key is overwritten every time the module
 %%                        handles a message or an event.
-%% * <<"oXXXXXXXXXX">>  - an outbound key, representing a message this instance
+%%
+%% * `<<"oXXXXXXXXXX">>'  - an outbound key, representing a message this instance
 %%                        wishes to send to another peer.
-%% * <<"iXXXXXXXXXX">>  - an inbound key, this represents a message arriving
+%%
+%% * `<<"iXXXXXXXXXX">>'  - an inbound key, this represents a message arriving
 %%                        that has not been handled yet.
 %%
 %%  The 10 Xs in the inbound and outbound keys represent a strictly monotonic
@@ -26,7 +28,7 @@
 %%  so we can efficiently iterate over them independently. The 32 bit integer is
 %%  printed in left zero padded decimal so that the keys sort lexiographically.
 %%
-%%  Inbound values are stored in the form <<ActorID:16/integer, Value/binary>>.
+%%  Inbound values are stored in the form `<<ActorID:16/integer, Value/binary>>'.
 %%  Inbound messages are only stored if the handler indicates they cannot be
 %%  handled right now, up to a per-actor maximum. Other inbound events are
 %%  handled immediately and any new state or new outbound messages are stored to
@@ -34,12 +36,12 @@
 %%
 %%  Outbound values come in 3 types; unicast, multicast and 'callback'.
 %%
-%%  Unicast values look like this: <<1:2/bits, ActorID:14/integer, Value/binary>>
+%%  Unicast values look like this: `<<1:2/bits, ActorID:14/integer, Value/binary>>'
 %%  and are only intended for delivery to a single peer, identified by ActorID.
 %%  Once the designated Actor has ACKed the message, the key can be deleted.
 %%
 %%  Multicast values look like this:
-%%  <<0:2/bits, ActorBitMask:BitmaskSize/integer, Value/binary>> and are
+%%  `<<0:2/bits, ActorBitMask:BitmaskSize/integer, Value/binary>>' and are
 %%  intended to be delivered to every other actor in the consensus group. Each
 %%  time a send to one of the peers is ACKed, the bit for that actor is set to
 %%  0. Once all the bits have been set to 0, the key can be deleted. The bitmask
@@ -47,7 +49,7 @@
 %%  (along with the leading 0 bit) so the message is always byte aligned.
 %%
 %%  Callback values look like this:
-%%  <<2:2/bits, ActorBitMask:BitmaskSize/integer, Value/binary>> and are very
+%%  `<<2:2/bits, ActorBitMask:BitmaskSize/integer, Value/binary>>' and are very
 %%  similar to multicast values with one crucial difference. When relcast finds
 %%  that the next message for an actor is a callback message, it invokes
 %%  Module:callback_message(ActorID, Message, ModuleState). This call should
@@ -74,8 +76,7 @@
 %%  action the epoch counter is incremented by one. 2^32 epochs are allowed
 %%  before the counter wraps. Don't have 4 billion epochs, please.
 
-%% API exports
--export([]).
+-module(relcast).
 
 %%====================================================================
 %% Callback functions
@@ -135,9 +136,15 @@
           message_type :: inbound | outbound | both
          }).
 
+-type relcast_state() :: relcast_state().
+
 -export([start/5, command/2, deliver/3, take/2, ack/3, stop/2, status/1]).
 
--spec start(pos_integer(), [pos_integer(),...], atom(), list(), list()) -> error | {ok, #state{}} | {stop, pos_integer(), #state{}}.
+%% @doc Start a relcast instance. Starts a relcast instance for the actor
+%% `ActorID' in the group of `ActorIDs' using the callback module `Module'
+%% initialized with `Arguments'. `RelcastOptions' contains configuration options
+%% around the relcast itself, for example the data directory.
+-spec start(pos_integer(), [pos_integer(),...], atom(), list(), list()) -> error | {ok, relcast_state()} | {stop, pos_integer(), relcast_state()}.
 start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     DataDir = proplists:get_value(data_dir, RelcastOptions),
     DBOptions = db_options(length(ActorIDs)),
@@ -212,7 +219,12 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
             error
     end.
 
--spec command(any(), #state{}) -> {any(), #state{}} | {stop, any(), pos_integer(), #state{}}.
+%% @doc Send a command to the relcast callback module. Commands are distinct
+%% from messages as they do not originate from another actor in the relcast
+%% group. Commands are dispatched to `Module':handle_command and can simply
+%% return information via `{reply, Reply, ignore}' or update the callback
+%% module's state or send messages via `{reply, Reply, Actions, NewModuleState}'.
+-spec command(any(), relcast_state()) -> {any(), relcast_state()} | {stop, any(), pos_integer(), relcast_state()}.
 command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) ->
     case Module:handle_command(Message, ModuleState) of
         {reply, Reply, ignore} ->
@@ -238,7 +250,12 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
             end
     end.
 
--spec deliver(binary(), pos_integer(), #state{}) -> {ok, #state{}} | {stop, pos_integer(), #state{}} | full.
+%% @doc Deliver a message from another actor to the relcast instance. `Message'
+%% from `FromActorID' is submitted via `Module':handle_message. Depending on the
+%% result of this, the message is either consumed immediately, deferred for
+%% later, or this function returns `full' to indicate it cannot absorb any more
+%% deferred messages from this Actor.
+-spec deliver(binary(), pos_integer(), relcast_state()) -> {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
 deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_cf=CF, defers=Defers}) ->
     case maps:get(FromActorID, Defers, []) of
         [] ->
@@ -278,7 +295,12 @@ deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_c
             full
     end.
 
--spec take(pos_integer, #state{}) -> {not_found, #state{}} | {ok, reference(), binary(), #state{}}.
+%% @doc Get the next message this relcast has queued outbound for `ForActorID'.
+%% Once this message has been delivered to its destination, and acknowledged,
+%% `ack()' should be called with reference associated with the message.
+%% Subsequent calls to `take()' without any intervening acks will return the
+%% same message with the same reference (barring restarts or epoch changes).
+-spec take(pos_integer, relcast_state()) -> {not_found, relcast_state()} | {ok, reference(), binary(), relcast_state()}.
 take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}) ->
     %% we need to find the first "unacked" message for this actor
     %% we should remember the last acked message for this actor ID and start there
@@ -324,7 +346,9 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
             end
     end.
 
--spec ack(pos_integer(), reference(), #state{}) -> {ok, #state{}}.
+%% @doc Indicate to relcast that `FromActorID' has acknowledged receipt of the
+%% message associated with `Ref'.
+-spec ack(pos_integer(), reference(), relcast_state()) -> {ok, relcast_state()}.
 ack(FromActorID, Ref, State = #state{db=DB}) ->
     case maps:get(FromActorID, State#state.pending_acks, undefined) of
         {Ref, CF, Key, Multicast} ->
@@ -343,7 +367,8 @@ ack(FromActorID, Ref, State = #state{db=DB}) ->
             {ok, State}
     end.
 
--spec stop(any(), #state{}) -> ok.
+%% @doc Stop the relcast instance.
+-spec stop(any(), relcast_state()) -> ok.
 stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
     case erlang:function_exported(Module, terminate, 2) of
         true ->
@@ -353,7 +378,9 @@ stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
     end,
     rocksdb:close(State#state.db).
 
--spec status(#state{}) -> {ModuleState :: any(), InboundQueue ::
+%% @doc Get a representation of the relcast's module state, inbound queue and
+%% outbound queue.
+-spec status(relcast_state()) -> {ModuleState :: any(), InboundQueue ::
                            [{pos_integer(), binary()}], OutboundQueue ::
                            #{pos_integer() => [binary()]}}.
 status(State = #state{modulestate=ModuleState}) ->
@@ -365,7 +392,7 @@ status(State = #state{modulestate=ModuleState}) ->
 %% Internal functions
 %%====================================================================
 
--spec handle_pending_inbound(#state{}) -> {stop, pos_integer(), #state{}} | {ok, #state{}}.
+-spec handle_pending_inbound(relcast_state()) -> {stop, pos_integer(), relcast_state()} | {ok, relcast_state()}.
 handle_pending_inbound(State) ->
     %% so we need to start at the oldest messages in the inbound queue and
     %% attempt Module:handle_message on each one. If the module returns `defer'
@@ -739,7 +766,7 @@ actor_list(<<0:1/integer, Tail/bits>>, I, List) ->
 %% * you only iterate inbound/outbound messages
 %% * jumps across column families will start in the next
 %%   column family at the first key inbound/outbound key
--spec cf_iterator(#state{}, rocksdb:cf_handle(), inbound | outbound | both, list()) -> {ok, reference()}.
+-spec cf_iterator(relcast_state(), rocksdb:cf_handle(), inbound | outbound | both, list()) -> {ok, reference()}.
 cf_iterator(State, CF, MsgType, Args) when MsgType == inbound; MsgType == outbound; MsgType == both ->
     Ref = make_ref(),
     {CF, NextCF} = case {State#state.prev_cf, State#state.active_cf} of
