@@ -1,23 +1,26 @@
--module(relcast).
 
+%% @doc
 %% Relcast's job is ensure a consistent state for consensus protocols. It
 %% provides atomic updates to the consensus state, the inbound message queue and
-%% the outbound message queue. It does this by serializing all inbound messages
-%% to disk before attempting to process them, by serializing the new module
+%% the outbound message queue. It does this by speculatively processing inbound messages,
+%% serializing them to disk if they can't be handled now, by serializing the new module
 %% state and any outbound messages to disk and deleting the inbound message
 %% after processing the message. Assuming no disk failures, the Erlang process,
 %% the Erlang VM or the host operating system should be able to fail at any time
-%% and recover where it left off.
+%% and recover where it left off. All messages have a clear ownership and are not
+%% removed until they've been handled or someone else has taken ownership.
 %%
 %% Relcast does this using 3 kinds of keys
 %%
-%% * <<"stored_module_state">> - this key stores the latest serialized state of the
+%% * `<<"stored_module_state">>' - this key stores the latest serialized state of the
 %%                        callback module's state. It is only read back from disk on
 %%                        recovery. This key is overwritten every time the module
 %%                        handles a message or an event.
-%% * <<"oXXXXXXXXXX">>  - an outbound key, representing a message this instance
+%%
+%% * `<<"oXXXXXXXXXX">>'  - an outbound key, representing a message this instance
 %%                        wishes to send to another peer.
-%% * <<"iXXXXXXXXXX">>  - an inbound key, this represents a message arriving
+%%
+%% * `<<"iXXXXXXXXXX">>'  - an inbound key, this represents a message arriving
 %%                        that has not been handled yet.
 %%
 %%  The 10 Xs in the inbound and outbound keys represent a strictly monotonic
@@ -25,25 +28,39 @@
 %%  so we can efficiently iterate over them independently. The 32 bit integer is
 %%  printed in left zero padded decimal so that the keys sort lexiographically.
 %%
-%%  Inbound values are stored in the form <<ActorID:16/integer, Value/binary>>.
+%%  Inbound values are stored in the form `<<ActorID:16/integer, Value/binary>>'.
 %%  Inbound messages are only stored if the handler indicates they cannot be
 %%  handled right now, up to a per-actor maximum. Other inbound events are
 %%  handled immediately and any new state or new outbound messages are stored to
 %%  disk.
 %%
-%%  Outbound values come in 2 types; unicast and multicast.
+%%  Outbound values come in 3 types; unicast, multicast and 'callback'.
 %%
-%%  Unicast values look like this: <<1:1/bits, ActorID:15/integer, Value/binary>>
+%%  Unicast values look like this: `<<1:2/bits, ActorID:14/integer, Value/binary>>'
 %%  and are only intended for delivery to a single peer, identified by ActorID.
 %%  Once the designated Actor has ACKed the message, the key can be deleted.
 %%
 %%  Multicast values look like this:
-%%  <<0:1/bits, ActorBitMask:BitmaskSize/integer, Value/binary>> and are
+%%  `<<0:2/bits, ActorBitMask:BitmaskSize/integer, Value/binary>>' and are
 %%  intended to be delivered to every other actor in the consensus group. Each
 %%  time a send to one of the peers is ACKed, the bit for that actor is set to
 %%  0. Once all the bits have been set to 0, the key can be deleted. The bitmask
 %%  is stored least significant bit first and is padded to be a multiple of 8
 %%  (along with the leading 0 bit) so the message is always byte aligned.
+%%
+%%  Callback values look like this:
+%%  `<<2:2/bits, ActorBitMask:BitmaskSize/integer, Value/binary>>' and are very
+%%  similar to multicast values with one crucial difference. When relcast finds
+%%  that the next message for an actor is a callback message, it invokes
+%%  Module:callback_message(ActorID, Message, ModuleState). This call should
+%%  produce either the actual binary of the message to send or `none` to indicate
+%%  no message should be sent for that actor (in which case the bitfield is cleared
+%%  for that actor immediately and the search for the next message for that actor
+%%  continues. This message type is useful, for example, if you have a message with
+%%  a large common term and some smaller per-user terms that you need to send to
+%%  all actors but don't want to store separetely N times. It could also be useful
+%%  if you don't know if the message will ever be sent and it involves some expensive
+%%  computation or a signature. The module should not be modified as it is not returned.
 %%
 %%  Epochs
 %%  Relcast has the notion of epochs for protocols that have the property of "if
@@ -59,8 +76,7 @@
 %%  action the epoch counter is incremented by one. 2^32 epochs are allowed
 %%  before the counter wraps. Don't have 4 billion epochs, please.
 
-%% API exports
--export([]).
+-module(relcast).
 
 %%====================================================================
 %% Callback functions
@@ -74,6 +90,8 @@
 -callback handle_command(Request :: term(), State :: term()) ->
    {reply, Reply :: term(), Actions :: actions(), NewState :: term()} |
    {reply, Reply :: term(), ignore}. %% when there's no changes, likely just returning information
+-callback callback_message(ActorID :: pos_integer(), Message :: binary(), State :: term()) ->
+    binary() | none.
 -callback terminate(Reason :: term(), NewState :: term()) -> any().
 -optional_callbacks([terminate/2]).
 
@@ -118,9 +136,15 @@
           message_type :: inbound | outbound | both
          }).
 
+-type relcast_state() :: relcast_state().
+
 -export([start/5, command/2, deliver/3, take/2, ack/3, stop/2, status/1]).
 
--spec start(pos_integer(), [pos_integer(),...], atom(), list(), list()) -> error | {ok, #state{}} | {stop, pos_integer(), #state{}}.
+%% @doc Start a relcast instance. Starts a relcast instance for the actor
+%% `ActorID' in the group of `ActorIDs' using the callback module `Module'
+%% initialized with `Arguments'. `RelcastOptions' contains configuration options
+%% around the relcast itself, for example the data directory.
+-spec start(pos_integer(), [pos_integer(),...], atom(), list(), list()) -> error | {ok, relcast_state()} | {stop, pos_integer(), relcast_state()}.
 start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     DataDir = proplists:get_value(data_dir, RelcastOptions),
     DBOptions = db_options(length(ActorIDs)),
@@ -178,7 +202,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                   ModuleState0
                           end,
             LastKey = get_last_key(DB, ActiveCF),
-            BitFieldSize = round_to_nearest_byte(length(ActorIDs)) - 1, %% one bit for unicast/multicast
+            BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
             State = #state{module=Module, id=ActorID,
                            prev_cf = PrevCF,
                            active_cf = ActiveCF,
@@ -195,7 +219,12 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
             error
     end.
 
--spec command(any(), #state{}) -> {any(), #state{}} | {stop, any(), pos_integer(), #state{}}.
+%% @doc Send a command to the relcast callback module. Commands are distinct
+%% from messages as they do not originate from another actor in the relcast
+%% group. Commands are dispatched to `Module':handle_command and can simply
+%% return information via `{reply, Reply, ignore}' or update the callback
+%% module's state or send messages via `{reply, Reply, Actions, NewModuleState}'.
+-spec command(any(), relcast_state()) -> {any(), relcast_state()} | {stop, any(), pos_integer(), relcast_state()}.
 command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) ->
     case Module:handle_command(Message, ModuleState) of
         {reply, Reply, ignore} ->
@@ -221,7 +250,12 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
             end
     end.
 
--spec deliver(binary(), pos_integer(), #state{}) -> {ok, #state{}} | {stop, pos_integer(), #state{}} | full.
+%% @doc Deliver a message from another actor to the relcast instance. `Message'
+%% from `FromActorID' is submitted via `Module':handle_message. Depending on the
+%% result of this, the message is either consumed immediately, deferred for
+%% later, or this function returns `full' to indicate it cannot absorb any more
+%% deferred messages from this Actor.
+-spec deliver(binary(), pos_integer(), relcast_state()) -> {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
 deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_cf=CF, defers=Defers}) ->
     case maps:get(FromActorID, Defers, []) of
         [] ->
@@ -261,18 +295,34 @@ deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_c
             full
     end.
 
--spec take(pos_integer, #state{}) -> {not_found, #state{}} | {ok, reference(), binary(), #state{}}.
-take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB}) ->
+%% @doc Get the next message this relcast has queued outbound for `ForActorID'.
+%% Once this message has been delivered to its destination, and acknowledged,
+%% `ack()' should be called with reference associated with the message.
+%% Subsequent calls to `take()' without any intervening acks will return the
+%% same message with the same reference (barring restarts or epoch changes).
+-spec take(pos_integer, relcast_state()) -> {not_found, relcast_state()} | {ok, reference(), binary(), relcast_state()}.
+take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}) ->
     %% we need to find the first "unacked" message for this actor
     %% we should remember the last acked message for this actor ID and start there
     %% check if there's a pending ACK and use that to find the "last" key, if present
     case maps:get(ForActorID, State#state.pending_acks, undefined) of
         {Ref, CF, Key, _Multicast} ->
             case rocksdb:get(DB, CF, Key, []) of
-                {ok, <<1:1/integer, ForActorID:15/integer, Value/binary>>} ->
+                {ok, <<1:2/integer, ForActorID:14/integer, Value/binary>>} ->
                     {ok, Ref, Value, State};
-                {ok, <<0:1/integer, _:(BitfieldSize)/integer, Value/binary>>} ->
+                {ok, <<0:2/integer, _:(BitfieldSize)/integer, Value/binary>>} ->
                     {ok, Ref, Value, State};
+                {ok, <<2:2/integer, _:(BitfieldSize)/integer, Value/binary>>} ->
+                    case Module:callback_message(ForActorID, Value, State#state.modulestate) of
+                        none ->
+                            %% nothing for this actor, flip the bit
+                            ActorIDStr = ["-", integer_to_list(ForActorID+1)],
+                            ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), []),
+                            %% keep looking
+                            take(ForActorID, State#state{pending_acks=maps:remove(ForActorID, State#state.pending_acks)});
+                        Message ->
+                            {ok, Ref, Message, State}
+                    end;
                 not_found ->
                     %% something strange is happening, try again
                     take(ForActorID, State#state{pending_acks=maps:remove(ForActorID, State#state.pending_acks)})
@@ -296,7 +346,9 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB}) ->
             end
     end.
 
--spec ack(pos_integer(), reference(), #state{}) -> {ok, #state{}}.
+%% @doc Indicate to relcast that `FromActorID' has acknowledged receipt of the
+%% message associated with `Ref'.
+-spec ack(pos_integer(), reference(), relcast_state()) -> {ok, relcast_state()}.
 ack(FromActorID, Ref, State = #state{db=DB}) ->
     case maps:get(FromActorID, State#state.pending_acks, undefined) of
         {Ref, CF, Key, Multicast} ->
@@ -306,11 +358,8 @@ ack(FromActorID, Ref, State = #state{db=DB}) ->
                     ok = rocksdb:delete(DB, CF, Key, []);
                 true ->
                     %% flip the bit, we can delete it next time we iterate
-                    ActorIDStr = io_lib:format("-~b", [FromActorID]),
-                    ok = rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), [{sync, true}]);
-                not_found ->
-                    %% something strange is happening
-                    ok
+                    ActorIDStr = ["-", integer_to_list(FromActorID+1)],
+                    ok = rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), [])
             end,
             NewPending = maps:remove(FromActorID, State#state.pending_acks),
             {ok, State#state{pending_acks=NewPending, last_sent=maps:put(FromActorID, {CF, Key}, State#state.last_sent)}};
@@ -318,7 +367,8 @@ ack(FromActorID, Ref, State = #state{db=DB}) ->
             {ok, State}
     end.
 
--spec stop(any(), #state{}) -> ok.
+%% @doc Stop the relcast instance.
+-spec stop(any(), relcast_state()) -> ok.
 stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
     case erlang:function_exported(Module, terminate, 2) of
         true ->
@@ -328,7 +378,9 @@ stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
     end,
     rocksdb:close(State#state.db).
 
--spec status(#state{}) -> {ModuleState :: any(), InboundQueue ::
+%% @doc Get a representation of the relcast's module state, inbound queue and
+%% outbound queue.
+-spec status(relcast_state()) -> {ModuleState :: any(), InboundQueue ::
                            [{pos_integer(), binary()}], OutboundQueue ::
                            #{pos_integer() => [binary()]}}.
 status(State = #state{modulestate=ModuleState}) ->
@@ -340,7 +392,7 @@ status(State = #state{modulestate=ModuleState}) ->
 %% Internal functions
 %%====================================================================
 
--spec handle_pending_inbound(#state{}) -> {stop, pos_integer(), #state{}} | {ok, #state{}}.
+-spec handle_pending_inbound(relcast_state()) -> {stop, pos_integer(), relcast_state()} | {ok, relcast_state()}.
 handle_pending_inbound(State) ->
     %% so we need to start at the oldest messages in the inbound queue and
     %% attempt Module:handle_message on each one. If the module returns `defer'
@@ -454,7 +506,7 @@ handle_actions([{multicast, Message}|Tail], Batch, State =
                #state{key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
     Key = make_outbound_key(KeyCount),
-    rocksdb:batch_put(Batch, CF, Key, <<0:1/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
+    ok = rocksdb:batch_put(Batch, CF, Key, <<0:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
     %% handle our own copy of the message
     %% deferring your own message is an error
     case Module:handle_message(Message, ID, State#state.modulestate) of
@@ -463,9 +515,27 @@ handle_actions([{multicast, Message}|Tail], Batch, State =
         {ModuleState, Actions} ->
             handle_actions(Actions++Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, key_count=KeyCount+1}))
     end;
+handle_actions([{callback, Message}|Tail], Batch, State =
+               #state{key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
+    Bitfield = make_bitfield(BitfieldSize, IDs, ID),
+    Key = make_outbound_key(KeyCount),
+    ok = rocksdb:batch_put(Batch, CF, Key, <<2:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
+    case Module:callback_message(ID, Message, State#state.modulestate) of
+        none ->
+            handle_actions(Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{key_count=KeyCount+1}));
+        OurMessage when is_binary(OurMessage) ->
+            %% handle our own copy of the message
+            %% deferring your own message is an error
+            case Module:handle_message(OurMessage, ID, State#state.modulestate) of
+                ignore ->
+                    handle_actions(Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{key_count=KeyCount+1}));
+                {ModuleState, Actions} ->
+                    handle_actions(Actions++Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, key_count=KeyCount+1}))
+            end
+    end;
 handle_actions([{unicast, ToActorID, Message}|Tail], Batch, State = #state{key_count=KeyCount, active_cf=CF}) ->
     Key = make_outbound_key(KeyCount),
-    rocksdb:batch_put(Batch, CF, Key, <<1:1/integer, ToActorID:15/integer, Message/binary>>),
+    ok = rocksdb:batch_put(Batch, CF, Key, <<1:2/integer, ToActorID:14/integer, Message/binary>>),
     handle_actions(Tail, Batch, update_next([ToActorID], CF, Key, State#state{key_count=KeyCount+1}));
 handle_actions([{stop, Timeout}|_Tail], _Batch, State) ->
     {stop, Timeout, State}.
@@ -491,17 +561,14 @@ make_bitfield(BitfieldSize, Actors, Actor) ->
                           <<1:1/integer>>
                   end
               end || A <- Actors >>,
-    Padding = << <<0:1/integer>> || _ <- lists:seq(0, BitfieldSize -
-                                                        length(Actors)) >>,
-    <<Bits:(length(Actors))/bits, Padding:(BitfieldSize -
-                                           length(Actors))/bits>>.
+    <<Bits:(length(Actors))/bits, 0:(BitfieldSize - length(Actors))/integer>>.
 
 db_options(NumActors) ->
     [
      {create_if_missing, true},
      {max_open_files, 1024},
      {max_log_file_size, 100*1024*1024},
-     {merge_operator, {bitset_merge_operator, round_to_nearest_byte(NumActors+1)}}
+     {merge_operator, {bitset_merge_operator, round_to_nearest_byte(NumActors+2)}}
     ].
 
 round_to_nearest_byte(Bits) ->
@@ -561,15 +628,15 @@ find_next_outbound_(_ActorId, {error, _}, Iter, _State) ->
     end,
     cf_iterator_close(Iter),
     Res;
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:1/integer, ActorID:15/integer, Value/binary>>}, Iter, _State) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, _State) ->
     %% unicast message for this actor
     CF = cf_iterator_id(Iter),
     cf_iterator_close(Iter),
     {Key, CF, Value, false};
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:1/integer, _/bits>>}, Iter, State) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:2/integer, _/bits>>}, Iter, State) ->
     %% unicast message for someone else
     find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:1/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize}) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize}) ->
     <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
     case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
         0 ->
@@ -587,6 +654,33 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:1/integer, Tail/b
             CF = cf_iterator_id(Iter),
             cf_iterator_close(Iter),
             {Key, CF, Value, true}
+    end;
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<2:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize, module=Module}) ->
+    <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
+    case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
+        0 ->
+            %% not for us, keep looking
+            case ActorMask == 0 of
+                true ->
+                    %% everyone has gotten this message, we can delete it now
+                    ok = rocksdb:delete(State#state.db, cf_iterator_id(Iter), Key, []);
+                false ->
+                    ok
+            end,
+            find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
+        _ ->
+            %% callback message with the high bit set for this actor
+            CF = cf_iterator_id(Iter),
+            case Module:callback_message(ActorID, Value, State#state.modulestate) of
+                none ->
+                    %% nothing for this actor
+                    ActorIDStr = ["-", integer_to_list(ActorID+1)],
+                    ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), []),
+                    find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
+                Message ->
+                    cf_iterator_close(Iter),
+                    {Key, CF, Message, true}
+            end
     end;
 find_next_outbound_(_ActorID, {ok, _Key, _Value}, Iter, _State) ->
     %% we hit the upper bound of the outbound messages
@@ -630,10 +724,10 @@ build_status({error, _}, Iter, _BFS, InboundQueue, OutboundQueue) ->
     {lists:reverse(InboundQueue), maps:map(fun(_K, V) -> lists:reverse(V) end, OutboundQueue)};
 build_status({ok, <<"i", _/binary>>, <<FromActorID:16/integer, Msg/binary>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
     build_status(cf_iterator_move(Iter, next), Iter, BFS, [{FromActorID, Msg}|InboundQueue], OutboundQueue);
-build_status({ok, <<"o", _/binary>>, <<1:1/integer, ActorID:15/integer, Value/binary>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
+build_status({ok, <<"o", _/binary>>, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
     %% unicast message
     build_status(cf_iterator_move(Iter, next), Iter, BFS, InboundQueue, prepend_message([ActorID], Value, OutboundQueue));
-build_status({ok, <<"o", _/binary>>, <<0:1/integer, Tail/bits>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
+build_status({ok, <<"o", _/binary>>, <<0:2/integer, Tail/bits>>}, Iter, BFS, InboundQueue, OutboundQueue) ->
     <<ActorMask:BFS/bits, Value/binary>> = Tail,
     ActorIDs = actor_list(ActorMask, 1, []),
     build_status(cf_iterator_move(Iter, next), Iter, BFS, InboundQueue, prepend_message(ActorIDs, Value, OutboundQueue));
@@ -672,7 +766,7 @@ actor_list(<<0:1/integer, Tail/bits>>, I, List) ->
 %% * you only iterate inbound/outbound messages
 %% * jumps across column families will start in the next
 %%   column family at the first key inbound/outbound key
--spec cf_iterator(#state{}, rocksdb:cf_handle(), inbound | outbound | both, list()) -> {ok, reference()}.
+-spec cf_iterator(relcast_state(), rocksdb:cf_handle(), inbound | outbound | both, list()) -> {ok, reference()}.
 cf_iterator(State, CF, MsgType, Args) when MsgType == inbound; MsgType == outbound; MsgType == both ->
     Ref = make_ref(),
     {CF, NextCF} = case {State#state.prev_cf, State#state.active_cf} of
