@@ -108,7 +108,7 @@
         binary().
 
 %%====================================================================
-%% Callback functions
+%% State record
 %%====================================================================
 
 -record(state, {
@@ -136,7 +136,7 @@
           message_type :: inbound | outbound | both
          }).
 
--type relcast_state() :: relcast_state().
+-type relcast_state() :: #state{}.
 
 -export([start/5, command/2, deliver/3, take/2, ack/3, stop/2, status/1]).
 
@@ -197,6 +197,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                   {ok, RestoredModuleState} = Module:restore(OldModuleState, ModuleState0),
                                   RestoredModuleState;
                               not_found ->
+                                  %% This seems like something we should do?
                                   %% TODO there might be a chance we crashed between creating the next column family
                                   %% and writing the module state into it, check for this.
                                   ModuleState0
@@ -235,6 +236,7 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
             %% write new output messages & update the state atomically
             case handle_actions(Actions, Batch, State#state{modulestate=NewModuleState}) of
                 {ok, NewState} ->
+                    %% Abstract these two into a store_module_state function and use it in the four places this repetation occurs
                     ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
                     case handle_pending_inbound(NewState) of
@@ -315,7 +317,7 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
                 {ok, <<2:2/integer, _:(BitfieldSize)/integer, Value/binary>>} ->
                     case Module:callback_message(ForActorID, Value, State#state.modulestate) of
                         none ->
-                            %% nothing for this actor, flip the bit
+                            %% Abstract the bit flipping into a function. It's used a few times.
                             ActorIDStr = ["-", integer_to_list(ForActorID+1)],
                             ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), []),
                             %% keep looking
@@ -355,6 +357,7 @@ ack(FromActorID, Ref, State = #state{db=DB}) ->
             case Multicast of
                 false ->
                     %% unicast message, fine to delete now
+                    %% Do you want to ignore some of the error responses here? As in if the key is not found?
                     ok = rocksdb:delete(DB, CF, Key, []);
                 true ->
                     %% flip the bit, we can delete it next time we iterate
@@ -447,6 +450,7 @@ find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/bi
                                 Deferring, State)
     end;
 find_next_inbound({ok, Key, _Value}, Iter, Deferring, State) ->
+    %% Is this fixed now?
     %% XXX erlang-rocksb doesn't actually support the iterate_upper_bound option yet so we will see keys past the end of the range
     case Key > max_inbound_key() of
         true ->
@@ -638,6 +642,7 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:2/integer, _/bits>>}, I
     find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize}) ->
     <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
+    %% There's a lot of duplication between this and the next find_next_outbound head. Any way to simplify/combine?
     case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
         0 ->
             %% not for us, keep looking
