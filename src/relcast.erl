@@ -196,10 +196,20 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                   OldModuleState = Module:deserialize(SerializedModuleState),
                                   {ok, RestoredModuleState} = Module:restore(OldModuleState, ModuleState0),
                                   RestoredModuleState;
+                              not_found when PrevCF /= undefined ->
+                                  %% there might be a chance we crashed between creating the next column family
+                                  %% and writing the module state into it, so we check for this:
+                                  case rocksdb:get(DB, PrevCF, <<"stored_module_state">>, []) of
+                                      {ok, SerializedModuleState} ->
+                                          OldModuleState = Module:deserialize(SerializedModuleState),
+                                          {ok, RestoredModuleState} = Module:restore(OldModuleState, ModuleState0),
+                                          %% write the module state to the new epoch so it's here the next time
+                                          ok = rocksdb:put(DB, ActiveCF, <<"stored_module_state">>, Module:serialize(RestoredModuleState), [{sync, true}]),
+                                          RestoredModuleState;
+                                      not_found ->
+                                          ModuleState0
+                                  end;
                               not_found ->
-                                  %% This seems like something we should do?
-                                  %% TODO there might be a chance we crashed between creating the next column family
-                                  %% and writing the module state into it, check for this.
                                   ModuleState0
                           end,
             LastKey = get_last_key(DB, ActiveCF),
@@ -236,7 +246,6 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
             %% write new output messages & update the state atomically
             case handle_actions(Actions, Batch, State#state{modulestate=NewModuleState}) of
                 {ok, NewState} ->
-                    %% Abstract these two into a store_module_state function and use it in the four places this repetation occurs
                     ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
                     case handle_pending_inbound(NewState) of
@@ -302,7 +311,7 @@ deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_c
 %% `ack()' should be called with reference associated with the message.
 %% Subsequent calls to `take()' without any intervening acks will return the
 %% same message with the same reference (barring restarts or epoch changes).
--spec take(pos_integer, relcast_state()) -> {not_found, relcast_state()} | {ok, reference(), binary(), relcast_state()}.
+-spec take(pos_integer(), relcast_state()) -> {not_found, relcast_state()} | {ok, reference(), binary(), relcast_state()}.
 take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}) ->
     %% we need to find the first "unacked" message for this actor
     %% we should remember the last acked message for this actor ID and start there
@@ -317,9 +326,8 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
                 {ok, <<2:2/integer, _:(BitfieldSize)/integer, Value/binary>>} ->
                     case Module:callback_message(ForActorID, Value, State#state.modulestate) of
                         none ->
-                            %% Abstract the bit flipping into a function. It's used a few times.
-                            ActorIDStr = ["-", integer_to_list(ForActorID+1)],
-                            ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), []),
+                            %% ok, nothing for this actor ID for this callback message
+                            flip_actor_bit(ForActorID, State#state.db, CF, Key),
                             %% keep looking
                             take(ForActorID, State#state{pending_acks=maps:remove(ForActorID, State#state.pending_acks)});
                         Message ->
@@ -357,12 +365,10 @@ ack(FromActorID, Ref, State = #state{db=DB}) ->
             case Multicast of
                 false ->
                     %% unicast message, fine to delete now
-                    %% Do you want to ignore some of the error responses here? As in if the key is not found?
-                    ok = rocksdb:delete(DB, CF, Key, []);
+                    rocksdb:delete(DB, CF, Key, []);
                 true ->
                     %% flip the bit, we can delete it next time we iterate
-                    ActorIDStr = ["-", integer_to_list(FromActorID+1)],
-                    ok = rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), [])
+                    flip_actor_bit(FromActorID, DB, CF, Key)
             end,
             NewPending = maps:remove(FromActorID, State#state.pending_acks),
             {ok, State#state{pending_acks=NewPending, last_sent=maps:put(FromActorID, {CF, Key}, State#state.last_sent)}};
@@ -448,18 +454,6 @@ find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/bi
         true ->
               find_next_inbound(cf_iterator_move(Iter, next), Iter,
                                 Deferring, State)
-    end;
-find_next_inbound({ok, Key, _Value}, Iter, Deferring, State) ->
-    %% Is this fixed now?
-    %% XXX erlang-rocksb doesn't actually support the iterate_upper_bound option yet so we will see keys past the end of the range
-    case Key > max_inbound_key() of
-        true ->
-            ok = cf_iterator_close(Iter),
-            {ok, State};
-        false ->
-            %% this should not happen
-            find_next_inbound(cf_iterator_move(Iter, next), Iter,
-                              Deferring, State)
     end.
 
 
@@ -640,7 +634,7 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:2/integer, ActorI
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:2/integer, _/bits>>}, Iter, State) ->
     %% unicast message for someone else
     find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize}) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize}) when Type == 0; Type == 2 ->
     <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
     %% There's a lot of duplication between this and the next find_next_outbound head. Any way to simplify/combine?
     case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
@@ -654,43 +648,26 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:2/integer, Tail/b
                     ok
             end,
             find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
-        _ ->
+        _  when Type == 0 ->
             %% multicast message with the high bit set for this actor
             CF = cf_iterator_id(Iter),
             cf_iterator_close(Iter),
-            {Key, CF, Value, true}
-    end;
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<2:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize, module=Module}) ->
-    <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
-    case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
-        0 ->
-            %% not for us, keep looking
-            case ActorMask == 0 of
-                true ->
-                    %% everyone has gotten this message, we can delete it now
-                    ok = rocksdb:delete(State#state.db, cf_iterator_id(Iter), Key, []);
-                false ->
-                    ok
-            end,
-            find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
-        _ ->
+            {Key, CF, Value, true};
+        _  when Type == 2 ->
             %% callback message with the high bit set for this actor
             CF = cf_iterator_id(Iter),
+            Module = State#state.module,
             case Module:callback_message(ActorID, Value, State#state.modulestate) of
                 none ->
                     %% nothing for this actor
-                    ActorIDStr = ["-", integer_to_list(ActorID+1)],
-                    ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), []),
+                    flip_actor_bit(ActorID, State#state.db, CF, Key),
                     find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
                 Message ->
                     cf_iterator_close(Iter),
                     {Key, CF, Message, true}
             end
-    end;
-find_next_outbound_(_ActorID, {ok, _Key, _Value}, Iter, _State) ->
-    %% we hit the upper bound of the outbound messages
-    cf_iterator_close(Iter),
-    not_found.
+
+    end.
 
 min_inbound_key() ->
     <<"i0000000000">>.
@@ -764,6 +741,11 @@ actor_list(<<1:1/integer, Tail/bits>>, I, List) ->
     actor_list(Tail, I+1, [I|List]);
 actor_list(<<0:1/integer, Tail/bits>>, I, List) ->
     actor_list(Tail, I+1, List).
+
+flip_actor_bit(ActorID, DB, CF, Key) ->
+    ActorIDStr = ["-", integer_to_list(ActorID+1)],
+    rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), []).
+
 
 %% wrapper around rocksdb iterators that will iterate across column families.
 %% Requirements to use this:
