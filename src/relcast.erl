@@ -531,6 +531,15 @@ handle_actions([{callback, Message}|Tail], Batch, State =
                     handle_actions(Actions++Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, key_count=KeyCount+1}))
             end
     end;
+handle_actions([{unicast, ID, Message}|Tail], Batch, State = #state{module=Module, id=ID}) ->
+    %% handle our own message
+    %% deferring your own message is an error
+    case Module:handle_message(Message, ID, State#state.modulestate) of
+        ignore ->
+            handle_actions(Tail, Batch, State);
+        {ModuleState, Actions} ->
+            handle_actions(Actions++Tail, Batch, State#state{modulestate=ModuleState})
+    end;
 handle_actions([{unicast, ToActorID, Message}|Tail], Batch, State = #state{key_count=KeyCount, active_cf=CF}) ->
     Key = make_outbound_key(KeyCount),
     ok = rocksdb:batch_put(Batch, CF, Key, <<1:2/integer, ToActorID:14/integer, Message/binary>>),
