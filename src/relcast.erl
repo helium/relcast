@@ -189,7 +189,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                          {cf_to_epoch(Last), undefined, hd(lists:sublist(CFHs, length(CFHs) + 1 - 1, 1))}
                                  end
                          end,
-    case erlang:apply(Module, init, Arguments) of
+    case Module:init(Arguments) of
         {ok, ModuleState0} ->
             ModuleState = case rocksdb:get(DB, ActiveCF, <<"stored_module_state">>, []) of
                               {ok, SerializedModuleState} ->

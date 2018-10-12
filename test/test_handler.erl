@@ -21,7 +21,7 @@
           round = 0 :: non_neg_integer()
          }).
 
-init(ID) ->
+init([ID]) ->
     {ok, #state{id=ID}}.
 
 handle_command(next_epoch, State) ->
