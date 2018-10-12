@@ -645,7 +645,6 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:2/integer, _/bits>>}, I
     find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize}) when Type == 0; Type == 2 ->
     <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
-    %% There's a lot of duplication between this and the next find_next_outbound head. Any way to simplify/combine?
     case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
         0 ->
             %% not for us, keep looking
