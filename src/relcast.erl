@@ -137,6 +137,7 @@
          }).
 
 -type relcast_state() :: #state{}.
+-export_type([relcast_state/0]).
 
 -export([start/5, command/2, deliver/3, take/2, ack/3, stop/2, status/1]).
 
