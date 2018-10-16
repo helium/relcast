@@ -753,7 +753,8 @@ actor_list(<<0:1/integer, Tail/bits>>, I, List) ->
 
 flip_actor_bit(ActorID, DB, CF, Key) ->
     ActorIDStr = ["-", integer_to_list(ActorID+1)],
-    rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), []).
+    %% this can crash for odd reasons, but we don't care
+    catch rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), []).
 
 
 %% wrapper around rocksdb iterators that will iterate across column families.
