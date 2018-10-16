@@ -85,7 +85,7 @@
 -callback restore(OldState :: term(), NewState :: term()) -> {ok, State :: term()}.
 -callback serialize(State :: term()) -> Binary :: binary().
 -callback deserialize(Binary :: binary()) -> State :: term().
--callback handle_message(Message :: message(), ActorId :: pos_integer(), State :: term()) ->
+-callback handle_message(Message :: binary(), ActorId :: pos_integer(), State :: term()) ->
     {NewState :: term(), Actions :: actions()} | defer | ignore.
 -callback handle_command(Request :: term(), State :: term()) ->
    {reply, Reply :: term(), Actions :: actions(), NewState :: term()} |
