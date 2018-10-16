@@ -318,7 +318,7 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
     %% we should remember the last acked message for this actor ID and start there
     %% check if there's a pending ACK and use that to find the "last" key, if present
     case maps:get(ForActorID, State#state.pending_acks, undefined) of
-        {Ref, CF, Key, _Multicast} ->
+        {Ref, CF, Key, _Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
             case rocksdb:get(DB, CF, Key, []) of
                 {ok, <<1:2/integer, ForActorID:14/integer, Value/binary>>} ->
                     {ok, Ref, Value, State};
@@ -343,7 +343,14 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
                 none ->
                     %% we *know* there's nothing pending for this actor
                     {not_found, State};
-                {CF, StartKey} ->
+                {CF0, StartKey} ->
+                    %% check if the column family is still valid
+                    CF = case CF0 == State#state.active_cf orelse CF0 == State#state.prev_cf of
+                             true ->
+                                 CF0;
+                             false ->
+                                 State#state.prev_cf
+                         end,
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
                         {not_found, LastKey, CF2} ->
@@ -362,7 +369,7 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
 -spec ack(pos_integer(), reference(), relcast_state()) -> {ok, relcast_state()}.
 ack(FromActorID, Ref, State = #state{db=DB}) ->
     case maps:get(FromActorID, State#state.pending_acks, undefined) of
-        {Ref, CF, Key, Multicast} ->
+        {Ref, CF, Key, Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
             case Multicast of
                 false ->
                     %% unicast message, fine to delete now
