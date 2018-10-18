@@ -420,8 +420,7 @@ handle_pending_inbound(State) ->
     %% try to handle them again, as the module may now be ready to handle them.
     {ok, Iter} = cf_iterator(State, prev_cf(State), inbound, [{iterate_upper_bound, max_inbound_key()}]),
     Res = cf_iterator_move(Iter, {seek, min_inbound_key()}),
-    Deferring = [],
-    case find_next_inbound(Res, Iter, Deferring, State) of
+    case find_next_inbound(Res, Iter, State) of
         {stop, Timeout, State} ->
             {stop, Timeout, State};
         {ok, State} ->
@@ -432,42 +431,40 @@ handle_pending_inbound(State) ->
             handle_pending_inbound(NewState)
     end.
 
-find_next_inbound({error, _}, Iter, _, State) ->
+find_next_inbound({error, _}, Iter, State) ->
     ok = cf_iterator_close(Iter),
     {ok, State};
-find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/binary>>}, Iter, Deferring, State) ->
-    case lists:member(FromActorID, Deferring) of
-        false ->
-            CF = cf_iterator_id(Iter),
-            case handle_message(Key, CF, FromActorID, Msg, State) of
-                defer ->
-                    %% done processing messages from this actor
-                    find_next_inbound(cf_iterator_move(Iter, next), Iter,
-                                      [FromActorID|Deferring], State);
-                ignore ->
-                    %% keep on going
-                    find_next_inbound(cf_iterator_move(Iter, next), Iter,
-                                      Deferring, State);
-                {ok, NewState} ->
-                    %% refresh the iterator so it sees any new keys we wrote
-                    cf_iterator_refresh(Iter),
-                    %% we managed to handle a deferred message, yay
-                    OldDefers= maps:get(FromActorID, NewState#state.defers),
-                    find_next_inbound(cf_iterator_move(Iter, next), Iter,
-                                      Deferring, NewState#state{defers=maps:put(FromActorID, OldDefers -- [{CF, Key}], NewState#state.defers)});
-                {stop, Timeout, NewState} ->
-                    ok = cf_iterator_close(Iter),
-                    {stop, Timeout, NewState}
-            end;
-        true ->
-              find_next_inbound(cf_iterator_move(Iter, next), Iter,
-                                Deferring, State)
+find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/binary>>}, Iter, State) ->
+    CF = cf_iterator_id(Iter),
+    case handle_message(Key, CF, FromActorID, Msg, State) of
+        defer ->
+            %% done processing messages from this actor
+            find_next_inbound(cf_iterator_move(Iter, next), Iter, State);
+        ignore ->
+            %% keep on going
+            find_next_inbound(cf_iterator_move(Iter, next), Iter, State);
+        {ok, NewState} ->
+            %% refresh the iterator so it sees any new keys we wrote
+            cf_iterator_refresh(Iter),
+            %% we managed to handle a deferred message, yay
+            OldDefers= maps:get(FromActorID, NewState#state.defers),
+            find_next_inbound(cf_iterator_move(Iter, next), Iter,
+                              NewState#state{defers=maps:put(FromActorID, OldDefers -- [{CF, Key}], NewState#state.defers)});
+        {stop, Timeout, NewState} ->
+            ok = cf_iterator_close(Iter),
+            {stop, Timeout, NewState}
     end.
 
 
 handle_message(Key, CF, FromActorID, Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) ->
     case Module:handle_message(Message, FromActorID, ModuleState) of
         ignore ->
+            case Key /= undefined of
+                true ->
+                    rocksdb:delete(DB, CF, Key, []);
+                false ->
+                    ok
+            end,
             ignore;
         defer ->
             defer;

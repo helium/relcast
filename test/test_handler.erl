@@ -42,15 +42,16 @@ handle_command(Msg, _State) ->
 
 handle_message(<<"seq", Int:8/integer>>, Actor, State = #state{seqmap=Seqmap}) ->
     ct:pal("seq ~p from ~p", [Int, Actor]),
-    case maps:get(Actor, Seqmap, 0) + 1 of
+    Current = maps:get(Actor, Seqmap, 0),
+    case  Current + 1 of
         Int when Int =< State#state.round ->
             {State#state{seqmap=maps:put(Actor, Int, Seqmap)}, []};
-        Int ->
+        X when X > Current ->
             %% valid, but not yet
             defer;
-        _ ->
+        Other ->
             %% invalid, drop it
-            {State, []}
+            ignore
     end;
 handle_message(<<"greet">>, _Actor, State) ->
     {State, [{callback, <<"greet">>}]};
