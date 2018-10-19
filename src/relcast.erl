@@ -269,35 +269,44 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
 %% deferred messages from this Actor.
 -spec deliver(binary(), pos_integer(), relcast_state()) -> {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
 deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_cf=CF, defers=Defers}) ->
-    case maps:get(FromActorID, Defers, []) of
-        N when length(N) < 10 ->
-            case handle_message(undefined, undefined, FromActorID, Message, State) of
-                {ok, NewState} ->
-                    %% something happened, evaluate if we can handle any other blocked messages
-                    case length(maps:keys(Defers)) of
-                        0 ->
-                            %% no active defers, no queued inbound messages to evaluate
-                            {ok, NewState};
-                        _ ->
-                            case handle_pending_inbound(NewState) of
-                                {ok, NewerState} ->
-                                    {ok, NewerState};
-                                {stop, Timeout, NewerState} ->
-                                    {stop, Timeout, NewerState}
-                            end
-                    end;
-                {stop, Timeout, NewState} ->
-                    {stop, Timeout, NewState};
-                ignore ->
-                    {ok, State};
-                defer ->
-                    Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
-                    ok = rocksdb:put(DB, CF, Key, <<FromActorID:16/integer, Message/binary>>, [{sync, true}]),
-                    {ok, State#state{key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key}|N], Defers)}}
+    case handle_message(undefined, undefined, FromActorID, Message, State) of
+        {ok, NewState} ->
+            %% something happened, evaluate if we can handle any other blocked messages
+            case length(maps:keys(Defers)) of
+                0 ->
+                    %% no active defers, no queued inbound messages to evaluate
+                    {ok, NewState};
+                _ ->
+                    case handle_pending_inbound(NewState) of
+                        {ok, NewerState} ->
+                            {ok, NewerState};
+                        {stop, Timeout, NewerState} ->
+                            {stop, Timeout, NewerState}
+                    end
             end;
-        _ ->
-            %% sorry buddy, no room on the couch
-            full
+        {stop, Timeout, NewState} ->
+            {stop, Timeout, NewState};
+        ignore ->
+            {ok, State};
+        defer ->
+            DefersForThisActor = maps:get(FromActorID, Defers, []),
+            MsgHash = erlang:phash2(Message),
+            case lists:keyfind(MsgHash, 3, DefersForThisActor) of
+                false ->
+                    case DefersForThisActor of
+                        N when length(N) < 10 ->
+                            Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
+                            ok = rocksdb:put(DB, CF, Key, <<FromActorID:16/integer, Message/binary>>, [{sync, true}]),
+                            {ok, State#state{key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key, MsgHash}|N], Defers)}};
+                        _ ->
+                            %% sorry buddy, no room on the couch
+                            full
+                    end;
+                _ ->
+                    %% we already have a copy of this, this is likely a retry.
+                    %% we can accept it without changing our state at all
+                    {ok, State}
+            end
     end.
 
 %% @doc Get the next message this relcast has queued outbound for `ForActorID'.
@@ -440,9 +449,9 @@ find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/bi
             %% refresh the iterator so it sees any new keys we wrote
             cf_iterator_refresh(Iter),
             %% we managed to handle a deferred message, yay
-            OldDefers= maps:get(FromActorID, NewState#state.defers),
+            OldDefers = maps:get(FromActorID, NewState#state.defers),
             find_next_inbound(cf_iterator_move(Iter, next), Iter,
-                              NewState#state{defers=maps:put(FromActorID, OldDefers -- [{CF, Key}], NewState#state.defers)});
+                              NewState#state{defers=maps:put(FromActorID, OldDefers -- [{CF, Key, erlang:phash2(Msg)}], NewState#state.defers)});
         {stop, Timeout, NewState} ->
             ok = cf_iterator_close(Iter),
             {stop, Timeout, NewState}
@@ -725,9 +734,20 @@ build_status({ok, _Key, _Value}, Iter, BFS, InboundQueue, OutboundQueue) ->
 build_defer_list({error, _}, Iter, Acc) ->
     cf_iterator_close(Iter),
     Acc;
-build_defer_list({ok, <<"i", _/binary>>=Key, <<FromActorID:16/integer, _Msg/binary>>}, Iter, Acc) ->
+build_defer_list({ok, <<"i", _/binary>>=Key, <<FromActorID:16/integer, Msg/binary>>}, Iter, Acc) ->
     CF = cf_iterator_id(Iter),
-    build_defer_list(cf_iterator_move(Iter, next), Iter, maps:put(FromActorID, [{CF, Key}|maps:get(FromActorID, Acc, [])], Acc)).
+    DefersForThisActor = maps:get(FromActorID, Acc, []),
+    MsgHash = erlang:phash2(Msg),
+    case lists:keyfind(MsgHash, 3, DefersForThisActor) of
+        false ->
+            build_defer_list(cf_iterator_move(Iter, next), Iter, maps:put(FromActorID, [{CF, Key, MsgHash}|DefersForThisActor], Acc));
+        _ ->
+            %% already have a copy of this message deferred, delete this duplicate
+            %% this shouldn't happen in reality but it's good to check for it
+            DB = cf_iterator_db(Iter),
+            rocksdb:delete(DB, CF, Key, []),
+            build_defer_list(cf_iterator_move(Iter, next), Iter, Acc)
+    end.
 
 
 prepend_message(Actors, Message, Map) ->
@@ -811,6 +831,11 @@ cf_iterator_move(Ref, Args) ->
 cf_iterator_id(Ref) ->
     Iterator = erlang:get(Ref),
     Iterator#iterator.cf.
+
+-spec cf_iterator_db(reference()) -> rocksdb:db_handle().
+cf_iterator_db(Ref) ->
+    Iterator = erlang:get(Ref),
+    Iterator#iterator.db.
 
 cf_iterator_refresh(Ref) ->
     Iterator = erlang:get(Ref),
