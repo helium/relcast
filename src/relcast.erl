@@ -294,7 +294,7 @@ deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_c
             case lists:keyfind(MsgHash, 3, DefersForThisActor) of
                 false ->
                     case DefersForThisActor of
-                        N when length(N) < 10 ->
+                        N when length(N) < 100 ->
                             Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
                             ok = rocksdb:put(DB, CF, Key, <<FromActorID:16/integer, Message/binary>>, [{sync, true}]),
                             {ok, State#state{key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key, MsgHash}|N], Defers)}};
