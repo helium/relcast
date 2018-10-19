@@ -49,7 +49,7 @@ handle_message(<<"seq", Int:8/integer>>, Actor, State = #state{seqmap=Seqmap}) -
         X when X > Current ->
             %% valid, but not yet
             defer;
-        Other ->
+        _Other ->
             %% invalid, drop it
             ignore
     end;

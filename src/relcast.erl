@@ -270,7 +270,7 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
 -spec deliver(binary(), pos_integer(), relcast_state()) -> {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
 deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_cf=CF, defers=Defers}) ->
     case maps:get(FromActorID, Defers, []) of
-        [] ->
+        N when length(N) < 10 ->
             case handle_message(undefined, undefined, FromActorID, Message, State) of
                 {ok, NewState} ->
                     %% something happened, evaluate if we can handle any other blocked messages
@@ -293,15 +293,8 @@ deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_c
                 defer ->
                     Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
                     ok = rocksdb:put(DB, CF, Key, <<FromActorID:16/integer, Message/binary>>, [{sync, true}]),
-                    %% congratulations, first defer for this actor
-                    {ok, State#state{key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key}], Defers)}}
+                    {ok, State#state{key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key}|N], Defers)}}
             end;
-        N when length(N) < 10 ->
-            %% we can soak up some more
-            Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
-            ok = rocksdb:put(DB, CF, Key, <<FromActorID:16/integer, Message/binary>>, [{sync, true}]),
-            %% congratulations, first defer for this actor
-            {ok, State#state{key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key}|N], Defers)}};
         _ ->
             %% sorry buddy, no room on the couch
             full
