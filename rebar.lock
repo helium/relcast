@@ -1,6 +1,4 @@
-{"1.1.0",
-[{<<"rocksdb">>,{pkg,<<"rocksdb">>,<<"0.23.1">>},0}]}.
-[
-{pkg_hash,[
- {<<"rocksdb">>, <<"6CF2F15974110331B38FFFC862FE19B7A0EF67C1C0965DF0AA1A265FECB3A5F9">>}]}
-].
+[{<<"rocksdb">>,
+  {git,"https://gitlab.com/Vagabond1/erlang-rocksdb.git",
+       {ref,"16d0294f5b3a98d9715509bcccc84f615d01e98f"}},
+  0}].
