@@ -182,11 +182,13 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                          %% the last two are contiguous, delete all but those
                                          CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 2),
                                          [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
+                                         [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
                                          list_to_tuple([cf_to_epoch(Last)|lists:sublist(CFHs, length(CFHs) + 1 - 2, 2)]);
                                      false ->
                                          %% the last two are non contiguous, gotta prune all but the last one
                                          CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 1),
                                          [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
+                                         [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
                                          {cf_to_epoch(Last), undefined, hd(lists:sublist(CFHs, length(CFHs) + 1 - 1, 1))}
                                  end
                          end,
@@ -500,6 +502,7 @@ handle_actions([new_epoch|Tail], Batch, State) ->
         undefined -> State#state.defers;
         _ ->
             ok = rocksdb:drop_column_family(State#state.prev_cf),
+            ok = rocksdb:destroy_column_family(State#state.prev_cf),
             maps:map(fun(_, V) ->
                              lists:keydelete(State#state.prev_cf, 1, V)
                      end, State#state.defers)
