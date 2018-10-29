@@ -383,7 +383,7 @@ ack(FromActorID, Ref, State = #state{db=DB}) ->
                     flip_actor_bit(FromActorID, DB, CF, Key)
             end,
             NewPending = maps:remove(FromActorID, State#state.pending_acks),
-            {ok, State#state{pending_acks=NewPending, last_sent=maps:put(FromActorID, {CF, Key}, State#state.last_sent)}};
+            {ok, maybe_update_last(FromActorID, CF, Key, State#state{pending_acks=NewPending})};
         _ ->
             {ok, State}
     end.
@@ -412,6 +412,35 @@ status(State = #state{modulestate=ModuleState}) ->
 %%====================================================================
 %% Internal functions
 %%====================================================================
+
+-spec maybe_update_last(pos_integer(), rocksdb:cf_handle(), binary(), #state{}) -> #state{}.
+maybe_update_last(ActorID, CF, Key, State = #state{prev_cf=PrevCF}) ->
+    %% the last key ACK'd is not necessarily the last key by sequence number, due to
+    %% ordering and defer issues. Compare the new CF/Key and compare to the existing one,
+    %% if present and pick the 'oldest' one that is still valid.
+    {NewCF, NewKey} = case maps:get(ActorID, State#state.pending_acks, undefined) of
+                          {CF2, Key2} ->
+                              %% ok, now find the 'oldest' key and store it
+                              case {{CF, CF2}, {Key, Key2}} of
+                                  {{CF, CF}, {K1, K2}} when K1 =< K2 ->
+                                      %% column families are equal and K1 is older
+                                      {CF, K1};
+                                  {{CF, CF}, {K1, K2}} when K1 > K2 ->
+                                      %% column families are equal and K2 is older
+                                      {CF, K2};
+                                  {{PrevCF, _}, {K1, _}} ->
+                                      %% K1 comes from the previous column family, so it's older
+                                      %% or K2 comes from a deleted epoch
+                                      {CF, K1};
+                                  {{_, PrevCF}, {_, K2}} ->
+                                      %% K2 comes from the previous column family, so it's older
+                                      %% or K1 comes from a deleted epoch
+                                      {CF, K2}
+                              end;
+                          undefined ->
+                              {CF, Key}
+                      end,
+    State#state{last_sent=maps:put(ActorID, {NewCF, NewKey}, State#state.last_sent)}.
 
 -spec handle_pending_inbound(relcast_state()) -> {stop, pos_integer(), relcast_state()} | {ok, relcast_state()}.
 handle_pending_inbound(State) ->
