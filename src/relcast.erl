@@ -347,14 +347,15 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
                 none ->
                     %% we *know* there's nothing pending for this actor
                     {not_found, State};
-                {CF0, StartKey} ->
+                {CF0, StartKey0} ->
                     %% check if the column family is still valid
-                    CF = case CF0 == State#state.active_cf orelse CF0 == State#state.prev_cf of
-                             true ->
-                                 CF0;
-                             false ->
-                                 State#state.prev_cf
-                         end,
+                    {CF, StartKey} = case CF0 == State#state.active_cf orelse CF0 == State#state.prev_cf of
+                                         true ->
+                                             {CF0, StartKey0};
+                                         false ->
+                                             %% reset the start key as well
+                                             {State#state.prev_cf, min_inbound_key()}
+                                     end,
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
                         {not_found, LastKey, CF2} ->
