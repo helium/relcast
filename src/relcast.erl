@@ -421,22 +421,27 @@ maybe_update_last(ActorID, CF, Key, State = #state{prev_cf=PrevCF}) ->
     %% if present and pick the 'oldest' one that is still valid.
     Value = case maps:get(ActorID, State#state.pending_acks, undefined) of
                 {CF2, Key2} ->
-                    %% ok, now find which is the 'oldest' key and store it
-                    case {{CF, CF2}, {Key, Key2}} of
-                        {{CF, CF}, {K1, K2}} when K1 =< K2 ->
-                            %% column families are equal and K1 is older
-                            {CF, K1};
-                        {{CF, CF}, {K1, K2}} when K1 > K2 ->
-                            %% column families are equal and K2 is older
-                            {CF, K2};
-                        {{PrevCF, _}, {K1, _}} ->
-                            %% K1 comes from the previous column family, so it's older
-                            %% or K2 comes from a deleted epoch
-                            {CF, K1};
-                        {{_, PrevCF}, {_, K2}} ->
-                            %% K2 comes from the previous column family, so it's older
-                            %% or K1 comes from a deleted epoch
-                            {CF, K2}
+                    case rocksdb:get(State#state.db, CF2, Key2, []) of
+                        not_found ->
+                            {CF, Key};
+                        _ ->
+                            %% ok, now find which is the 'oldest' key and store it
+                            case {{CF, CF2}, {Key, Key2}} of
+                                {{CF, CF}, {K1, K2}} when K1 =< K2 ->
+                                    %% column families are equal and K1 is older
+                                    {CF, K1};
+                                {{CF, CF}, {K1, K2}} when K1 > K2 ->
+                                    %% column families are equal and K2 is older
+                                    {CF, K2};
+                                {{PrevCF, _}, {K1, _}} ->
+                                    %% K1 comes from the previous column family, so it's older
+                                    %% or K2 comes from a deleted epoch
+                                    {CF, K1};
+                                {{_, PrevCF}, {_, K2}} ->
+                                    %% K2 comes from the previous column family, so it's older
+                                    %% or K1 comes from a deleted epoch
+                                    {CF, K2}
+                            end
                     end;
                 none ->
                     {CF, Key};
