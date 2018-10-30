@@ -362,7 +362,8 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
                             {not_found, State#state{last_sent=maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
                         {Key, CF2, Msg, Multicast} ->
                             Ref = make_ref(),
-                            {ok, Ref, Msg, State#state{pending_acks=maps:put(ForActorID, {Ref, CF2, Key, Multicast}, State#state.pending_acks)}};
+                            {ok, Ref, Msg, State#state{last_sent=maps:put(ForActorID, {CF2, Key}, State#state.last_sent),
+                                                       pending_acks=maps:put(ForActorID, {Ref, CF2, Key, Multicast}, State#state.pending_acks)}};
                         not_found ->
                             {not_found, State#state{last_sent=maps:put(ForActorID, none, State#state.last_sent)}}
                     end
@@ -384,7 +385,7 @@ ack(FromActorID, Ref, State = #state{db=DB}) ->
                     flip_actor_bit(FromActorID, DB, CF, Key)
             end,
             NewPending = maps:remove(FromActorID, State#state.pending_acks),
-            {ok, maybe_update_last(FromActorID, CF, Key, State#state{pending_acks=NewPending})};
+            {ok, State#state{pending_acks=NewPending}};
         _ ->
             {ok, State}
     end.
@@ -413,50 +414,6 @@ status(State = #state{modulestate=ModuleState}) ->
 %%====================================================================
 %% Internal functions
 %%====================================================================
-
--spec maybe_update_last(pos_integer(), rocksdb:cf_handle(), binary(), #state{}) -> #state{}.
-maybe_update_last(ActorID, CF, Key, State = #state{prev_cf=PrevCF}) ->
-    %% the last key ACK'd is not necessarily the last key by sequence number, due to
-    %% ordering and defer issues. Compare the new CF/Key and compare to the existing one,
-    %% if present and pick the 'oldest' one that is still valid.
-    Value = case maps:get(ActorID, State#state.pending_acks, undefined) of
-                {CF2, Key2} ->
-                    case rocksdb:get(State#state.db, CF2, Key2, []) of
-                        not_found ->
-                            {CF, Key};
-                        _ ->
-                            %% ok, now find which is the 'oldest' key and store it
-                            case {{CF, CF2}, {Key, Key2}} of
-                                {{CF, CF}, {K1, K2}} when K1 =< K2 ->
-                                    %% column families are equal and K1 is older
-                                    {CF, K1};
-                                {{CF, CF}, {K1, K2}} when K1 > K2 ->
-                                    %% column families are equal and K2 is older
-                                    {CF, K2};
-                                {{PrevCF, _}, {K1, _}} ->
-                                    %% K1 comes from the previous column family, so it's older
-                                    %% or K2 comes from a deleted epoch
-                                    {CF, K1};
-                                {{_, PrevCF}, {_, K2}} ->
-                                    %% K2 comes from the previous column family, so it's older
-                                    %% or K1 comes from a deleted epoch
-                                    {CF, K2}
-                            end
-                    end;
-                none ->
-                    {CF, Key};
-                _ ->
-                    %% the cache is still warming up, find the oldest possible key
-                    case find_next_outbound(ActorID, prev_cf(State), min_outbound_key(), State) of
-                        {not_found, LastKey, CF2} ->
-                            {CF2, LastKey};
-                        {NewKey, CF2, _Msg, _Multicast} ->
-                            {CF2, NewKey};
-                        not_found ->
-                            {CF, Key}
-                    end
-            end,
-    State#state{last_sent=maps:put(ActorID, Value, State#state.last_sent)}.
 
 -spec handle_pending_inbound(relcast_state()) -> {stop, pos_integer(), relcast_state()} | {ok, relcast_state()}.
 handle_pending_inbound(State) ->
