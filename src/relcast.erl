@@ -432,39 +432,59 @@ handle_pending_inbound(Batch, State) ->
     %% try to handle them again, as the module may now be ready to handle them.
     {ok, Iter} = cf_iterator(State, prev_cf(State), inbound, [{iterate_upper_bound, max_inbound_key()}]),
     Res = cf_iterator_move(Iter, {seek, min_inbound_key()}),
-    case find_next_inbound(Res, Iter, Batch, false, State) of
+    case find_next_inbound(Res, Iter, Batch, false, [], State) of
         {stop, Timeout, State} ->
             {stop, Timeout, State};
-        {ok, false, State} ->
+        {ok, false, _, State} ->
             %% nothing changed, we're done here
             {ok, State};
-        {ok, true, NewState} ->
+        {ok, true, Acc, NewState} ->
             %% we changed something, try handling other deferreds again
-            %% TODO we should really cache the keys/values rather than re-iterating
-            handle_pending_inbound(Batch, NewState)
+            %% we have them in an accumulator, so we can just try to handle/delete them
+            handle_defers(Batch, Acc, [], false, NewState)
     end.
 
-find_next_inbound({error, _}, Iter, _Batch, Changed, State) ->
+find_next_inbound({error, _}, Iter, _Batch, Changed, Acc, State) ->
     ok = cf_iterator_close(Iter),
-    {ok, Changed, State};
-find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/binary>>}, Iter, Batch, Changed, State) ->
+    {ok, Changed, lists:reverse(Acc), State};
+find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/binary>>}, Iter, Batch, Changed, Acc, State) ->
     CF = cf_iterator_id(Iter),
     case handle_message(Key, CF, FromActorID, Msg, Batch, State) of
         defer ->
             %% keep on going
-            find_next_inbound(cf_iterator_move(Iter, next), Iter, Batch, Changed, State);
+            find_next_inbound(cf_iterator_move(Iter, next), Iter, Batch, Changed, [{CF, Key, FromActorID, Msg}|Acc], State);
         ignore ->
             %% keep on going
-            find_next_inbound(cf_iterator_move(Iter, next), Iter, Batch, Changed, State);
+            find_next_inbound(cf_iterator_move(Iter, next), Iter, Batch, Changed, Acc, State);
         {ok, NewState} ->
             %% refresh the iterator so it sees any new keys we wrote
             cf_iterator_refresh(Iter),
             %% we managed to handle a deferred message, yay
             OldDefers = maps:get(FromActorID, NewState#state.defers),
-            find_next_inbound(cf_iterator_move(Iter, next), Iter, Batch, true,
+            find_next_inbound(cf_iterator_move(Iter, next), Iter, Batch, true, Acc,
                               NewState#state{defers=maps:put(FromActorID, OldDefers -- [{CF, Key, erlang:phash2(Msg)}], NewState#state.defers)});
         {stop, Timeout, NewState} ->
             ok = cf_iterator_close(Iter),
+            {stop, Timeout, NewState}
+    end.
+
+handle_defers(Batch, [], Out, true, State) ->
+    %% we changed something, go around again
+    handle_defers(Batch, Out, [], false, State);
+handle_defers(_Batch, [], _Out, false, State) ->
+    %% no changes this iteration, bail
+    {ok, State};
+handle_defers(Batch, [{CF, Key, FromActorID, Msg}|Acc], Out, Changed, State) ->
+    case handle_message(Key, CF, FromActorID, Msg, Batch, State) of
+        defer ->
+            handle_defers(Batch, Acc, [{CF, Key, FromActorID, Msg}|Out], Changed, State);
+        ignore ->
+            handle_defers(Batch, Acc, [{CF, Key, FromActorID, Msg}|Out], Changed, State);
+        {ok, NewState} ->
+            OldDefers = maps:get(FromActorID, NewState#state.defers),
+            handle_defers(Batch, Acc, Out, true,
+                              NewState#state{defers=maps:put(FromActorID, OldDefers -- [{CF, Key, erlang:phash2(Msg)}], NewState#state.defers)});
+        {stop, Timeout, NewState} ->
             {stop, Timeout, NewState}
     end.
 
