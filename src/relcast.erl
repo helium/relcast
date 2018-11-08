@@ -85,7 +85,7 @@
 -callback restore(OldState :: term(), NewState :: term()) -> {ok, State :: term()}.
 -callback serialize(State :: term()) -> Binary :: binary().
 -callback deserialize(Binary :: binary()) -> State :: term().
--callback handle_message(Message :: message(), ActorId :: pos_integer(), State :: term()) ->
+-callback handle_message(Message :: binary(), ActorId :: pos_integer(), State :: term()) ->
     {NewState :: term(), Actions :: actions()} | defer | ignore.
 -callback handle_command(Request :: term(), State :: term()) ->
    {reply, Reply :: term(), Actions :: actions(), NewState :: term()} |
@@ -108,7 +108,7 @@
         binary().
 
 %%====================================================================
-%% Callback functions
+%% State record
 %%====================================================================
 
 -record(state, {
@@ -136,7 +136,8 @@
           message_type :: inbound | outbound | both
          }).
 
--type relcast_state() :: relcast_state().
+-type relcast_state() :: #state{}.
+-export_type([relcast_state/0]).
 
 -export([start/5, command/2, deliver/3, take/2, ack/3, stop/2, status/1]).
 
@@ -181,24 +182,37 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                          %% the last two are contiguous, delete all but those
                                          CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 2),
                                          [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
+                                         [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
                                          list_to_tuple([cf_to_epoch(Last)|lists:sublist(CFHs, length(CFHs) + 1 - 2, 2)]);
                                      false ->
                                          %% the last two are non contiguous, gotta prune all but the last one
                                          CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 1),
                                          [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
+                                         [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
                                          {cf_to_epoch(Last), undefined, hd(lists:sublist(CFHs, length(CFHs) + 1 - 1, 1))}
                                  end
                          end,
-    case erlang:apply(Module, init, Arguments) of
+    case Module:init(Arguments) of
         {ok, ModuleState0} ->
             ModuleState = case rocksdb:get(DB, ActiveCF, <<"stored_module_state">>, []) of
                               {ok, SerializedModuleState} ->
                                   OldModuleState = Module:deserialize(SerializedModuleState),
                                   {ok, RestoredModuleState} = Module:restore(OldModuleState, ModuleState0),
                                   RestoredModuleState;
+                              not_found when PrevCF /= undefined ->
+                                  %% there might be a chance we crashed between creating the next column family
+                                  %% and writing the module state into it, so we check for this:
+                                  case rocksdb:get(DB, PrevCF, <<"stored_module_state">>, []) of
+                                      {ok, SerializedModuleState} ->
+                                          OldModuleState = Module:deserialize(SerializedModuleState),
+                                          {ok, RestoredModuleState} = Module:restore(OldModuleState, ModuleState0),
+                                          %% write the module state to the new epoch so it's here the next time
+                                          ok = rocksdb:put(DB, ActiveCF, <<"stored_module_state">>, Module:serialize(RestoredModuleState), [{sync, true}]),
+                                          RestoredModuleState;
+                                      not_found ->
+                                          ModuleState0
+                                  end;
                               not_found ->
-                                  %% TODO there might be a chance we crashed between creating the next column family
-                                  %% and writing the module state into it, check for this.
                                   ModuleState0
                           end,
             LastKey = get_last_key(DB, ActiveCF),
@@ -214,7 +228,10 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
             {ok, Iter} = cf_iterator(State, prev_cf(State), inbound, [{iterate_upper_bound, max_inbound_key()}]),
             Defers = build_defer_list(cf_iterator_move(Iter, {seek, min_inbound_key()}), Iter, #{}),
             %% try to deliver any old queued inbound messages
-            handle_pending_inbound(State#state{defers=Defers});
+            {ok, Batch} = rocksdb:batch(),
+            {ok, NewState} = handle_pending_inbound(Batch, State#state{defers=Defers}),
+            ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
+            {ok, NewState};
         _ ->
             error
     end.
@@ -233,21 +250,21 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
         {reply, Reply, Actions, NewModuleState} ->
             {ok, Batch} = rocksdb:batch(),
             %% write new output messages & update the state atomically
-            case handle_actions(Actions, Batch, State#state{modulestate=NewModuleState}) of
-                {ok, NewState} ->
-                    ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
-                    ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
-                    case handle_pending_inbound(NewState) of
-                        {ok, NewerState} ->
-                            {Reply, NewerState};
-                        {stop, Timeout, NewerState} ->
-                            {stop, Reply, Timeout, NewerState}
-                    end;
-                {stop, Timeout, NewState} ->
-                    ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
-                    ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
-                    {stop, Reply, Timeout, NewState}
-            end
+            Result = case handle_actions(Actions, Batch, State#state{modulestate=NewModuleState}) of
+                         {ok, NewState} ->
+                             ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
+                             case handle_pending_inbound(Batch, NewState) of
+                                 {ok, NewerState} ->
+                                     {Reply, NewerState};
+                                 {stop, Timeout, NewerState} ->
+                                     {stop, Reply, Timeout, NewerState}
+                             end;
+                         {stop, Timeout, NewState} ->
+                             ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
+                             {stop, Reply, Timeout, NewState}
+                     end,
+            ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
+            Result
     end.
 
 %% @doc Deliver a message from another actor to the relcast instance. `Message'
@@ -257,56 +274,61 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
 %% deferred messages from this Actor.
 -spec deliver(binary(), pos_integer(), relcast_state()) -> {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
 deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_cf=CF, defers=Defers}) ->
-    case maps:get(FromActorID, Defers, []) of
-        [] ->
-            case handle_message(undefined, undefined, FromActorID, Message, State) of
-                {ok, NewState} ->
-                    %% something happened, evaluate if we can handle any other blocked messages
-                    case length(maps:keys(Defers)) of
-                        0 ->
-                            %% no active defers, no queued inbound messages to evaluate
-                            {ok, NewState};
-                        _ ->
-                            case handle_pending_inbound(NewState) of
-                                {ok, NewerState} ->
-                                    {ok, NewerState};
-                                {stop, Timeout, NewerState} ->
-                                    {stop, Timeout, NewerState}
-                            end
-                    end;
-                {stop, Timeout, NewState} ->
-                    {stop, Timeout, NewState};
-                ignore ->
-                    {ok, State};
-                defer ->
-                    Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
-                    ok = rocksdb:put(DB, CF, Key, <<FromActorID:16/integer, Message/binary>>, [{sync, true}]),
-                    %% congratulations, first defer for this actor
-                    {ok, State#state{key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key}], Defers)}}
-            end;
-        N when length(N) < 10 ->
-            %% we can soak up some more
-            Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
-            ok = rocksdb:put(DB, CF, Key, <<FromActorID:16/integer, Message/binary>>, [{sync, true}]),
-            %% congratulations, first defer for this actor
-            {ok, State#state{key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key}|N], Defers)}};
-        _ ->
-            %% sorry buddy, no room on the couch
-            full
-    end.
+    {ok, Batch} = rocksdb:batch(),
+    Result = case handle_message(undefined, undefined, FromActorID, Message, Batch, State) of
+                 {ok, NewState} ->
+                     %% something happened, evaluate if we can handle any other blocked messages
+                     case length(maps:keys(Defers)) of
+                         0 ->
+                             %% no active defers, no queued inbound messages to evaluate
+                             {ok, NewState};
+                         _ ->
+                             case handle_pending_inbound(Batch, NewState) of
+                                 {ok, NewerState} ->
+                                     {ok, NewerState};
+                                 {stop, Timeout, NewerState} ->
+                                     {stop, Timeout, NewerState}
+                             end
+                     end;
+                 {stop, Timeout, NewState} ->
+                     {stop, Timeout, NewState};
+                 ignore ->
+                     {ok, State};
+                 defer ->
+                     DefersForThisActor = maps:get(FromActorID, Defers, []),
+                     MsgHash = erlang:phash2(Message),
+                     case lists:keyfind(MsgHash, 3, DefersForThisActor) of
+                         false ->
+                             case DefersForThisActor of
+                                 N when length(N) < 100 ->
+                                     Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
+                                     ok = rocksdb:batch_put(Batch, CF, Key, <<FromActorID:16/integer, Message/binary>>),
+                                     {ok, State#state{key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key, MsgHash}|N], Defers)}};
+                                 _ ->
+                                     %% sorry buddy, no room on the couch
+                                     full
+                             end;
+                         _ ->
+                             %% we already have a copy of this, this is likely a retry.
+                             %% we can accept it without changing our state at all
+                             {ok, State}
+                     end
+             end,
+    ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
+    Result.
 
 %% @doc Get the next message this relcast has queued outbound for `ForActorID'.
 %% Once this message has been delivered to its destination, and acknowledged,
 %% `ack()' should be called with reference associated with the message.
 %% Subsequent calls to `take()' without any intervening acks will return the
 %% same message with the same reference (barring restarts or epoch changes).
--spec take(pos_integer, relcast_state()) -> {not_found, relcast_state()} | {ok, reference(), binary(), relcast_state()}.
+-spec take(pos_integer(), relcast_state()) -> {not_found, relcast_state()} | {ok, reference(), binary(), relcast_state()}.
 take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}) ->
     %% we need to find the first "unacked" message for this actor
     %% we should remember the last acked message for this actor ID and start there
     %% check if there's a pending ACK and use that to find the "last" key, if present
     case maps:get(ForActorID, State#state.pending_acks, undefined) of
-        {Ref, CF, Key, _Multicast} ->
+        {Ref, CF, Key, _Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
             case rocksdb:get(DB, CF, Key, []) of
                 {ok, <<1:2/integer, ForActorID:14/integer, Value/binary>>} ->
                     {ok, Ref, Value, State};
@@ -315,9 +337,8 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
                 {ok, <<2:2/integer, _:(BitfieldSize)/integer, Value/binary>>} ->
                     case Module:callback_message(ForActorID, Value, State#state.modulestate) of
                         none ->
-                            %% nothing for this actor, flip the bit
-                            ActorIDStr = ["-", integer_to_list(ForActorID+1)],
-                            ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), []),
+                            %% ok, nothing for this actor ID for this callback message
+                            flip_actor_bit(ForActorID, State#state.db, CF, Key),
                             %% keep looking
                             take(ForActorID, State#state{pending_acks=maps:remove(ForActorID, State#state.pending_acks)});
                         Message ->
@@ -332,14 +353,23 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
                 none ->
                     %% we *know* there's nothing pending for this actor
                     {not_found, State};
-                {CF, StartKey} ->
+                {CF0, StartKey0} ->
+                    %% check if the column family is still valid
+                    {CF, StartKey} = case CF0 == State#state.active_cf orelse CF0 == State#state.prev_cf of
+                                         true ->
+                                             {CF0, StartKey0};
+                                         false ->
+                                             %% reset the start key as well
+                                             {State#state.prev_cf, min_inbound_key()}
+                                     end,
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
                         {not_found, LastKey, CF2} ->
                             {not_found, State#state{last_sent=maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
                         {Key, CF2, Msg, Multicast} ->
                             Ref = make_ref(),
-                            {ok, Ref, Msg, State#state{pending_acks=maps:put(ForActorID, {Ref, CF2, Key, Multicast}, State#state.pending_acks)}};
+                            {ok, Ref, Msg, State#state{last_sent=maps:put(ForActorID, {CF2, Key}, State#state.last_sent),
+                                                       pending_acks=maps:put(ForActorID, {Ref, CF2, Key, Multicast}, State#state.pending_acks)}};
                         not_found ->
                             {not_found, State#state{last_sent=maps:put(ForActorID, none, State#state.last_sent)}}
                     end
@@ -351,18 +381,17 @@ take(ForActorID, State = #state{bitfieldsize=BitfieldSize, db=DB, module=Module}
 -spec ack(pos_integer(), reference(), relcast_state()) -> {ok, relcast_state()}.
 ack(FromActorID, Ref, State = #state{db=DB}) ->
     case maps:get(FromActorID, State#state.pending_acks, undefined) of
-        {Ref, CF, Key, Multicast} ->
+        {Ref, CF, Key, Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
             case Multicast of
                 false ->
                     %% unicast message, fine to delete now
-                    ok = rocksdb:delete(DB, CF, Key, []);
+                    rocksdb:delete(DB, CF, Key, []);
                 true ->
                     %% flip the bit, we can delete it next time we iterate
-                    ActorIDStr = ["-", integer_to_list(FromActorID+1)],
-                    ok = rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), [])
+                    flip_actor_bit(FromActorID, DB, CF, Key)
             end,
             NewPending = maps:remove(FromActorID, State#state.pending_acks),
-            {ok, State#state{pending_acks=NewPending, last_sent=maps:put(FromActorID, {CF, Key}, State#state.last_sent)}};
+            {ok, State#state{pending_acks=NewPending}};
         _ ->
             {ok, State}
     end.
@@ -392,8 +421,8 @@ status(State = #state{modulestate=ModuleState}) ->
 %% Internal functions
 %%====================================================================
 
--spec handle_pending_inbound(relcast_state()) -> {stop, pos_integer(), relcast_state()} | {ok, relcast_state()}.
-handle_pending_inbound(State) ->
+-spec handle_pending_inbound(rocksdb:batch_handle(), relcast_state()) -> {stop, pos_integer(), relcast_state()} | {ok, relcast_state()}.
+handle_pending_inbound(Batch, State) ->
     %% so we need to start at the oldest messages in the inbound queue and
     %% attempt Module:handle_message on each one. If the module returns `defer'
     %% we need to not attempt to deliver any newer messages from that actor.
@@ -403,70 +432,76 @@ handle_pending_inbound(State) ->
     %% try to handle them again, as the module may now be ready to handle them.
     {ok, Iter} = cf_iterator(State, prev_cf(State), inbound, [{iterate_upper_bound, max_inbound_key()}]),
     Res = cf_iterator_move(Iter, {seek, min_inbound_key()}),
-    Deferring = [],
-    case find_next_inbound(Res, Iter, Deferring, State) of
+    case find_next_inbound(Res, Iter, Batch, false, [], State) of
         {stop, Timeout, State} ->
             {stop, Timeout, State};
-        {ok, State} ->
+        {ok, false, _, State} ->
             %% nothing changed, we're done here
             {ok, State};
-        {ok, NewState} ->
+        {ok, true, Acc, NewState} ->
             %% we changed something, try handling other deferreds again
-            handle_pending_inbound(NewState)
+            %% we have them in an accumulator, so we can just try to handle/delete them
+            handle_defers(Batch, Acc, [], false, NewState)
     end.
 
-find_next_inbound({error, _}, Iter, _, State) ->
+find_next_inbound({error, _}, Iter, _Batch, Changed, Acc, State) ->
     ok = cf_iterator_close(Iter),
-    {ok, State};
-find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/binary>>}, Iter, Deferring, State) ->
-    case lists:member(FromActorID, Deferring) of
-        false ->
-            CF = cf_iterator_id(Iter),
-            case handle_message(Key, CF, FromActorID, Msg, State) of
-                defer ->
-                    %% done processing messages from this actor
-                    find_next_inbound(cf_iterator_move(Iter, next), Iter,
-                                      [FromActorID|Deferring], State);
-                ignore ->
-                    %% keep on going
-                    find_next_inbound(cf_iterator_move(Iter, next), Iter,
-                                      Deferring, State);
-                {ok, NewState} ->
-                    %% refresh the iterator so it sees any new keys we wrote
-                    cf_iterator_refresh(Iter),
-                    %% we managed to handle a deferred message, yay
-                    OldDefers= maps:get(FromActorID, NewState#state.defers),
-                    find_next_inbound(cf_iterator_move(Iter, next), Iter,
-                                      Deferring, NewState#state{defers=maps:put(FromActorID, OldDefers -- [{CF, Key}], NewState#state.defers)});
-                {stop, Timeout, NewState} ->
-                    ok = cf_iterator_close(Iter),
-                    {stop, Timeout, NewState}
-            end;
-        true ->
-              find_next_inbound(cf_iterator_move(Iter, next), Iter,
-                                Deferring, State)
-    end;
-find_next_inbound({ok, Key, _Value}, Iter, Deferring, State) ->
-    %% XXX erlang-rocksb doesn't actually support the iterate_upper_bound option yet so we will see keys past the end of the range
-    case Key > max_inbound_key() of
-        true ->
+    {ok, Changed, lists:reverse(Acc), State};
+find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/binary>>}, Iter, Batch, Changed, Acc, State) ->
+    CF = cf_iterator_id(Iter),
+    case handle_message(Key, CF, FromActorID, Msg, Batch, State) of
+        defer ->
+            %% keep on going
+            find_next_inbound(cf_iterator_move(Iter, next), Iter, Batch, Changed, [{CF, Key, FromActorID, Msg}|Acc], State);
+        ignore ->
+            %% keep on going
+            find_next_inbound(cf_iterator_move(Iter, next), Iter, Batch, Changed, Acc, State);
+        {ok, NewState} ->
+            %% refresh the iterator so it sees any new keys we wrote
+            cf_iterator_refresh(Iter),
+            %% we managed to handle a deferred message, yay
+            OldDefers = maps:get(FromActorID, NewState#state.defers),
+            find_next_inbound(cf_iterator_move(Iter, next), Iter, Batch, true, Acc,
+                              NewState#state{defers=maps:put(FromActorID, OldDefers -- [{CF, Key, erlang:phash2(Msg)}], NewState#state.defers)});
+        {stop, Timeout, NewState} ->
             ok = cf_iterator_close(Iter),
-            {ok, State};
-        false ->
-            %% this should not happen
-            find_next_inbound(cf_iterator_move(Iter, next), Iter,
-                              Deferring, State)
+            {stop, Timeout, NewState}
+    end.
+
+handle_defers(Batch, [], Out, true, State) ->
+    %% we changed something, go around again
+    handle_defers(Batch, Out, [], false, State);
+handle_defers(_Batch, [], _Out, false, State) ->
+    %% no changes this iteration, bail
+    {ok, State};
+handle_defers(Batch, [{CF, Key, FromActorID, Msg}|Acc], Out, Changed, State) ->
+    case handle_message(Key, CF, FromActorID, Msg, Batch, State) of
+        defer ->
+            handle_defers(Batch, Acc, [{CF, Key, FromActorID, Msg}|Out], Changed, State);
+        ignore ->
+            handle_defers(Batch, Acc, [{CF, Key, FromActorID, Msg}|Out], Changed, State);
+        {ok, NewState} ->
+            OldDefers = maps:get(FromActorID, NewState#state.defers),
+            handle_defers(Batch, Acc, Out, true,
+                              NewState#state{defers=maps:put(FromActorID, OldDefers -- [{CF, Key, erlang:phash2(Msg)}], NewState#state.defers)});
+        {stop, Timeout, NewState} ->
+            {stop, Timeout, NewState}
     end.
 
 
-handle_message(Key, CF, FromActorID, Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) ->
+handle_message(Key, CF, FromActorID, Message, Batch, State = #state{module=Module, modulestate=ModuleState}) ->
     case Module:handle_message(Message, FromActorID, ModuleState) of
         ignore ->
+            case Key /= undefined of
+                true ->
+                    ok = rocksdb:batch_delete(Batch, CF, Key);
+                false ->
+                    ok
+            end,
             ignore;
         defer ->
             defer;
         {NewModuleState, Actions} ->
-            {ok, Batch} = rocksdb:batch(),
             %% write new output messages, update the state and (if present) delete the message atomically
             case Key /= undefined of
                 true ->
@@ -477,11 +512,9 @@ handle_message(Key, CF, FromActorID, Message, State = #state{module=Module, modu
             case handle_actions(Actions, Batch, State#state{modulestate=NewModuleState}) of
                 {ok, NewState} ->
                     ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
-                    ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
                     {ok, NewState};
                 {stop, Timeout, NewState} ->
                     ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
-                    ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
                     {stop, Timeout, NewState}
             end
     end.
@@ -495,6 +528,7 @@ handle_actions([new_epoch|Tail], Batch, State) ->
         undefined -> State#state.defers;
         _ ->
             ok = rocksdb:drop_column_family(State#state.prev_cf),
+            ok = rocksdb:destroy_column_family(State#state.prev_cf),
             maps:map(fun(_, V) ->
                              lists:keydelete(State#state.prev_cf, 1, V)
                      end, State#state.defers)
@@ -532,6 +566,15 @@ handle_actions([{callback, Message}|Tail], Batch, State =
                 {ModuleState, Actions} ->
                     handle_actions(Actions++Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, key_count=KeyCount+1}))
             end
+    end;
+handle_actions([{unicast, ID, Message}|Tail], Batch, State = #state{module=Module, id=ID}) ->
+    %% handle our own message
+    %% deferring your own message is an error
+    case Module:handle_message(Message, ID, State#state.modulestate) of
+        ignore ->
+            handle_actions(Tail, Batch, State);
+        {ModuleState, Actions} ->
+            handle_actions(Actions++Tail, Batch, State#state{modulestate=ModuleState})
     end;
 handle_actions([{unicast, ToActorID, Message}|Tail], Batch, State = #state{key_count=KeyCount, active_cf=CF}) ->
     Key = make_outbound_key(KeyCount),
@@ -636,7 +679,7 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:2/integer, ActorI
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:2/integer, _/bits>>}, Iter, State) ->
     %% unicast message for someone else
     find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize}) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize}) when Type == 0; Type == 2 ->
     <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
     case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
         0 ->
@@ -649,43 +692,26 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<0:2/integer, Tail/b
                     ok
             end,
             find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
-        _ ->
+        _  when Type == 0 ->
             %% multicast message with the high bit set for this actor
             CF = cf_iterator_id(Iter),
             cf_iterator_close(Iter),
-            {Key, CF, Value, true}
-    end;
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<2:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize, module=Module}) ->
-    <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
-    case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
-        0 ->
-            %% not for us, keep looking
-            case ActorMask == 0 of
-                true ->
-                    %% everyone has gotten this message, we can delete it now
-                    ok = rocksdb:delete(State#state.db, cf_iterator_id(Iter), Key, []);
-                false ->
-                    ok
-            end,
-            find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
-        _ ->
+            {Key, CF, Value, true};
+        _  when Type == 2 ->
             %% callback message with the high bit set for this actor
             CF = cf_iterator_id(Iter),
+            Module = State#state.module,
             case Module:callback_message(ActorID, Value, State#state.modulestate) of
                 none ->
                     %% nothing for this actor
-                    ActorIDStr = ["-", integer_to_list(ActorID+1)],
-                    ok = rocksdb:merge(State#state.db, CF, Key, list_to_binary(ActorIDStr), []),
+                    flip_actor_bit(ActorID, State#state.db, CF, Key),
                     find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
                 Message ->
                     cf_iterator_close(Iter),
                     {Key, CF, Message, true}
             end
-    end;
-find_next_outbound_(_ActorID, {ok, _Key, _Value}, Iter, _State) ->
-    %% we hit the upper bound of the outbound messages
-    cf_iterator_close(Iter),
-    not_found.
+
+    end.
 
 min_inbound_key() ->
     <<"i0000000000">>.
@@ -737,9 +763,20 @@ build_status({ok, _Key, _Value}, Iter, BFS, InboundQueue, OutboundQueue) ->
 build_defer_list({error, _}, Iter, Acc) ->
     cf_iterator_close(Iter),
     Acc;
-build_defer_list({ok, <<"i", _/binary>>=Key, <<FromActorID:16/integer, _Msg/binary>>}, Iter, Acc) ->
+build_defer_list({ok, <<"i", _/binary>>=Key, <<FromActorID:16/integer, Msg/binary>>}, Iter, Acc) ->
     CF = cf_iterator_id(Iter),
-    build_defer_list(cf_iterator_move(Iter, next), Iter, maps:put(FromActorID, [{CF, Key}|maps:get(FromActorID, Acc, [])], Acc)).
+    DefersForThisActor = maps:get(FromActorID, Acc, []),
+    MsgHash = erlang:phash2(Msg),
+    case lists:keyfind(MsgHash, 3, DefersForThisActor) of
+        false ->
+            build_defer_list(cf_iterator_move(Iter, next), Iter, maps:put(FromActorID, [{CF, Key, MsgHash}|DefersForThisActor], Acc));
+        _ ->
+            %% already have a copy of this message deferred, delete this duplicate
+            %% this shouldn't happen in reality but it's good to check for it
+            DB = cf_iterator_db(Iter),
+            rocksdb:delete(DB, CF, Key, []),
+            build_defer_list(cf_iterator_move(Iter, next), Iter, Acc)
+    end.
 
 
 prepend_message(Actors, Message, Map) ->
@@ -759,6 +796,12 @@ actor_list(<<1:1/integer, Tail/bits>>, I, List) ->
     actor_list(Tail, I+1, [I|List]);
 actor_list(<<0:1/integer, Tail/bits>>, I, List) ->
     actor_list(Tail, I+1, List).
+
+flip_actor_bit(ActorID, DB, CF, Key) ->
+    ActorIDStr = ["-", integer_to_list(ActorID+1)],
+    %% this can crash for odd reasons, but we don't care
+    catch rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), []).
+
 
 %% wrapper around rocksdb iterators that will iterate across column families.
 %% Requirements to use this:
@@ -817,6 +860,11 @@ cf_iterator_move(Ref, Args) ->
 cf_iterator_id(Ref) ->
     Iterator = erlang:get(Ref),
     Iterator#iterator.cf.
+
+-spec cf_iterator_db(reference()) -> rocksdb:db_handle().
+cf_iterator_db(Ref) ->
+    Iterator = erlang:get(Ref),
+    Iterator#iterator.db.
 
 cf_iterator_refresh(Ref) ->
     Iterator = erlang:get(Ref),

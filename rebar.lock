@@ -1,4 +1,6 @@
-[{<<"rocksdb">>,
-  {git,"https://gitlab.com/barrel-db/erlang-rocksdb.git",
-       {ref,"8cb18a3a3f3ecd7508ad5b4fd29934212249d3c3"}},
-  0}].
+{"1.1.0",
+[{<<"rocksdb">>,{pkg,<<"rocksdb">>,<<"0.23.3">>},0}]}.
+[
+{pkg_hash,[
+ {<<"rocksdb">>, <<"1E088C3870265D4C037C4CA274C4153DAE739CE48D3C6536230C6B22226FF44E">>}]}
+].
