@@ -137,7 +137,10 @@
          }).
 
 -type relcast_state() :: #state{}.
--export_type([relcast_state/0]).
+-type status() :: {ModuleState :: any(),
+                   InboundQueue :: [{pos_integer(), binary()}],
+                   OutboundQueue :: #{pos_integer() => [binary()]}}.
+-export_type([relcast_state/0, status/0]).
 
 -export([start/5, command/2, deliver/3, take/2, ack/3, stop/2, status/1]).
 
@@ -409,9 +412,7 @@ stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
 
 %% @doc Get a representation of the relcast's module state, inbound queue and
 %% outbound queue.
--spec status(relcast_state()) -> {ModuleState :: any(), InboundQueue ::
-                           [{pos_integer(), binary()}], OutboundQueue ::
-                           #{pos_integer() => [binary()]}}.
+-spec status(relcast_state()) -> status().
 status(State = #state{modulestate=ModuleState}) ->
     {ok, Iter} = cf_iterator(State, prev_cf(State), both, [{iterate_upper_bound, max_outbound_key()}]),
     {InboundQueue, OutboundQueue} = build_status(cf_iterator_move(Iter, {seek, min_inbound_key()}), Iter, State#state.bitfieldsize, [], #{}),
