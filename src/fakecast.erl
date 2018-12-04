@@ -95,12 +95,12 @@ trace(Format, Args) ->
                              [Time, Node] ++ Args)).
 
 
--spec start_test(atom(), term(), seed(), [input()]) -> term().
-start_test(TestModule, TestArgs, Seed, InitialInput) ->
-    start_test(TestModule, TestArgs, Seed, InitialInput, #{}).
+-spec start_test(fun(), fun(), seed(), [input()]) -> term().
+start_test(Init, Model, Seed, InitialInput) ->
+    start_test(Init, Model, Seed, InitialInput, #{}).
 
--spec start_test(atom(), term(), seed(), [input()], Options :: #{}) -> term().
-start_test(TestModule, TestArgs, Seed, InitialInput, Options) ->
+-spec start_test(fun(), fun(), seed(), [input()], Options :: #{}) -> term().
+start_test(Init, Model, Seed, InitialInput, Options) ->
     %% establish the seed for repeatability
     SeedStr =
         case Seed of
@@ -129,7 +129,7 @@ start_test(TestModule, TestArgs, Seed, InitialInput, Options) ->
       Configs,
       _MaxTime
      } = TestConfig,
-     TestState} = TestModule:init(TestArgs),
+     TestState} = Init(),
 
     %% initialize all the nodes
     case length(NodeNames) == length(Configs) of
@@ -166,11 +166,11 @@ start_test(TestModule, TestArgs, Seed, InitialInput, Options) ->
 
     trace("init complete, entering test loop, seed is ~p", [Seed]),
 
-    test_loop(TestConfig, TestModule,
+    test_loop(TestConfig, Model,
               SeedNode, CurrentTime,
               Nodes1, TestState).
 
-test_loop({Module, Ordering, Strategy, _, _, MaxTime} = TestConfig, Test,
+test_loop({Module, Ordering, Strategy, _, _, MaxTime} = TestConfig, Model,
           PrevNode, PrevTime,
           Nodes, TestState) ->
 
@@ -207,11 +207,11 @@ test_loop({Module, Ordering, Strategy, _, _, MaxTime} = TestConfig, Test,
 
     case maps:get(Node, Nodes1) of
         #node{queue = []} ->
-            test_loop(TestConfig, Test, Node, Time, Nodes1, TestState);
+            test_loop(TestConfig, Model, Node, Time, Nodes1, TestState);
         #node{status = SorP} when SorP =:= stopped;
                                   SorP =:= partitioned ->
             %% trace("node ~p is ~p", [Node, SorP]),
-            test_loop(TestConfig, Test, Node, Time, Nodes1, TestState);
+            test_loop(TestConfig, Model, Node, Time, Nodes1, TestState);
         #node{queue = [{From, Message}|T], state = NodeState} ->
             %% trace("node ~p is ~p", [Node, Status]),
             {NewState, Actions} = Module:handle_msg(NodeState, From, Message),
@@ -222,7 +222,7 @@ test_loop({Module, Ordering, Strategy, _, _, MaxTime} = TestConfig, Test,
                    Node,
                    print_actions(Actions)]),
 
-            case Test:model(Message, From, Node, NodeState, NewState, Actions, TestState) of
+            case Model(Message, From, Node, NodeState, NewState, Actions, TestState) of
                 success -> file_close(erlang:get(trace_file)), ok;
                 {result, Result} -> file_close(erlang:get(trace_file)), {ok, Result};
                 fail -> file_close(erlang:get(trace_file)), throw(fakecast_model_failure);
@@ -235,14 +235,14 @@ test_loop({Module, Ordering, Strategy, _, _, MaxTime} = TestConfig, Test,
                         process_output({NewState1, Actions1},
                                        Node, Time,
                                        Nodes2#{Node => NodeSt#node{queue = T}}),
-                    test_loop(TestConfig, Test, Node, Time, Nodes3, TestState1);
+                    test_loop(TestConfig, Model, Node, Time, Nodes3, TestState1);
                 {continue, TestState1} ->
                     #{Node := NodeSt} = Nodes1,
                     Nodes2 =
                         process_output({NewState, Actions},
                                        Node, Time,
                                        Nodes1#{Node => NodeSt#node{queue = T}}),
-                    test_loop(TestConfig, Test, Node, Time, Nodes2, TestState1)
+                    test_loop(TestConfig, Model, Node, Time, Nodes2, TestState1)
             end
     end.
 
