@@ -55,6 +55,8 @@
 
 -type input() :: {node_id() | all, term()}.
 
+-type seed() :: {integer(), integer(), integer()}.
+
 %% fakecast is a drop-in replacement runner for relcast protocols that
 %% allows the user to easily specify test cases that go beyond simply
 %% running protocol and attempting to intervene.  it serializes the
@@ -93,11 +95,11 @@ trace(Format, Args) ->
                              [Time, Node] ++ Args)).
 
 
--spec start_test(atom(), term(), rand:seed(), [input()]) -> term().
+-spec start_test(atom(), term(), seed(), [input()]) -> term().
 start_test(TestModule, TestArgs, Seed, InitialInput) ->
     start_test(TestModule, TestArgs, Seed, InitialInput, #{}).
 
--spec start_test(atom(), term(), rand:seed(), [input()], Options :: #{}) -> term().
+-spec start_test(atom(), term(), seed(), [input()], Options :: #{}) -> term().
 start_test(TestModule, TestArgs, Seed, InitialInput, Options) ->
     %% establish the seed for repeatability
     SeedStr =
