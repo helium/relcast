@@ -198,13 +198,20 @@ test_loop({Module, Ordering, Strategy, _, _, MaxTime} = TestConfig, Test,
 
     Nodes1 = process_timers(Time, Nodes),
 
+    %% perhaps at this point we should do a quick check for empty
+    %% timers and empty queues (at least occasionally).  if we're in
+    %% that state, we're inevitably going to time out, as there's
+    %% nothing to drive forward progress.
+
     case maps:get(Node, Nodes1) of
         #node{queue = []} ->
             test_loop(TestConfig, Test, Node, Time, Nodes1, TestState);
-        #node{status = SorP} when SorP == stopped;
-                                  SorP == partitioned ->
+        #node{status = SorP} when SorP =:= stopped;
+                                  SorP =:= partitioned ->
+            %% trace("node ~p is ~p", [Node, SorP]),
             test_loop(TestConfig, Test, Node, Time, Nodes1, TestState);
         #node{queue = [{From, Message}|T], state = NodeState} ->
+            %% trace("node ~p is ~p", [Node, Status]),
             {NewState, Actions} = Module:handle_msg(NodeState, From, Message),
 
             %% ideally this is 100% statically aligned up to the actions
@@ -221,7 +228,7 @@ test_loop({Module, Ordering, Strategy, _, _, MaxTime} = TestConfig, Test,
                 {actions, TestActions, TestState1} ->
                     {Nodes2, NewState1, Actions1} =
                         process_actions(TestActions, Nodes1, NewState, Actions),
-                    #{Node := NodeSt} = Nodes,
+                    #{Node := NodeSt} = Nodes2,
                     Nodes3 =
                         process_output({NewState1, Actions1},
                                        Node, Time,
@@ -298,7 +305,7 @@ process_action({stop_node, ID}, Nodes, State, Actions) ->
     {Nodes#{ID => Node#node{status = stopped}},
      State, Actions};
 process_action({alter_state, NewState}, Nodes, _State, Actions) ->
-    %%trace("altering state of node ~p", [ID]),
+    trace("altering state of node"),
     {Nodes, NewState, Actions};
 process_action({alter_actions, NewActions}, Nodes, State, Actions) ->
     trace("alter actions ~s to ~s", [print_actions(Actions), print_actions(NewActions)]),
@@ -381,6 +388,8 @@ file_close(FD) ->
     end.
 
 
+print_message(timeout) ->
+    <<"timeout">>;
 print_message(Msg) ->
     case element(1, Msg) of
         Tag when is_atom(Tag) ->
