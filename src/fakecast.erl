@@ -3,6 +3,7 @@
 -include_lib("kernel/include/logger.hrl").
 
 -export([trace/1, trace/2,
+         ptest/3,
          start_test/4,
          start_test/5]).
 
@@ -78,6 +79,7 @@
         {
          name :: atom(),
          queue = [] :: [term()],
+         dqueue = [] :: [term()],
          status = running :: running | stopped | partitioned,
          timer = undefined :: undefined | pos_integer(),
          state :: term()
@@ -94,13 +96,36 @@ trace(Format, Args) ->
                io_lib:format("~6B:~3B|" ++ Format ++ "~n",
                              [Time, Node] ++ Args)).
 
+%% helper for testing at the shell
+ptest(Pids, Tests, Fun) ->
+    Me = self(),
+    [spawn(fun() ->
+                   ptest_loop(Me, Tests, Fun)
+           end)
+     || _ <- lists:seq(1,Pids)],
+    [receive
+         ok -> ok;
+         {error, E} ->
+             io:format("execution ended with non-match ~p", [E])
+     end
+     || _ <- lists:seq(1,Pids)].
 
--spec start_test(fun(), fun(), seed(), [input()]) -> term().
+ptest_loop(Me, 0, _Fun) ->
+    Me ! ok;
+ptest_loop(Me, Tests, Fun) ->
+    case (catch Fun()) of
+        ok ->
+            ptest_loop(Me, Tests - 1, Fun);
+         E ->
+            Me ! {error, E}
+    end.
+
+-spec start_test(fun(), fun(), seed(), [input()] | fun()) -> term().
 start_test(Init, Model, Seed, InitialInput) ->
     start_test(Init, Model, Seed, InitialInput, #{}).
 
--spec start_test(fun(), fun(), seed(), [input()], Options :: #{}) -> term().
-start_test(Init, Model, Seed, InitialInput, Options) ->
+-spec start_test(fun(), fun(), seed(), [input()] | fun(), Options :: #{}) -> term().
+start_test(Init, Model, Seed, InitialInput0, Options) ->
     %% establish the seed for repeatability
     SeedStr =
         case Seed of
@@ -112,7 +137,7 @@ start_test(Init, Model, Seed, InitialInput, Options) ->
                 seed_to_string(Seed)
         end,
 
-    TraceFileName = maps:get(trace_file_name, Options, "trace" ++ SeedStr),
+    TraceFileName = maps:get(trace_file_name, Options, "trace-" ++ os:getpid() ++ "-" ++ SeedStr ),
     {ok, TraceFile} = file:open(TraceFileName, [write, delayed_write]),
     erlang:put(trace_file, TraceFile),
 
@@ -126,6 +151,7 @@ start_test(Init, Model, Seed, InitialInput, Options) ->
       _MessageOrdering,
       _TimeStrategy,
       NodeNames,
+      IDStart,
       Configs,
       _MaxTime
      } = TestConfig,
@@ -142,10 +168,20 @@ start_test(Init, Model, Seed, InitialInput, Options) ->
                             NodeState = erlang:apply(Module, init, NodeArgs),
                             {NodeID + 1, Acc#{NodeID => #node{state = NodeState,
                                                               name = NodeName}}}
-                    end, {1, #{}}, lists:zip(NodeNames, Configs)),
+                    end, {IDStart, #{}}, lists:zip(NodeNames, Configs)),
 
     %% time in abstract units
     CurrentTime = 0,
+
+    InitialInput =
+        case InitialInput0 of
+            Fun when is_function(Fun) ->
+                Fun();
+            List when is_list(List) ->
+                List;
+            _ ->
+                throw(bad_input)
+        end,
 
     %% refactor this into a fold to support multiple initial inputs
     Nodes1 =
@@ -154,7 +190,7 @@ start_test(Init, Model, Seed, InitialInput, Options) ->
                   #{Target := #node{state = TargetState}} = Ns,
                   trace("providing ~p as initial input to ~p", [Message, Target]),
 
-                  process_output(Module:input(TargetState, Message),
+                  process_output(Module:input(TargetState, Message), Message,
                                  Target,
                                  CurrentTime,
                                  Ns)
@@ -170,11 +206,11 @@ start_test(Init, Model, Seed, InitialInput, Options) ->
               SeedNode, CurrentTime,
               Nodes1, TestState).
 
-test_loop({Module, Ordering, Strategy, _, _, MaxTime} = TestConfig, Model,
+test_loop({Module, Ordering, Strategy, _, IDStart, _, MaxTime} = TestConfig, Model,
           PrevNode, PrevTime,
           Nodes, TestState) ->
 
-    Node = sched(Ordering, PrevNode, maps:size(Nodes)),
+    Node = sched(Ordering, PrevNode, maps:size(Nodes), IDStart),
     erlang:put(curr_node, Node),
 
     Time = advance_time(Strategy, PrevTime),
@@ -206,21 +242,27 @@ test_loop({Module, Ordering, Strategy, _, _, MaxTime} = TestConfig, Model,
     %% nothing to drive forward progress.
 
     case maps:get(Node, Nodes1) of
-        #node{queue = []} ->
+        #node{queue = [], dqueue = []} ->
             test_loop(TestConfig, Model, Node, Time, Nodes1, TestState);
         #node{status = SorP} when SorP =:= stopped;
                                   SorP =:= partitioned ->
             %% trace("node ~p is ~p", [Node, SorP]),
             test_loop(TestConfig, Model, Node, Time, Nodes1, TestState);
-        #node{queue = [{From, Message}|T], state = NodeState} ->
+        #node{queue = Queue, dqueue = DQueue, state = NodeState} ->
             %% trace("node ~p is ~p", [Node, Status]),
-            {NewState, Actions} = Module:handle_msg(NodeState, From, Message),
+            {From, Message, Queue1, DQueue1} = next_message(Queue, DQueue),
+            {NewState, Actions} =
+                case Module:handle_msg(NodeState, From, Message) of
+                    {S, A} -> {S, A};
+                    ignore -> {NodeState, ignore}
+                end,
 
             %% ideally this is 100% statically aligned up to the actions
-            trace("~-16s->~3B => ~s",
+            trace("~-16s ~2B->~2B => ~s",
                   [print_message(Message),
-                   Node,
+                   From,Node,
                    print_actions(Actions)]),
+            trace("~p", [Message]),
 
             case Model(Message, From, Node, NodeState, NewState, Actions, TestState) of
                 success -> file_close(erlang:get(trace_file)), ok;
@@ -232,66 +274,67 @@ test_loop({Module, Ordering, Strategy, _, _, MaxTime} = TestConfig, Model,
                         process_actions(TestActions, Nodes1, NewState, Actions),
                     #{Node := NodeSt} = Nodes2,
                     Nodes3 =
-                        process_output({NewState1, Actions1},
+                        process_output({NewState1, Actions1}, {From, Message},
                                        Node, Time,
-                                       Nodes2#{Node => NodeSt#node{queue = T}}),
+                                       Nodes2#{Node => NodeSt#node{queue = Queue1,
+                                                                   dqueue = DQueue1}}),
                     test_loop(TestConfig, Model, Node, Time, Nodes3, TestState1);
                 {continue, TestState1} ->
                     #{Node := NodeSt} = Nodes1,
                     Nodes2 =
-                        process_output({NewState, Actions},
+                        process_output({NewState, Actions}, {From, Message},
                                        Node, Time,
-                                       Nodes1#{Node => NodeSt#node{queue = T}}),
+                                       Nodes1#{Node => NodeSt#node{queue = Queue1,
+                                                                   dqueue = DQueue1}}),
                     test_loop(TestConfig, Model, Node, Time, Nodes2, TestState1)
             end
     end.
 
-process_output({NewState, {send, Messages}}, Current, _Time, Nodes) ->
+next_message([], [{From, Message} | T]) ->
+    {From, Message, [], T};
+next_message([{From, Message} | T], []) ->
+    {From, Message, T, []};
+next_message(Queue, DQueue) ->
+    case rand:uniform(2) of
+        1 ->
+            [{From, Message} | T] = Queue,
+            {From, Message, T, DQueue};
+        2 ->
+            [{From, Message} | T] = DQueue,
+            {From, Message, Queue, T}
+    end.
+
+
+process_output({NewState, {send, Messages}}, _, Current, _Time, Nodes) ->
     #{Current := Node} = Nodes,
     %% add messages to queues
-    lists:foldl(
-      fun(Message, Nds) ->
-              case Message of
-                  {unicast, Target, Msg} ->
-                      #{Target := Nd = #node{queue = TargetQueue}} = Nds,
-                      case Nd of
-                          %% messages to running or partitioned nodes
-                          %% are queued.
-                          #node{status = RorP} when RorP == running;
-                                                    RorP == partitioned ->
-                              Nds#{Target => Nd#node{queue = TargetQueue ++ [{Current, Msg}]}};
-                          %% messages to downed nodes are dropped
-                          #node{status = stopped} ->
-                              Nds
-                      end;
-                  {multicast, Msg} ->
-                      maps:map(fun(_ID, Nd = #node{queue = Q, status = RorP}) when RorP == running;
-                                                                                   RorP == partitioned ->
-                                       Nd#node{queue = Q ++ [{Current, Msg}]};
-                                  (_ID, Nd) ->
-                                       Nd
-                               end,
-                               Nds);
-                  Msg ->
-                      throw({unhandled, Msg, Nds})
-              end
-      end,
-      Nodes#{Current := Node#node{state = NewState}},
-      Messages);
-process_output({NewState, Ign}, Current, _Time, Nodes) when Ign == ok;
+    send_messages(Current,
+                  Nodes#{Current := Node#node{state = NewState}},
+                  Messages);
+process_output({NewState, {result_and_send, _Result, {send, Messages}}}, _, Current, _Time, Nodes) ->
+    #{Current := Node} = Nodes,
+    %% add messages to queues
+    send_messages(Current,
+                  Nodes#{Current := Node#node{state = NewState}},
+                  Messages);
+process_output({NewState, Ign}, _, Current, _Time, Nodes) when Ign == ok;
                                                             Ign == ignore ->
     #{Current := Node} = Nodes,
     Nodes#{Current := Node#node{state = NewState}};
-%% results are not special messages?
-process_output({NewState, {result, _}}, Current, _Time, Nodes) ->
+process_output({NewState, {result, _}}, _, Current, _Time, Nodes) ->
     #{Current := Node} = Nodes,
     Nodes#{Current := Node#node{state = NewState}};
-process_output({NewState, start_timer}, Current, Time, Nodes) ->
+process_output({NewState, start_timer}, _, Current, Time, Nodes) ->
     trace("starting timer ~p for ~p", [Time + 1000, Current]),
     #{Current := Node} = Nodes,
     Nodes#{Current := Node#node{timer = Time + 1000,
                                 state = NewState}};
-process_output(Output, _, _, _) ->
+process_output({NewState, defer}, {From, Message}, Current, _Time, Nodes) ->
+    %% trace("starting timer ~p for ~p", [Time + 1000, Current]),
+    #{Current := #node{dqueue = DQueue} = Node} = Nodes,
+    DQueue1 = DQueue ++ [{From, Message}],
+    Nodes#{Current := Node#node{dqueue = DQueue1, state = NewState}};
+process_output(Output, _, _, _, _) ->
     throw({unknown_output, Output}).
 
 
@@ -317,10 +360,41 @@ process_action(Action, _, _, _) ->
 
 %%%% helpers
 
-sched(round_robin, Current, Size) ->
-    ((Current + 1) rem Size) + 1;
-sched(random, _Current, Size) ->
-    rand:uniform(Size).
+send_messages(Sender, Nodes, Messages) ->
+    lists:foldl(
+      fun(Message, Nds) ->
+              case Message of
+                  {unicast, Target, Msg} ->
+                      #{Target := Nd = #node{queue = TargetQueue}} = Nds,
+                      case Nd of
+                          %% messages to running or partitioned nodes
+                          %% are queued.
+                          #node{status = RorP} when RorP == running;
+                                                    RorP == partitioned ->
+                              Nds#{Target => Nd#node{queue = TargetQueue ++ [{Sender, Msg}]}};
+                          %% messages to downed nodes are dropped
+                          #node{status = stopped} ->
+                              Nds
+                      end;
+                  {multicast, Msg} ->
+                      maps:map(fun(_ID, Nd = #node{queue = Q, status = RorP}) when RorP == running;
+                                                                                   RorP == partitioned ->
+                                       Nd#node{queue = Q ++ [{Sender, Msg}]};
+                                  (_ID, Nd) ->
+                                       Nd
+                               end,
+                               Nds);
+                  Msg ->
+                      throw({unhandled, Msg, Nds})
+              end
+      end,
+      Nodes,
+      Messages).
+
+sched(round_robin, Current, Size, Start) ->
+    ((Current + 1) rem Size) + Start;
+sched(random, _Current, Size, Start) ->
+    rand:uniform(Size) + (Start - 1).
 
 advance_time(favor_concurrent, Time) ->
     case rand:uniform(100) of
@@ -373,7 +447,7 @@ format_nodes([{_, #node{name = Name,
         io_lib:format("node ~p:~n"
                       "\t~p~n"
                       "\t~p~n",
-                      [Name, Status, length(Queue)]),
+                      [Name, Status, Queue]),
     format_nodes(T, [Display|Acc]).
 
 seed_to_string({A, B, C}) ->
@@ -389,7 +463,8 @@ file_close(FD) ->
             ok = file:close(FD)
     end.
 
-
+%% there likely needs to be some rewriting here to support arbitrary
+%% protocol nesting?
 print_message(timeout) ->
     <<"timeout">>;
 print_message(Msg) ->
@@ -400,23 +475,29 @@ print_message(Msg) ->
             SubTag = element(1, element(2, Msg)),
             [io_lib:format("~p", [Sub]),
              $:,
-             atom_to_binary(SubTag, utf8)]
+             io_lib:format("~p", [SubTag])]
     end.
 
+print_actions({result_and_send, _Result, {send, Messages}}) ->
+    [<<"result+">>,[[print_action(Msg),$,] || Msg <- Messages]];
 print_actions({send, Messages}) ->
     [[print_action(Msg),$,] || Msg <- Messages];
 print_actions({send, _Mcast, Messages}) ->
     [[print_action(Msg),$,] || Msg <- Messages];
 print_actions({result, _Result}) ->
     <<"output result">>;
+print_actions([]) ->
+    <<"ok">>;
 print_actions(ok) ->
     <<"ok">>;
 print_actions(ignore) ->
     <<"ignored">>;
+print_actions(defer) ->
+    <<"deferred">>;
 print_actions(start_timer) ->
     <<"started timer">>.
 
 print_action({unicast, Targ, Msg}) ->
     [print_message(Msg),"->",integer_to_binary(Targ)];
 print_action({multicast, Msg}) ->
-    [atom_to_binary(element(1, Msg), utf8),<<"->all">>].
+    [io_lib:format("~p", [element(1, Msg)]),<<"->all">>].
