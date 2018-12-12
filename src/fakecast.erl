@@ -1,6 +1,7 @@
 -module(fakecast).
 
 -include_lib("kernel/include/logger.hrl").
+-include("fakecast.hrl").
 
 -export([trace/1, trace/2,
          ptest/3,
@@ -18,19 +19,7 @@
 -callback terminate(Reason :: term(), NewState :: term()) -> any().
 -optional_callbacks([terminate/2]).
 
--type settings() :: {
-                     ModuleUnderTest :: atom(),
-                     ModelFun :: function(),
-                     MessageOrdering :: ordering(),
-                     TimeStrategy :: strategy(),
-                     NodeList :: [node_id()],
-                     NodeConfig :: [{name(), init_state(), term()}],
-                     MaxTime :: pos_integer()
-                    }.
-
--type ordering() :: round_robin | random. %% others?  attack_leader?  nemesis?
--type strategy() :: favor_serial | favor_concurrent.  %% time
--type init_state() :: started | stopped.
+-type settings() :: #fc_conf{}.
 
 -type message() ::
         {unicast, Index::pos_integer(), Msg::message_value()} |
@@ -50,9 +39,6 @@
                         {partition_node, ID :: name() | node_id()} |
                         {restart_node, ID :: name() | node_id()} |
                         {start_node, ID :: name() | node_id()}.
-
--type name() :: atom().
--type node_id() :: pos_integer().
 
 -type input() :: {node_id() | all, term()}.
 
@@ -93,7 +79,7 @@ trace(Format, Args) ->
     Node = erlang:get(curr_node),
     File = erlang:get(trace_file),
     file:write(File,
-               io_lib:format("~6B:~3B|" ++ Format ++ "~n",
+               io_lib:format("~4B:~2B|" ++ Format ++ "~n",
                              [Time, Node] ++ Args)).
 
 %% helper for testing at the shell
@@ -146,15 +132,12 @@ start_test(Init, Model, Seed, InitialInput0, Options) ->
     erlang:put(ab_time, 0),
 
     {ok,
-     {
-      Module,
-      _MessageOrdering,
-      _TimeStrategy,
-      NodeNames,
-      IDStart,
-      Configs,
-      _MaxTime
-     } = TestConfig,
+     #fc_conf{
+        test_mod = Module,
+        nodes = NodeNames,
+        configs = Configs,
+        id_start = IDStart
+       } = TestConfig,
      TestState} = Init(),
 
     %% initialize all the nodes
@@ -183,7 +166,6 @@ start_test(Init, Model, Seed, InitialInput0, Options) ->
                 throw(bad_input)
         end,
 
-    %% refactor this into a fold to support multiple initial inputs
     Nodes1 =
         lists:foldl(
           fun({Target, Message}, Ns) ->
@@ -206,7 +188,12 @@ start_test(Init, Model, Seed, InitialInput0, Options) ->
               SeedNode, CurrentTime,
               Nodes1, TestState).
 
-test_loop({Module, Ordering, Strategy, _, IDStart, _, MaxTime} = TestConfig, Model,
+test_loop(#fc_conf{test_mod = Module,
+                   ordering = Ordering,
+                   strategy = Strategy,
+                   id_start = IDStart,
+                   max_time = MaxTime} = TestConfig,
+          Model,
           PrevNode, PrevTime,
           Nodes, TestState) ->
 
@@ -226,12 +213,6 @@ test_loop({Module, Ordering, Strategy, _, IDStart, _, MaxTime} = TestConfig, Mod
                        "~p~n~s~n~n", [TestState, format_nodes(Nodes)]),
             throw(etoomuchtime);
         _ -> ok
-    end,
-
-    case Time rem 500 of
-        0 when Time /= 0 ->
-            trace("time marker: ~p", [Time]);
-        _ -> meh
     end,
 
     Nodes1 = process_timers(Time, Nodes),
@@ -260,9 +241,9 @@ test_loop({Module, Ordering, Strategy, _, IDStart, _, MaxTime} = TestConfig, Mod
             %% ideally this is 100% statically aligned up to the actions
             trace("~-16s ~2B->~2B => ~s",
                   [print_message(Message),
-                   From,Node,
+                   From, Node,
                    print_actions(Actions)]),
-            trace("~p", [Message]),
+            %% trace("~p", [Message]),
 
             case Model(Message, From, Node, NodeState, NewState, Actions, TestState) of
                 success -> file_close(erlang:get(trace_file)), ok;
@@ -278,15 +259,7 @@ test_loop({Module, Ordering, Strategy, _, IDStart, _, MaxTime} = TestConfig, Mod
                                        Node, Time,
                                        Nodes2#{Node => NodeSt#node{queue = Queue1,
                                                                    dqueue = DQueue1}}),
-                    test_loop(TestConfig, Model, Node, Time, Nodes3, TestState1);
-                {continue, TestState1} ->
-                    #{Node := NodeSt} = Nodes1,
-                    Nodes2 =
-                        process_output({NewState, Actions}, {From, Message},
-                                       Node, Time,
-                                       Nodes1#{Node => NodeSt#node{queue = Queue1,
-                                                                   dqueue = DQueue1}}),
-                    test_loop(TestConfig, Model, Node, Time, Nodes2, TestState1)
+                    test_loop(TestConfig, Model, Node, Time, Nodes3, TestState1)
             end
     end.
 
@@ -330,7 +303,6 @@ process_output({NewState, start_timer}, _, Current, Time, Nodes) ->
     Nodes#{Current := Node#node{timer = Time + 1000,
                                 state = NewState}};
 process_output({NewState, defer}, {From, Message}, Current, _Time, Nodes) ->
-    %% trace("starting timer ~p for ~p", [Time + 1000, Current]),
     #{Current := #node{dqueue = DQueue} = Node} = Nodes,
     DQueue1 = DQueue ++ [{From, Message}],
     Nodes#{Current := Node#node{dqueue = DQueue1, state = NewState}};
@@ -425,7 +397,7 @@ process_timers(Time, Nodes) ->
                          true ->
                              trace("timer expired for ~p", [_ID]),
                              Node#node{timer = undefined,
-                                       queue = Node#node.queue ++ [{Node, timeout}]};
+                                       queue = Node#node.queue ++ [{-1, timeout}]};
                          false ->
                              Node
                      end
