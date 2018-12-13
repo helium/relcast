@@ -1,5 +1,5 @@
 -type ordering() :: round_robin | random. %% others?  attack_leader?  nemesis?
--type strategy() :: favor_serial | favor_concurrent.  %% time
+-type strategy() :: favor_sequential | favor_concurrent.  %% time
 -type init_state() :: started | stopped.
 
 -type name() :: atom().
