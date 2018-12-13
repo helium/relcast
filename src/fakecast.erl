@@ -4,7 +4,6 @@
 -include("fakecast.hrl").
 
 -export([trace/1, trace/2,
-         ptest/3,
          start_test/4,
          start_test/5]).
 
@@ -53,19 +52,12 @@
 %% TODO: figure out how to wire this so that EQC can generate and
 %% shrink a command history so that we can generate automatic test cases.
 
-%% TODO: somehow allow nodes to behave in a byzantine manner, either
-%% by state-mutating callbacks or alternate implementations that
-%% attack the protocol or something else??a
-
-%% how this looks: we should be able to set up a test with initial
-%% conditions like random seed, node count (names?), round count, end
-%% condition, etc.
-
 -record(node,
         {
          name :: atom(),
          queue = [] :: [term()],
-         dqueue = [] :: [term()],
+         dqueue = [] :: [term()], % separate queue for messages
+                                  % deferred to later rounds.
          status = running :: running | stopped | partitioned,
          timer = undefined :: undefined | pos_integer(),
          state :: term()
@@ -82,30 +74,9 @@ trace(Format, Args) ->
                io_lib:format("~4B:~2B|" ++ Format ++ "~n",
                              [Time, Node] ++ Args)).
 
-%% helper for testing at the shell
-ptest(Pids, Tests, Fun) ->
-    Me = self(),
-    [spawn(fun() ->
-                   ptest_loop(Me, Tests, Fun)
-           end)
-     || _ <- lists:seq(1,Pids)],
-    [receive
-         ok -> ok;
-         {error, E} ->
-             io:format("execution ended with non-match ~p", [E])
-     end
-     || _ <- lists:seq(1,Pids)].
-
-ptest_loop(Me, 0, _Fun) ->
-    Me ! ok;
-ptest_loop(Me, Tests, Fun) ->
-    case (catch Fun()) of
-        ok ->
-            ptest_loop(Me, Tests - 1, Fun);
-         E ->
-            Me ! {error, E}
-    end.
-
+%%% start_test is our main entry-point function, which is meant to be
+%%% called by the test suite.  see the documentation for more
+%%% information on what the arguments mean.
 -spec start_test(fun(), fun(), seed(), [input()] | fun()) -> term().
 start_test(Init, Model, Seed, InitialInput) ->
     start_test(Init, Model, Seed, InitialInput, #{}).
@@ -131,6 +102,7 @@ start_test(Init, Model, Seed, InitialInput0, Options) ->
     erlang:put(curr_node, 0),
     erlang:put(ab_time, 0),
 
+    %% should probably allow tuple or function like input
     {ok,
      #fc_conf{
         test_mod = Module,
@@ -158,14 +130,18 @@ start_test(Init, Model, Seed, InitialInput0, Options) ->
 
     InitialInput =
         case InitialInput0 of
+            %% functions should be used when there is randomness in
+            %% the input to make things fully replayable.
             Fun when is_function(Fun) ->
                 Fun();
+            %% but allow lists for convenience when we don't need it
             List when is_list(List) ->
                 List;
             _ ->
                 throw(bad_input)
         end,
 
+    %% generate starting states from initial inputs
     Nodes1 =
         lists:foldl(
           fun({Target, Message}, Ns) ->
@@ -238,7 +214,7 @@ test_loop(#fc_conf{test_mod = Module,
                     ignore -> {NodeState, ignore}
                 end,
 
-            %% ideally this is 100% statically aligned up to the actions
+            %% ideally this is 100% statically aligned for ease of reading
             trace("~-16s ~2B->~2B => ~s",
                   [print_message(Message),
                    From, Node,
@@ -316,6 +292,7 @@ process_actions([Action|T], Nodes, State, Actions) ->
     {Nodes1, State1, Actions1} = process_action(Action, Nodes, State, Actions),
     process_actions(T, Nodes1, State1, Actions1).
 
+%% sets node state to stopped, causing all messages to it to be dropped.
 process_action({stop_node, ID}, Nodes, State, Actions) ->
     trace("stopping node ~p", [ID]),
     #{ID := Node} = Nodes,
@@ -332,6 +309,11 @@ process_action(Action, _, _, _) ->
 
 %%%% helpers
 
+%% fold through all the messages and put them in the appropriate
+%% queues.  note that when a node is stopped, we drop their messages,
+%% but we deliver them when the node is partitioned, which might not
+%% be clear from the names.  stalled and partitioned, might be better
+%% names for partitioned and stopped respectively.
 send_messages(Sender, Nodes, Messages) ->
     lists:foldl(
       fun(Message, Nds) ->
@@ -368,6 +350,12 @@ sched(round_robin, Current, Size, Start) ->
 sched(random, _Current, Size, Start) ->
     rand:uniform(Size) + (Start - 1).
 
+%% mostly with these strategies, we're either favoring dense or sparse
+%% interleavings.  I'm not totally certain about the design here.
+%% Mostly all this does is affect timeouts, with concurrent making
+%% more things happen before timeouts occur, and sequential
+%% stretching them out more to favor timeouts hitting in the middle of
+%% protocol execution.
 advance_time(favor_concurrent, Time) ->
     case rand:uniform(100) of
         N when N =< 65 ->
@@ -389,6 +377,8 @@ advance_time(favor_sequential, Time) ->
             Time + 3
     end.
 
+%% go through all the timers and check if there's anything that's
+%% expired.  if so, add it as a message to the queue of the recipient.
 process_timers(Time, Nodes) ->
     maps:map(fun(_ID, Node = #node{timer = undefined}) ->
                      Node;
@@ -404,7 +394,7 @@ process_timers(Time, Nodes) ->
              end,
              Nodes).
 
-
+%% helper functions for printing out complex state in a legible way.
 format_nodes(Nodes) ->
     format_nodes(maps:to_list(Nodes), []).
 
@@ -427,6 +417,8 @@ seed_to_string({A, B, C}) ->
         integer_to_list(B) ++ "-" ++
         integer_to_list(C).
 
+%% since we're using write-ahead, we wrap all closes in this to make
+%% sure that the file gets closed.
 file_close(FD) ->
     file:sync(FD),
     case file:close(FD) of
@@ -435,8 +427,8 @@ file_close(FD) ->
             ok = file:close(FD)
     end.
 
-%% there likely needs to be some rewriting here to support arbitrary
-%% protocol nesting?
+%% TODO: there likely needs to be some rewriting here to support
+%% arbitrary protocol nesting?
 print_message(timeout) ->
     <<"timeout">>;
 print_message(Msg) ->
@@ -450,6 +442,8 @@ print_message(Msg) ->
              io_lib:format("~p", [SubTag])]
     end.
 
+%% mostly we're trying to make the protocol intention clear here, we
+%% want to avoid printing any data, which could be large.
 print_actions({result_and_send, _Result, {send, Messages}}) ->
     [<<"result+">>,[[print_action(Msg),$,] || Msg <- Messages]];
 print_actions({send, Messages}) ->
