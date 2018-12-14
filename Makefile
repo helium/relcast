@@ -1,6 +1,6 @@
 .PHONY: compile rel test typecheck
 
-REBAR=./rebar3
+REBAR ?= rebar3
 
 compile:
 	$(REBAR) compile
