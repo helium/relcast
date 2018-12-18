@@ -16,3 +16,14 @@
          id_start = 0 :: 0 | 1,
          max_time = 1500 :: pos_integer()
         }).
+
+-record(node,
+        {
+         name :: atom(),
+         queue = [] :: [term()],
+         dqueue = [] :: [term()], % separate queue for messages
+                                  % deferred to later rounds.
+         status = running :: running | stopped | partitioned,
+         timer = undefined :: undefined | pos_integer(),
+         state :: term()
+        }).

@@ -4,6 +4,7 @@
 -include("fakecast.hrl").
 
 -export([trace/1, trace/2,
+         send_messages/3,
          start_test/4,
          start_test/5]).
 
@@ -52,27 +53,17 @@
 %% TODO: figure out how to wire this so that EQC can generate and
 %% shrink a command history so that we can generate automatic test cases.
 
--record(node,
-        {
-         name :: atom(),
-         queue = [] :: [term()],
-         dqueue = [] :: [term()], % separate queue for messages
-                                  % deferred to later rounds.
-         status = running :: running | stopped | partitioned,
-         timer = undefined :: undefined | pos_integer(),
-         state :: term()
-        }).
-
 trace(Format) ->
     trace(Format, []).
 
 trace(Format, Args) ->
     Time = erlang:get(ab_time),
+    SubTime = erlang:get(sub_time),
     Node = erlang:get(curr_node),
     File = erlang:get(trace_file),
     file:write(File,
-               io_lib:format("~4B:~2B|" ++ Format ++ "~n",
-                             [Time, Node] ++ Args)).
+               io_lib:format("~6B.~2..0B:~2B|" ++ Format ++ "~n",
+                             [Time, SubTime, Node] ++ Args)).
 
 %%% start_test is our main entry-point function, which is meant to be
 %%% called by the test suite.  see the documentation for more
@@ -101,6 +92,7 @@ start_test(Init, Model, Seed, InitialInput0, Options) ->
     %% set up crap for early traces
     erlang:put(curr_node, 0),
     erlang:put(ab_time, 0),
+    erlang:put(sub_time, 0),
 
     %% should probably allow tuple or function like input
     {ok,
@@ -111,6 +103,8 @@ start_test(Init, Model, Seed, InitialInput0, Options) ->
         id_start = IDStart
        } = TestConfig,
      TestState} = Init(),
+
+    TimeModel = maps:get(time_model, Options, undefined),
 
     %% initialize all the nodes
     case length(NodeNames) == length(Configs) of
@@ -160,8 +154,8 @@ start_test(Init, Model, Seed, InitialInput0, Options) ->
 
     trace("init complete, entering test loop, seed is ~p", [Seed]),
 
-    test_loop(TestConfig, Model,
-              SeedNode, CurrentTime,
+    test_loop(TestConfig, Model, TimeModel,
+              SeedNode, {CurrentTime, 0},
               Nodes1, TestState).
 
 test_loop(#fc_conf{test_mod = Module,
@@ -169,15 +163,22 @@ test_loop(#fc_conf{test_mod = Module,
                    strategy = Strategy,
                    id_start = IDStart,
                    max_time = MaxTime} = TestConfig,
-          Model,
-          PrevNode, PrevTime,
+          Model, TimeModel,
+          PrevNode, {PrevTime, PrevSubTime},
           Nodes, TestState) ->
 
     Node = sched(Ordering, PrevNode, maps:size(Nodes), IDStart),
     erlang:put(curr_node, Node),
 
     Time = advance_time(Strategy, PrevTime),
+    SubTime = case Time of
+                  PrevTime ->
+                      PrevSubTime + 1;
+                  _ ->
+                      0
+              end,
     erlang:put(ab_time, Time),
+    erlang:put(sub_time, SubTime),
 
     case Time >= MaxTime of
         true ->
@@ -191,20 +192,28 @@ test_loop(#fc_conf{test_mod = Module,
         _ -> ok
     end,
 
-    Nodes1 = process_timers(Time, Nodes),
+    {Nodes1, TestState1} =
+        case TimeModel of
+            F when is_function(F) andalso SubTime == 0 ->
+                F(Time, Nodes, TestState);
+            _ ->
+                {Nodes, TestState}
+        end,
+
+    Nodes2 = process_timers(Time, Nodes1),
 
     %% perhaps at this point we should do a quick check for empty
     %% timers and empty queues (at least occasionally).  if we're in
     %% that state, we're inevitably going to time out, as there's
     %% nothing to drive forward progress.
 
-    case maps:get(Node, Nodes1) of
+    case maps:get(Node, Nodes2) of
         #node{queue = [], dqueue = []} ->
-            test_loop(TestConfig, Model, Node, Time, Nodes1, TestState);
+            test_loop(TestConfig, Model, TimeModel, Node, {Time, SubTime}, Nodes2, TestState1);
         #node{status = SorP} when SorP =:= stopped;
                                   SorP =:= partitioned ->
             %% trace("node ~p is ~p", [Node, SorP]),
-            test_loop(TestConfig, Model, Node, Time, Nodes1, TestState);
+            test_loop(TestConfig, Model, TimeModel, Node, {Time, SubTime}, Nodes2, TestState1);
         #node{queue = Queue, dqueue = DQueue, state = NodeState} ->
             %% trace("node ~p is ~p", [Node, Status]),
             {From, Message, Queue1, DQueue1} = next_message(Queue, DQueue),
@@ -215,7 +224,7 @@ test_loop(#fc_conf{test_mod = Module,
                 end,
 
             %% ideally this is 100% statically aligned for ease of reading
-            trace("~-16s ~2B->~2B => ~s",
+            trace("~-20s ~2B->~2B => ~s",
                   [print_message(Message),
                    From, Node,
                    print_actions(Actions)]),
@@ -226,16 +235,16 @@ test_loop(#fc_conf{test_mod = Module,
                 {result, Result} -> file_close(erlang:get(trace_file)), {ok, Result};
                 fail -> file_close(erlang:get(trace_file)), throw(fakecast_model_failure);
                 {fail, Reason} -> file_close(erlang:get(trace_file)), throw({fakecast_model_failure, Reason});
-                {actions, TestActions, TestState1} ->
-                    {Nodes2, NewState1, Actions1} =
-                        process_actions(TestActions, Nodes1, NewState, Actions),
+                {actions, TestActions, TestState2} ->
+                    {Nodes3, NewState1, Actions1} =
+                        process_actions(TestActions, Nodes2, NewState, Actions),
                     #{Node := NodeSt} = Nodes2,
-                    Nodes3 =
+                    Nodes4 =
                         process_output({NewState1, Actions1}, {From, Message},
                                        Node, Time,
-                                       Nodes2#{Node => NodeSt#node{queue = Queue1,
+                                       Nodes3#{Node => NodeSt#node{queue = Queue1,
                                                                    dqueue = DQueue1}}),
-                    test_loop(TestConfig, Model, Node, Time, Nodes3, TestState1)
+                    test_loop(TestConfig, Model, TimeModel, Node, {Time, SubTime}, Nodes4, TestState2)
             end
     end.
 
@@ -436,10 +445,10 @@ print_message(Msg) ->
         Tag when is_atom(Tag) ->
             atom_to_binary(Tag, utf8);
         Sub when is_tuple(Sub) ->
-            SubTag = element(1, element(2, Msg)),
+            SubTag = element(2, Msg),
             [io_lib:format("~p", [Sub]),
              $:,
-             io_lib:format("~p", [SubTag])]
+             print_message(SubTag)]
     end.
 
 %% mostly we're trying to make the protocol intention clear here, we
@@ -452,6 +461,8 @@ print_actions({send, _Mcast, Messages}) ->
     [[print_action(Msg),$,] || Msg <- Messages];
 print_actions({result, _Result}) ->
     <<"output result">>;
+print_actions(already_started) ->
+    <<"already_started">>;
 print_actions([]) ->
     <<"ok">>;
 print_actions(ok) ->
@@ -466,4 +477,4 @@ print_actions(start_timer) ->
 print_action({unicast, Targ, Msg}) ->
     [print_message(Msg),"->",integer_to_binary(Targ)];
 print_action({multicast, Msg}) ->
-    [io_lib:format("~p", [element(1, Msg)]),<<"->all">>].
+    [print_message(Msg),<<"->all">>].
