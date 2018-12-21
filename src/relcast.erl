@@ -441,7 +441,10 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
                             not_found
                     end;
                 _ ->
-                    {not_found, State}
+                    %% here when the CF is old, we need to re-search in a newer
+                    %% epoch.  our state alteration will be undone, since we
+                    %% never pass the changed state back to the user
+                    peek(ForActorID, State#state{pending_acks = Pending#{ForActorID => []}})
             end;
         _ ->
             %% default to the "first" key"
@@ -482,12 +485,13 @@ ack(FromActorID, Ref, State = #state{db = DB}) ->
                 {Ref, CF, _Key, _Multicast} when CF == State#state.active_cf;
                                                  CF == State#state.prev_cf ->
                     %% in the case that we get an ack that is not the first, we
-                    %% ack everything up to the acked message.
+                    %% ack everything up to the acked message.  keyfind is fast
+                    %% but sadly doesn't return the index, so we get this fold:
                     {_, NewPends0} =
                         lists:foldl(
-                          fun(Elt, {true, Acc}) ->
-                                  {true, [Elt | Acc]};
-                             ({R, Fam, Key, MCast}, false) ->
+                          %% this clause iterates through the list until it
+                          %% finds the entry with Ref, deleting as it goes.
+                          fun({R, Fam, Key, MCast}, false) ->
                                   case MCast of
                                       false ->
                                           %% unicast message, fine to delete now
@@ -498,13 +502,19 @@ ack(FromActorID, Ref, State = #state{db = DB}) ->
                                   end,
                                   case R of
                                       Ref ->
+                                          %% when we find it we switch over to
+                                          %% clause #2
                                           {true, []};
                                       _ ->
                                           false
-                                  end
+                                  end;
+                             %% once we're here just accumulate the leftovers
+                             (Elt, {true, Acc}) ->
+                                  {true, [Elt | Acc]}
                           end,
                           false,
                           Pends),
+                    %% then reverse them since we've changed the order.
                     NewPends = lists:reverse(NewPends0),
                     NewPending = (State#state.pending_acks)#{FromActorID => NewPends},
                     {ok, State#state{pending_acks=NewPending}};
@@ -781,6 +791,9 @@ find_next_outbound(ActorID, CF, StartKey, State, AcceptStart) ->
             true ->
                 cf_iterator_move(Iter, StartKey);
             false ->
+                %% on the paths where this is called, we're calling this with a
+                %% known to be existing start key, so we need to move the
+                %% iterator past it initially so we don't get it back
                 cf_iterator_move(Iter, StartKey),
                 cf_iterator_move(Iter, next)
         end,
