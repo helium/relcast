@@ -119,10 +119,10 @@
           ids :: [pos_integer()],
           last_sent = #{} :: #{pos_integer() => binary()},
           pending_acks = #{} ::
-            #{pos_integer() => [{reference(),
-                                 rocksdb:cf_handle(),
-                                 rocksdb:cf_handle() | undefined,
-                                 boolean()}]},
+            #{pos_integer() => [{PendRef :: reference(),
+                                 Epoch :: rocksdb:cf_handle(),
+                                 Key :: binary(),
+                                 Multicast :: boolean()}]},
           key_count = 0 :: non_neg_integer(),
           epoch = 0 :: non_neg_integer(),
           bitfieldsize :: pos_integer(),
@@ -316,7 +316,7 @@ deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_c
                      MsgHash = erlang:phash2(Message),
                      case lists:keyfind(MsgHash, 3, DefersForThisActor) of
                          false ->
-                             MaxDefers = application:get_env(relcast, max_defers),
+                             MaxDefers = application:get_env(relcast, max_defers, 100),
                              case DefersForThisActor of
                                  N when length(N) < MaxDefers ->
                                      Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
@@ -382,6 +382,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                     end;
                 %% all our pends are for a stale epoch, clean them out
                 _ ->
+                    %% adding true here resets all the pending acks before retrying
                     take(ForActorID, State, true)
             end;
         _ ->
