@@ -146,7 +146,17 @@
                    OutboundQueue :: #{pos_integer() => [binary()]}}.
 -export_type([relcast_state/0, status/0]).
 
--export([start/5, command/2, deliver/3, take/2, take/3, ack/3, stop/2, status/1]).
+-export([
+         start/5,
+         command/2,
+         deliver/3,
+         take/2, take/3,
+         reset_actor/2,
+         peek/2,
+         ack/3,
+         stop/2,
+         status/1
+        ]).
 
 %% @doc Start a relcast instance. Starts a relcast instance for the actor
 %% `ActorID' in the group of `ActorIDs' using the callback module `Module'
@@ -350,13 +360,11 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
     %% we need to find the first "unacked" message for this actor
     %% we should remember the last acked message for this actor ID and start there
     %% check if there's a pending ACK and use that to find the "last" key, if present
-    ct:pal("take"),
-    {ok, PipelineDepth} = application:get_env(relcast, pipeline_depth),
+    PipelineDepth = application:get_env(relcast, pipeline_depth, 20),
     case maps:get(ForActorID, Pending, []) of
         Pends when length(Pends) >= PipelineDepth ->
             {pipeline_full, State};
         Pends when Pends /= [] ->
-            ct:pal("pends ~p >= ~p", [length(Pends), PipelineDepth]),
             case lists:last(Pends) of
                 {Ref, CF, Key, _Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
                     %% iterate until we find a key for this actor
@@ -378,7 +386,6 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
             end;
         _ ->
             %% default to the "first" key"
-            ct:pal("first key"),
             case maps:get(ForActorID, State#state.last_sent, {prev_cf(State), min_outbound_key()}) of
                 none ->
                     %% we *know* there's nothing pending for this actor
@@ -407,6 +414,62 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
             end
     end.
 
+-spec reset_actor(pos_integer(), relcast_state()) -> {ok, relcast_state()}.
+reset_actor(ForActorID, State = #state{pending_acks = Pending}) ->
+    {ok, State#state{pending_acks = Pending#{ForActorID => []}}}.
+
+%%% @doc Get the next message this relcast has queued outbound for
+%%% `ForActorID', without affecting the pipeline state or having any other side effects.
+-spec peek(pos_integer(), relcast_state()) ->
+                  not_found |
+                  {ok, binary()}.
+peek(ForActorID, State = #state{pending_acks = Pending}) ->
+    %% we need to find the first "unacked" message for this actor
+    %% we should remember the last acked message for this actor ID and start there
+    %% check if there's a pending ACK and use that to find the "last" key, if present
+    case maps:get(ForActorID, Pending, []) of
+        Pends when Pends /= [] ->
+            case lists:last(Pends) of
+                {_Ref, CF, Key, _Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
+                    %% iterate until we find a key for this actor
+                    case find_next_outbound(ForActorID, CF, Key, State) of
+                        {not_found, _LastKey, _CF2} ->
+                            not_found;
+                        {Key, CF, Msg, _Multicast} ->
+                            {ok, Msg};
+                        not_found ->
+                            not_found
+                    end;
+                _ ->
+                    {not_found, State}
+            end;
+        _ ->
+            %% default to the "first" key"
+            case maps:get(ForActorID, State#state.last_sent, {prev_cf(State), min_outbound_key()}) of
+                none ->
+                    %% we *know* there's nothing pending for this actor
+                    not_found;
+                {CF0, StartKey0} ->
+                    %% check if the column family is still valid
+                    {CF, StartKey} = case CF0 == State#state.active_cf orelse CF0 == State#state.prev_cf of
+                                         true ->
+                                             {CF0, StartKey0};
+                                         false ->
+                                             %% reset the start key as well
+                                             {State#state.prev_cf, min_inbound_key()}
+                                     end,
+                    %% iterate until we find a key for this actor
+                    case find_next_outbound(ForActorID, CF, StartKey, State) of
+                        {not_found, _LastKey, _CF2} ->
+                            not_found;
+                        {_Key, _CF2, Msg, _Multicast} ->
+                            {ok, Msg};
+                        not_found ->
+                            not_found
+                    end
+            end
+    end.
+
 %% @doc Indicate to relcast that `FromActorID' has acknowledged receipt of the
 %% message associated with `Ref'.
 -spec ack(pos_integer(), reference(), relcast_state()) -> {ok, relcast_state()}.
@@ -420,7 +483,6 @@ ack(FromActorID, Ref, State = #state{db = DB}) ->
                                                  CF == State#state.prev_cf ->
                     %% in the case that we get an ack that is not the first, we
                     %% ack everything up to the acked message.
-                    ct:pal("found ~p to ack", [Ref]),
                     {_, NewPends0} =
                         lists:foldl(
                           fun(Elt, {true, Acc}) ->
@@ -446,12 +508,7 @@ ack(FromActorID, Ref, State = #state{db = DB}) ->
                     NewPends = lists:reverse(NewPends0),
                     NewPending = (State#state.pending_acks)#{FromActorID => NewPends},
                     {ok, State#state{pending_acks=NewPending}};
-                _else ->
-                    ct:pal("didn't find ~p to ack in ~p~ncf ~p ~p~nelse ~p",
-                           [Ref, Pends,
-                            State#state.active_cf,
-                            State#state.prev_cf,
-                            _else]),
+                _ ->
                     {ok, State}
             end
     end.
