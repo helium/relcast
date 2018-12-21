@@ -4,23 +4,44 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -export([
-    all/0
-]).
+         all/0,
+         init_per_suite/1,
+         end_per_suite/1
+        ]).
 
 -export([
-    basic/1,
-    stop_resume/1,
-    defer/1,
-    defer_stop_resume/1,
-    epochs/1,
-    epochs_gc/1,
-    callback_message/1,
-    self_callback_message/1,
-    epoch_no_state/1
-]).
+         basic/1,
+         stop_resume/1,
+         defer/1,
+         defer_stop_resume/1,
+         epochs/1,
+         epochs_gc/1,
+         callback_message/1,
+         self_callback_message/1,
+         epoch_no_state/1,
+         pipeline/1
+        ]).
 
 all() ->
-    [basic, stop_resume, defer, defer_stop_resume, epochs, epochs_gc, callback_message, self_callback_message, epoch_no_state].
+    [
+     basic,
+     stop_resume,
+     defer,
+     defer_stop_resume,
+     epochs,
+     epochs_gc,
+     callback_message,
+     self_callback_message,
+     epoch_no_state,
+     pipeline
+    ].
+
+init_per_suite(Config) ->
+    application:load(relcast),
+    Config.
+
+end_per_suite(Config) ->
+    Config.
 
 basic(_Config) ->
     Actors = lists:seq(1, 3),
@@ -30,22 +51,22 @@ basic(_Config) ->
     {ok, RC1_2} = relcast:deliver(<<"hello">>, 2, RC1),
     {true, _} = relcast:command(is_done, RC1_2),
     {ok, Ref, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
-    %% same result if we take() again for this actor
-    {ok, Ref, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_3),
+    %%{ok, Ref1, <<"hai">>, RC1_4} = relcast:take(2, RC1_3),
     %% ack it
     {ok, RC1_4} = relcast:ack(2, Ref, RC1_3),
     %% check it's gone
     {ok, Ref2, <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
     %% take for actor 3
-    {ok, Ref3, <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
+    {ok, _Ref3, <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
     %% ack with the wrong ref
     {ok, RC1_7} = relcast:ack(3, Ref, RC1_6),
-    %% actor 3 still has pending data
-    {ok, Ref3, <<"hai">>, RC1_8} = relcast:take(3, RC1_7),
+    %% actor 3 still has pending data, but we need to clear pending to
+    %% get at it
+    {ok, Ref3_1, <<"hai">>, RC1_8} = relcast:take(3, RC1_7, true),
     %% ack both of the outstanding messages
     {ok, RC1_9} = relcast:ack(2, Ref2, RC1_8),
     {not_found, _} = relcast:take(2, RC1_9),
-    {ok, RC1_10} = relcast:ack(3, Ref3, RC1_9),
+    {ok, RC1_10} = relcast:ack(3, Ref3_1, RC1_9),
     {not_found, _} = relcast:take(2, RC1_10),
     relcast:stop(normal, RC1_10),
     ok.
@@ -61,8 +82,6 @@ stop_resume(_Config) ->
     [<<"ehlo">>, <<"hai">>] = maps:get(2, Outbound),
     [<<"hai">>] = maps:get(3, Outbound),
     {ok, Ref, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
-    %% same result if we take() again for this actor
-    {ok, Ref, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_3),
     %% ack it
     {ok, RC1_3a} = relcast:ack(2, Ref, RC1_3),
     relcast:stop(normal, RC1_3a),
@@ -70,11 +89,11 @@ stop_resume(_Config) ->
     %% check it's gone
     {ok, Ref2, <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
     %% take for actor 3
-    {ok, Ref3, <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
+    {ok, _Ref3, <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
     %% ack with the wrong ref
     {ok, RC1_7} = relcast:ack(3, Ref, RC1_6),
     %% actor 3 still has pending data
-    {ok, Ref3, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7),
+    {ok, Ref3, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7, true),
     relcast:stop(normal, RC1_7a),
     {ok, RC1_8} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2"}]),
     %% ack both of the outstanding messages
@@ -82,7 +101,7 @@ stop_resume(_Config) ->
     %% we lost the ack, so the message is still in-queue
     {ok, Ref4, <<"hai">>, RC1_10} = relcast:take(2, RC1_9),
     {ok, RC1_11} = relcast:ack(3, Ref3, RC1_10),
-    {ok, Ref5, <<"hai">>, RC1_12} = relcast:take(2, RC1_11),
+    {ok, Ref5, <<"hai">>, RC1_12} = relcast:take(2, RC1_11, true),
     %% ack both of the outstanding messages again
     {ok, RC1_13} = relcast:ack(2, Ref4, RC1_12),
     {not_found, _} = relcast:take(2, RC1_13),
@@ -275,7 +294,7 @@ self_callback_message(_Config) ->
     {false, _} = relcast:command(was_saluted, RC1),
     {ok, RC1_2} = relcast:deliver(<<"salute">>, 2, RC1),
     {ok, Ref,  <<"salutations to 2">>, RC1_3} = relcast:take(2, RC1_2),
-    {ok, Ref,  <<"salutations to 2">>, _} = relcast:take(2, RC1_3),
+    %%{ok, Ref,  <<"salutations to 2">>, _} = relcast:take(2, RC1_3),
     {ok, Ref2, <<"salutations to 3">>, RC1_4} = relcast:take(3, RC1_3),
     {ok, RC1_5} = relcast:ack(2, Ref, RC1_4),
     {ok, RC1_6} = relcast:ack(3, Ref2, RC1_5),
@@ -311,4 +330,36 @@ epoch_no_state(_Config) ->
                                         {"epoch0000000000", []},
                                         {"epoch0000000001", []}]),
     {ok, _Result} = rocksdb:get(DB2, CF1, <<"stored_module_state">>, []),
+    ok.
+
+pipeline(_Config) ->
+    Actors = lists:seq(1, 3),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data11"}]),
+    {not_found, _} = relcast:take(2, RC1),
+    {ok, RC2} =
+        lists:foldl(fun(Idx, {ok, Acc}) ->
+                            relcast:deliver(<<"unicast: hello - ", (integer_to_binary(Idx))/binary>>, 2, Acc)
+                    end,
+                    {ok, RC1},
+                    [N || N <- lists:seq(1, 30)]),
+    {ok, Ref, <<"hello - 20">>, RC3} =
+        lists:foldl(fun(_Idx, {ok, _R, _Msg, Acc}) ->
+                            relcast:take(2, Acc)
+                    end,
+                    {ok, ign, ign, RC2},
+                    [N || N <- lists:seq(1, 20)]),
+    {pipeline_full, _RC3} = relcast:take(2, RC3),
+    %% test multi-ack
+    {ok, RC4} = relcast:ack(2, Ref, RC3),
+    %% test single acks
+    RC5 =
+        lists:foldl(fun(Idx, Acc) ->
+                            Msg = <<"hello - ", (integer_to_binary(Idx))/binary>>,
+                            {ok, R, Msg, Acc1} = relcast:take(2, Acc),
+                            {ok, Acc2} = relcast:ack(R, 2, Acc1),
+                            Acc2
+                    end,
+                    RC4,
+                    [N || N <- lists:seq(21, 30)]),
+    {not_found, _} = relcast:take(2, RC5),
     ok.

@@ -61,6 +61,8 @@ handle_message(<<"hello">>, Actor, State) ->
     {State#state{got_hello=true}, [{unicast, Actor, <<"ehlo">>}, {multicast, <<"hai">>}]};
 handle_message(<<"hai">>, Actor, State = #state{id=Actor}) ->
     {State#state{got_self_hai=true}, []};
+handle_message(<<"unicast: ", Msg/binary>>, Actor, State) ->
+    {State, [{unicast, Actor, Msg}]};
 handle_message(<<"salutations to ", ID/binary>>, Actor, State = #state{id=Actor}) ->
     case list_to_integer(binary_to_list(ID)) of
         Actor ->
