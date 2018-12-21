@@ -7,7 +7,11 @@
     stdlib,
     rocksdb
    ]},
-  {env,[]},
+  {env,
+   [
+    {pipeline_depth, 20},
+    {max_defers, 100}
+   ]},
   {modules, []},
 
   {maintainers, []},
