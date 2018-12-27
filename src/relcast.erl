@@ -1028,3 +1028,31 @@ make_seq(ID, #state{seq_map=SeqMap, ids=A}=State) ->
 
 reset_seq(ID, #state{seq_map=SeqMap}=State) ->
     State#state{seq_map=maps:remove(ID, SeqMap)}.
+
+
+-ifdef(TEST).
+
+-include_lib("eunit/include/eunit.hrl").
+
+seq_increment_test() ->
+    State = #state{ids=[1, 2, 3, 4, 5]},
+    {Seq1, State1} = make_seq(1, State),
+    {Seq2, _State2} = make_seq(1, State1),
+    %% sequence numbers for the same actor should increment
+    ?assert(Seq1 < Seq2),
+    ?assertEqual(1, Seq2 - Seq1).
+
+seq_partition_test() ->
+    State = #state{ids=[1, 2, 3, 4, 5]},
+    {Seq1, State1} = make_seq(1, State),
+    {Seq2, _State2} = make_seq(2, State1),
+    %% Sequence 0 for 2 actors should not be the same
+    ?assertNotEqual(Seq1, Seq2).
+
+seq_rollover_test() ->
+    State = #state{ids=[1, 2, 3, 4, 5], seq_map=#{1 => trunc(math:pow(2, 29)) - 1}},
+    {Seq1, State1} = make_seq(1, State),
+    {Seq2, _State2} = make_seq(1, State1),
+    ?assert(Seq1 > Seq2).
+
+-endif.
