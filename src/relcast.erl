@@ -128,7 +128,8 @@
           bitfieldsize :: pos_integer(),
           prev_cf :: undefined | rocksdb:cf_handle(),
           active_cf :: rocksdb:cf_handle(),
-          defers = #{} :: #{pos_integer() => [{rocksdb:cf_handle(), binary()}]}
+          defers = #{} :: #{pos_integer() => [{rocksdb:cf_handle(), binary()}]},
+          seq_map = #{} :: #{pos_integer() => pos_integer()}
          }).
 
 -record(iterator, {
@@ -351,10 +352,10 @@ take(ID, State) ->
 -spec take(pos_integer(), relcast_state(), boolean()) ->
                   {not_found, relcast_state()} |
                   {pipeine_full, relcast_state()} |
-                  {ok, reference(), binary(), relcast_state()}.
+                  {ok, non_neg_integer(), binary(), relcast_state()}.
 take(ForActorID, State = #state{pending_acks = Pending}, true) ->
     take(ForActorID,
-         State#state{pending_acks = Pending#{ForActorID => []}},
+         reset_seq(ForActorID, State#state{pending_acks = Pending#{ForActorID => []}}),
          false);
 take(ForActorID, State = #state{pending_acks = Pending}, _) ->
     %% we need to find the first "unacked" message for this actor
@@ -366,16 +367,16 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
             {pipeline_full, State};
         Pends when Pends /= [] ->
             case lists:last(Pends) of
-                {Ref, CF, Key, _Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
+                {_Seq, CF, Key, _Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, Key, State, false) of
                         {not_found, LastKey, CF2} ->
                             {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
                         {Key2, CF2, Msg, Multicast} ->
-                            Ref2 = make_ref(),
-                            Pends1 = Pends ++ [{Ref2, CF2, Key2, Multicast}],
-                            {ok, Ref, Msg,
-                             State#state{last_sent = maps:put(ForActorID, {CF2, Key2}, State#state.last_sent),
+                            {Seq2, State2} = make_seq(ForActorID, State),
+                            Pends1 = Pends ++ [{Seq2, CF2, Key2, Multicast}],
+                            {ok, Seq2, Msg,
+                             State2#state{last_sent = maps:put(ForActorID, {CF2, Key2}, State#state.last_sent),
                                          pending_acks = maps:put(ForActorID, Pends1, Pending)}};
                         not_found ->
                             {not_found, State#state{last_sent=maps:put(ForActorID, {CF, Key}, State#state.last_sent)}}
@@ -405,10 +406,10 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                         {not_found, LastKey, CF2} ->
                             {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
                         {Key, CF2, Msg, Multicast} ->
-                            Ref = make_ref(),
-                            {ok, Ref, Msg,
-                             State#state{last_sent = maps:put(ForActorID, {CF2, Key}, State#state.last_sent),
-                                         pending_acks = maps:put(ForActorID, [{Ref, CF2, Key, Multicast}], Pending)}};
+                            {Seq, State2} = make_seq(ForActorID, State),
+                            {ok, Seq, Msg,
+                             State2#state{last_sent = maps:put(ForActorID, {CF2, Key}, State#state.last_sent),
+                                         pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
                         not_found ->
                             {not_found, State#state{last_sent = maps:put(ForActorID, none, State#state.last_sent)}}
                     end
@@ -475,15 +476,15 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
     end.
 
 %% @doc Indicate to relcast that `FromActorID' has acknowledged receipt of the
-%% message associated with `Ref'.
--spec ack(pos_integer(), reference(), relcast_state()) -> {ok, relcast_state()}.
-ack(FromActorID, Ref, State = #state{db = DB}) ->
+%% message associated with `Seq'.
+-spec ack(pos_integer(), non_neg_integer(), relcast_state()) -> {ok, relcast_state()}.
+ack(FromActorID, Seq, State = #state{db = DB}) ->
     case maps:get(FromActorID, State#state.pending_acks, []) of
         [] ->
             {ok, State};
         Pends ->
-            case lists:keyfind(Ref, 1, Pends) of
-                {Ref, CF, _Key, _Multicast} when CF == State#state.active_cf;
+            case lists:keyfind(Seq, 1, Pends) of
+                {Seq, CF, _Key, _Multicast} when CF == State#state.active_cf;
                                                  CF == State#state.prev_cf ->
                     %% in the case that we get an ack that is not the first, we
                     %% ack everything up to the acked message.  keyfind is fast
@@ -491,7 +492,7 @@ ack(FromActorID, Ref, State = #state{db = DB}) ->
                     {_, NewPends0} =
                         lists:foldl(
                           %% this clause iterates through the list until it
-                          %% finds the entry with Ref, deleting as it goes.
+                          %% finds the entry with Seq, deleting as it goes.
                           fun({R, Fam, Key, MCast}, false) ->
                                   case MCast of
                                       false ->
@@ -502,7 +503,7 @@ ack(FromActorID, Ref, State = #state{db = DB}) ->
                                           flip_actor_bit(FromActorID, DB, Fam, Key)
                                   end,
                                   case R of
-                                      Ref ->
+                                      Seq ->
                                           %% when we find it we switch over to
                                           %% clause #2
                                           {true, []};
@@ -1014,3 +1015,16 @@ cf_iterator_close(Ref) ->
     Iterator = erlang:get(Ref),
     erlang:erase(Ref),
     rocksdb:iterator_close(Iterator#iterator.iterator).
+
+%% generates a partitioned sequence number with the actor ID in the high bits
+%% rollover happens naturally because once the sequence number uses more than 32-PrefixLen
+%% bits the high bits get dropped
+make_seq(ID, #state{seq_map=SeqMap, ids=A}=State) ->
+    Seq = maps:get(ID, SeqMap, 0),
+    %% calculate the number of bits needed to hold length(A)
+    PrefixLen = ceil(math:log2(length(A))),
+    <<TaggedSeq:32/integer-unsigned-big>> = <<ID:PrefixLen, Seq:(32-PrefixLen)>>,
+    {TaggedSeq, State#state{seq_map=maps:put(ID, Seq+1, SeqMap)}}.
+
+reset_seq(ID, #state{seq_map=SeqMap}=State) ->
+    State#state{seq_map=maps:remove(ID, SeqMap)}.
