@@ -153,6 +153,7 @@
          deliver/3,
          take/2, take/3,
          reset_actor/2,
+         in_flight/2,
          peek/2,
          ack/3,
          stop/2,
@@ -420,6 +421,14 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
 reset_actor(ForActorID, State = #state{pending_acks = Pending}) ->
     {ok, State#state{pending_acks = Pending#{ForActorID => []}}}.
 
+-spec in_flight(pos_integer(), relcast_state()) -> non_neg_integer().
+in_flight(ForActorID, State = #state{pending_acks = Pending}) ->
+    P = maps:get(ForActorID, Pending, []),
+    Active = lists:filter(fun ({_Ref, CF, _Key, _Multicast}) ->
+                                  CF == State#state.active_cf orelse CF == State#state.prev_cf
+                          end, P),
+    length(Active).
+
 %%% @doc Get the next message this relcast has queued outbound for
 %%% `ForActorID', without affecting the pipeline state or having any other side effects.
 -spec peek(pos_integer(), relcast_state()) ->
@@ -651,18 +660,22 @@ handle_actions([], _Batch, State) ->
     {ok, State};
 handle_actions([new_epoch|Tail], Batch, State) ->
     {ok, NewCF} = rocksdb:create_column_family(State#state.db, make_column_family_name(State#state.epoch + 1), db_options(length(State#state.ids))),
-    Defers = case State#state.prev_cf of
-        undefined -> State#state.defers;
+    {Defers, Pends} = case State#state.prev_cf of
+        undefined -> {State#state.defers, State#state.pending_acks};
         _ ->
             ok = rocksdb:drop_column_family(State#state.prev_cf),
             ok = rocksdb:destroy_column_family(State#state.prev_cf),
-            maps:map(fun(_, V) ->
+            {maps:map(fun(_, V) ->
                              lists:keydelete(State#state.prev_cf, 1, V)
-                     end, State#state.defers)
+                     end, State#state.defers),
+            maps:map(fun(_, V) ->
+                             lists:keydelete(State#state.prev_cf, 2, V)
+                     end, State#state.pending_acks)}
+
     end,
     %% when we're done handling actions, we will write the module state (and all subsequent outbound messages from this point on)
     %% into the active CF, which is this new one now
-    handle_actions(Tail, Batch, State#state{key_count=0, active_cf=NewCF, prev_cf=State#state.active_cf, epoch=State#state.epoch + 1, defers=Defers});
+    handle_actions(Tail, Batch, State#state{key_count=0, active_cf=NewCF, prev_cf=State#state.active_cf, epoch=State#state.epoch + 1, defers=Defers, pending_acks=Pends});
 handle_actions([{multicast, Message}|Tail], Batch, State =
                #state{key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
