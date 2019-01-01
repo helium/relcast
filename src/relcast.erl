@@ -367,13 +367,11 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
         Pends when length(Pends) >= PipelineDepth ->
             {pipeline_full, State};
         Pends when Pends /= [] ->
-            error_logger:info_msg("pending not empty~n"),
             case lists:last(Pends) of
                 {_Seq, CF, Key, _Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, Key, State, false) of
                         {not_found, LastKey, CF2} ->
-                            error_logger:info_msg("can't find next outbound~n"),
                             {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
                         {Key2, CF2, Msg, Multicast} ->
                             {Seq2, State2} = make_seq(ForActorID, State),
@@ -382,21 +380,17 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                              State2#state{last_sent = maps:put(ForActorID, {CF2, Key2}, State#state.last_sent),
                                          pending_acks = maps:put(ForActorID, Pends1, Pending)}};
                         not_found ->
-                            error_logger:info_msg("can't find next outbound, second case~n"),
                             {not_found, State#state{last_sent=maps:put(ForActorID, none, State#state.last_sent)}}
                     end;
                 %% all our pends are for a stale epoch, clean them out
                 _ ->
-                    error_logger:info_msg("pending stale~n"),
                     %% adding true here resets all the pending acks before retrying
                     take(ForActorID, State, true)
             end;
         _ ->
-            error_logger:info_msg("Pending is empty~n"),
             %% default to the "first" key"
             case maps:get(ForActorID, State#state.last_sent, {prev_cf(State), min_outbound_key()}) of
                 none ->
-                    error_logger:info_msg("last_sent is none~n"),
                     %% we *know* there's nothing pending for this actor
                     {not_found, State};
                 {CF0, StartKey0} ->
@@ -411,7 +405,6 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
                         {not_found, LastKey, CF2} ->
-                            error_logger:info_msg("can't find next outbound~n"),
                             {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
                         {Key, CF2, Msg, Multicast} ->
                             {Seq, State2} = make_seq(ForActorID, State),
@@ -419,7 +412,6 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                              State2#state{last_sent = maps:put(ForActorID, {CF2, Key}, State#state.last_sent),
                                          pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
                         not_found ->
-                            error_logger:info_msg("can't find next outbound, second case~n"),
                             {not_found, State#state{last_sent = maps:put(ForActorID, none, State#state.last_sent)}}
                     end
             end
