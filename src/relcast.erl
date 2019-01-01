@@ -354,10 +354,9 @@ take(ID, State) ->
                   {not_found, relcast_state()} |
                   {pipeine_full, relcast_state()} |
                   {ok, non_neg_integer(), binary(), relcast_state()}.
-take(ForActorID, State = #state{pending_acks = Pending}, true) ->
-    take(ForActorID,
-         reset_seq(ForActorID, State#state{pending_acks = Pending#{ForActorID => []}}),
-         false);
+take(ForActorID, State, true) ->
+    {ok, NewState} = reset_actor(ForActorID, State),
+    take(ForActorID, NewState, false);
 take(ForActorID, State = #state{pending_acks = Pending}, _) ->
     %% we need to find the first "unacked" message for this actor
     %% we should remember the last acked message for this actor ID and start there
@@ -418,8 +417,9 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
     end.
 
 -spec reset_actor(pos_integer(), relcast_state()) -> {ok, relcast_state()}.
-reset_actor(ForActorID, State = #state{pending_acks = Pending}) ->
-    {ok, State#state{pending_acks = Pending#{ForActorID => []}}}.
+reset_actor(ForActorID, State = #state{pending_acks = Pending, last_sent = LastSent}) ->
+    {ok, reset_seq(ForActorID, State#state{pending_acks = Pending#{ForActorID => []},
+                                           last_sent = maps:remove(ForActorID, LastSent)})}.
 
 -spec in_flight(pos_integer(), relcast_state()) -> non_neg_integer().
 in_flight(ForActorID, State = #state{pending_acks = Pending}) ->
