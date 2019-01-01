@@ -530,7 +530,10 @@ ack(FromActorID, Seq, State = #state{db = DB}) ->
                     NewPending = (State#state.pending_acks)#{FromActorID => NewPends},
                     {ok, State#state{pending_acks=NewPending}};
                 _ ->
-                    {ok, State}
+                    %% delete this, it's stale
+                    NewPends = lists:keydelete(Seq, 1, Pends),
+                    NewPending = (State#state.pending_acks)#{FromActorID => NewPends},
+                    {ok, State#state{pending_acks=NewPending}}
             end
     end.
 
