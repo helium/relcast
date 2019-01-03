@@ -376,8 +376,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                             {Seq2, State2} = make_seq(ForActorID, State),
                             Pends1 = Pends ++ [{Seq2, CF2, Key2, Multicast}],
                             {ok, Seq2, Msg,
-                             State2#state{last_sent = maps:put(ForActorID, {CF2, Key2}, State#state.last_sent),
-                                         pending_acks = maps:put(ForActorID, Pends1, Pending)}};
+                             State2#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}};
                         not_found ->
                             {not_found, State#state{last_sent=maps:put(ForActorID, none, State#state.last_sent)}}
                     end;
@@ -408,8 +407,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                         {Key, CF2, Msg, Multicast} ->
                             {Seq, State2} = make_seq(ForActorID, State),
                             {ok, Seq, Msg,
-                             State2#state{last_sent = maps:put(ForActorID, {CF2, Key}, State#state.last_sent),
-                                         pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
+                             State2#state{pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
                         not_found ->
                             {not_found, State#state{last_sent = maps:put(ForActorID, none, State#state.last_sent)}}
                     end
@@ -493,7 +491,7 @@ ack(FromActorID, Seq, State = #state{db = DB}) ->
             {ok, State};
         Pends ->
             case lists:keyfind(Seq, 1, Pends) of
-                {Seq, CF, _Key, _Multicast} when CF == State#state.active_cf;
+                {Seq, CF, AKey, _Multicast} when CF == State#state.active_cf;
                                                  CF == State#state.prev_cf ->
                     %% in the case that we get an ack that is not the first, we
                     %% ack everything up to the acked message.  keyfind is fast
@@ -528,7 +526,7 @@ ack(FromActorID, Seq, State = #state{db = DB}) ->
                     %% then reverse them since we've changed the order.
                     NewPends = lists:reverse(NewPends0),
                     NewPending = (State#state.pending_acks)#{FromActorID => NewPends},
-                    {ok, State#state{pending_acks=NewPending}};
+                    {ok, State#state{pending_acks=NewPending, last_sent = maps:put(FromActorID, {CF, AKey}, State#state.last_sent)}};
                 _ ->
                     %% delete this, it's stale
                     NewPends = lists:keydelete(Seq, 1, Pends),
