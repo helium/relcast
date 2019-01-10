@@ -398,7 +398,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                                              {CF0, StartKey0};
                                          false ->
                                              %% reset the start key as well
-                                             {State#state.prev_cf, min_inbound_key()}
+                                             {State#state.prev_cf, min_outbound_key()}
                                      end,
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
@@ -441,10 +441,10 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
             case lists:last(Pends) of
                 {_Ref, CF, Key, _Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
                     %% iterate until we find a key for this actor
-                    case find_next_outbound(ForActorID, CF, Key, State) of
+                    case find_next_outbound(ForActorID, CF, Key, State, false) of
                         {not_found, _LastKey, _CF2} ->
                             not_found;
-                        {Key, CF, Msg, _Multicast} ->
+                        {_Key2, _CF2, Msg, _Multicast2} ->
                             {ok, Msg};
                         not_found ->
                             not_found
@@ -468,7 +468,7 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
                                              {CF0, StartKey0};
                                          false ->
                                              %% reset the start key as well
-                                             {State#state.prev_cf, min_inbound_key()}
+                                             {State#state.prev_cf, min_outbound_key()}
                                      end,
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
@@ -722,6 +722,7 @@ handle_actions([{unicast, ToActorID, Message}|Tail], Batch, State = #state{key_c
     ok = rocksdb:batch_put(Batch, CF, Key, <<1:2/integer, ToActorID:14/integer, Message/binary>>),
     handle_actions(Tail, Batch, update_next([ToActorID], CF, Key, State#state{key_count=KeyCount+1}));
 handle_actions([{stop, Timeout}|_Tail], _Batch, State) ->
+    logger:info("YYYYYYYYYY ~p stopping", [self()]),
     {stop, Timeout, State}.
 
 update_next(Actors, CF, Key, State) ->
@@ -765,7 +766,7 @@ round_to_nearest_byte(Bits) ->
 
 %% get the maximum key ID used
 get_last_key(DB, CF) ->
-    {ok, InIter} = rocksdb:iterator(DB, CF, [{iterate_upper_bound, max_inbound_key()}]),
+    {ok, InIter} = rocksdb:iterator(DB, CF, [{iterate_lower_bound, min_inbound_key()}]),
     %% XXX iterate_upper_bound doesn't work, so we can't use it.
     %% instead we seek to the last possible key, and if that is not present,
     %% seek to the previous key
@@ -781,7 +782,7 @@ get_last_key(DB, CF) ->
             end
     end,
     rocksdb:iterator_close(InIter),
-    {ok, OutIter} = rocksdb:iterator(DB, CF, [{iterate_upper_bound, max_outbound_key()}]),
+    {ok, OutIter} = rocksdb:iterator(DB, CF, [{iterate_lower_bound, min_outbound_key()}]),
     MaxOutbound = case rocksdb:iterator_move(OutIter, max_outbound_key()) of
         {ok, <<"o", OutNum:10/binary>>, _} ->
             list_to_integer(binary_to_list(OutNum));
