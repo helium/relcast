@@ -538,6 +538,7 @@ ack(FromActorID, Seq, State = #state{db = DB}) ->
 %% @doc Stop the relcast instance.
 -spec stop(any(), relcast_state()) -> ok.
 stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
+    lager:info("AAAAAAAA in stop fun"),
     case erlang:function_exported(Module, terminate, 2) of
         true ->
             Module:terminate(Reason, ModuleState);
@@ -651,6 +652,7 @@ handle_message(Key, CF, FromActorID, Message, Batch, State = #state{module=Modul
                     ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     {ok, NewState};
                 {stop, Timeout, NewState} ->
+                    lager:info("stoppping"),
                     ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     {stop, Timeout, NewState}
             end
@@ -722,6 +724,7 @@ handle_actions([{unicast, ToActorID, Message}|Tail], Batch, State = #state{key_c
     ok = rocksdb:batch_put(Batch, CF, Key, <<1:2/integer, ToActorID:14/integer, Message/binary>>),
     handle_actions(Tail, Batch, update_next([ToActorID], CF, Key, State#state{key_count=KeyCount+1}));
 handle_actions([{stop, Timeout}|_Tail], _Batch, State) ->
+    logger:info("YYYYYYYYYY ~p stopping", [self()]),
     {stop, Timeout, State}.
 
 update_next(Actors, CF, Key, State) ->
