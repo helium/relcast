@@ -30,6 +30,7 @@
          running = false :: boolean()
         }).
 
+-define(M, ?MODULE).
 
 %% this module describes a simple relcast setup of extremely simple
 %% actors that send and receive random messages.  The actors are
@@ -46,7 +47,7 @@
 initial_state() ->
     Actors = lists:seq(2, 3),
     DirNum = erlang:unique_integer(),
-    Dir = "data-" ++ integer_to_list(DirNum),
+    Dir = "data/data-" ++ integer_to_list(DirNum),
 
     States = maps:from_list([{A, #act{id = A}}
                              || A <- Actors]),
@@ -55,7 +56,7 @@ initial_state() ->
                              || A <- Actors]),
 
     %% add one here, but it's local so we don't want it selected for deliveries.
-    {ok, RC} = relcast:start(1, [1 | Actors], ?MODULE, [], [{data_dir, Dir}]),
+    {ok, RC} = relcast:start(1, [1 | Actors], ?M, [], [{data_dir, Dir}]),
 
     #s{actors = Actors,
        rc = RC,
@@ -69,14 +70,14 @@ initial_state() ->
 command(S) ->
     frequency(
       [
-       %% {1, {call, ?MODULE, open, [S#s.actors, S#s.dir]}},
-       %% {1, {call, ?MODULE, close, [S#s.rc]}},
-       {10, {call, ?MODULE, command, [S#s.rc, oneof(S#s.actors), binary()]}},
-       {10, {call, ?MODULE, take, [S#s.rc, oneof(S#s.actors)]}},
-       {10, {call, ?MODULE, deliver, [oneof(S#s.actors)]}},
-       %% {10, {call, ?MODULE, peek, [S#s.rc, oneof(S#s.actors)]}},
-       {10, {call, ?MODULE, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st]}}%,
-       %% {1, {call, ?MODULE, reset, [S#s.rc, oneof(S#s.actors)]}}
+       %% {1, {call, ?M, open, [S#s.actors, S#s.dir]}},
+       %% {1, {call, ?M, close, [S#s.rc]}},
+       {10, {call, ?M, command, [S#s.rc, oneof(S#s.actors), binary()]}},
+       {10, {call, ?M, take, [S#s.rc, oneof(S#s.actors)]}},
+       {10, {call, ?M, deliver, [oneof(S#s.actors)]}},
+       %% {10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
+       {10, {call, ?M, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st]}}%,
+       %% {1, {call, ?M, reset, [S#s.rc, oneof(S#s.actors)]}}
       ]).
 
 %% -- Common pre-/post-conditions --------------------------------------------
@@ -110,45 +111,42 @@ postcondition(_, _, _) ->
 next_state(#s{messages = Msgs,
               act_st = States} = S,
            RC, {_, _, command, [_RC0, Actor, Msg]}) ->
-    #{Actor := St = #act{sent = Sent}} = States,
     S#s{rc = RC,
-        messages = Msgs#{{Actor, Sent + 1} => Msg},
-        act_st = States#{Actor => St#act{sent = Sent + 1}}};
+        messages = {call, ?M, command_messages, [Actor, States, Msg, Msgs]},
+        act_st = {call, ?M, command_states, [Actor, States]}};
 next_state(#s{act_st = States} = S,
            RC,
            {_, _, ack, [_, Actor, _]}) ->
-    #{Actor := State} = States,
-    States1 =
-        case State of
-            #act{sent = Sent, acked = Acked} when Sent == Acked ->
-                States;
-            #act{acked = Acked} ->
-                States#{Actor => State#act{acked = Acked + 1}}
-        end,
     S#s{rc = RC,
-        act_st = States1};
+        act_st = {call, ?M, ack_states, [Actor, States]}};
 next_state(#s{act_st = States,
               inflight = Inf} = S,
            _V, {_, _, deliver, [Actor]}) ->
-    S#s{act_st = {call, ?MODULE, deliver_st, [Inf, Actor, States]},
-        inflight = {call, ?MODULE, deliver_inf, [Actor, Inf]}};
+    S#s{act_st = {call, ?M, deliver_st, [Inf, Actor, States]},
+        inflight = {call, ?M, deliver_inf, [Actor, Inf]}};
 next_state(S, V, {_, _, take, [_, Actor]}) ->
-    S#s{rc = {call, ?MODULE, extract_state, [V]},
-        inflight = {call, ?MODULE, extract_inf, [V, Actor, S#s.inflight]}};
+    S#s{rc = {call, ?M, extract_state, [V]},
+        inflight = {call, ?M, extract_inf, [V, Actor, S#s.inflight]}};
 next_state(S, _V, _C) ->
     error({S, _V, _C}),
     S.
 
-extract_state({_, RC}) ->
-    RC;
-extract_state({ok, _, _, RC}) ->
-    RC.
+command_states(Actor, States) ->
+    #{Actor := St = #act{sent = Sent}} = States,
+    States#{Actor => St#act{sent = Sent + 1}}.
 
-extract_inf({_, _}, _, Inf) ->
-    Inf;
-extract_inf({ok, _Seq, Msg, _RC}, Actor, Inf) ->
-    #{Actor := Q} = Inf,
-    Inf#{Actor => Q ++ [Msg]}.
+command_messages(Actor, States, Msg, Msgs) ->
+    #{Actor := #act{sent = Sent}} = States,
+    Msgs#{{Actor, Sent + 1} => Msg}.
+
+ack_states(Actor, States) ->
+    #{Actor := State} = States,
+    case State of
+        #act{sent = Sent, acked = Acked} when Sent == Acked ->
+            States;
+        #act{acked = Acked} ->
+            States#{Actor => State#act{acked = Acked + 1}}
+    end.
 
 deliver_states(Inf, Actor, States) ->
     case Inf of
@@ -167,10 +165,21 @@ deliver_inf(Actor, Inf) ->
             Inf
     end.
 
+extract_state({_, RC}) ->
+    RC;
+extract_state({ok, _, _, RC}) ->
+    RC.
+
+extract_inf({_, _}, _, Inf) ->
+    Inf;
+extract_inf({ok, _Seq, Msg, _RC}, Actor, Inf) ->
+    #{Actor := Q} = Inf,
+    Inf#{Actor => Q ++ [Msg]}.
+
 %% -- Commands ---------------------------------------------------------------
 
 open(Actors, Dir) ->
-    relcast:start(1, [1 | Actors], ?MODULE, [], [{data_dir, Dir}]).
+    relcast:start(1, [1 | Actors], ?M, [], [{data_dir, Dir}]).
 
 command(RC, Actor, Msg) ->
     {ok, RC1} = relcast:command({Actor, Msg}, RC),
@@ -203,14 +212,15 @@ cleanup(RC) ->
 prop_basic() ->
     ?FORALL(
        Cmds, %?SIZED(20,
-       commands(?MODULE),%)
+       commands(?M),%)
 
        begin
            {H, S, Res} = run_commands(Cmds),
-           eqc_statem:pretty_commands(?MODULE,
+           eqc_statem:pretty_commands(?M,
                                       Cmds,
                                       {H, S, Res},
-                                      cleanup(S#s.rc))
+                                      cleanup(S#s.rc)),
+           Res == ok
        end).
 
 %% @doc Run property repeatedly to find as many different bugs as
