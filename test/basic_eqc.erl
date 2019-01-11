@@ -130,8 +130,8 @@ postcondition(S, {call, _, ack, [_, Actor, _, _]}, _R) ->
     InFlight = maps:get(Actor, S#s.inflight),
     #act{acked=Acked, sent=Sent} = maps:get(Actor, S#s.act_st),
     case Sent == Acked of
-        false when Acked < length(InFlight) ->
-            {Seq, _} = lists:nth(Acked +1, InFlight),
+        false when length(InFlight) > 0 ->
+            {Seq, _} = lists:nth(1, InFlight),
             io:format("~p acked ~p~n", [Actor, Seq]),
             true;
         _ ->
@@ -156,7 +156,8 @@ next_state(#s{act_st = States, inflight=InFlight} = S,
            RC,
            {_, _, ack, [_, Actor, _, _]}) ->
     S#s{rc = RC,
-        act_st = {call, ?M, ack_states, [Actor, States, InFlight]}};
+        act_st = {call, ?M, ack_states, [Actor, States, InFlight]},
+        inflight = {call, ?M, deliver_inf, [Actor, InFlight]}};
 next_state(#s{act_st = States,
               inflight = Inf} = S,
            _V, {_, _, deliver, [Actor]}) ->
@@ -179,11 +180,13 @@ command_messages(Actor, States, Msg, Msgs) ->
 
 ack_states(Actor, States, InFlight) ->
     io:format("~p in flight ~p~n", [Actor, InFlight]),
+    MyInFlight = maps:get(Actor, InFlight),
     #{Actor := State} = States,
     case State of
         #act{sent = Sent, acked = Acked} when Sent == Acked ->
             States;
-        #act{acked = Acked} when Acked < length(InFlight) ->
+        #act{acked = Acked} when length(MyInFlight) > 0 ->
+            io:format("incrementing acks~n"),
             States#{Actor => State#act{acked = Acked + 1}};
         _ ->
             States
@@ -200,7 +203,7 @@ deliver_st(Inf, Actor, States) ->
 
 deliver_inf(Actor, Inf) ->
     case Inf of
-        #{Actor := T} ->
+        #{Actor := [_H|T]} ->
             Inf#{Actor => T};
         _ ->
             Inf
@@ -223,7 +226,9 @@ open(Actors, Dir0) ->
     Dir = case Dir0 of
               undefined ->
                   DirNum = erlang:unique_integer(),
-                  "data/data-" ++ integer_to_list(DirNum);
+                  D = "data/data-" ++ integer_to_list(DirNum),
+                  os:cmd("rm -rf "++D),
+                  D;
               Dir0 ->
                   Dir0
           end,
