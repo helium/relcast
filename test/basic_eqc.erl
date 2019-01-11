@@ -46,8 +46,8 @@
 -spec initial_state() -> eqc_statem:symbolic_state().
 initial_state() ->
     Actors = lists:seq(2, 3),
-    DirNum = erlang:unique_integer(),
-    Dir = "data/data-" ++ integer_to_list(DirNum),
+    %DirNum = erlang:unique_integer(),
+    %Dir = "data/data-" ++ integer_to_list(DirNum),
 
     States = maps:from_list([{A, #act{id = A}}
                              || A <- Actors]),
@@ -56,27 +56,26 @@ initial_state() ->
                              || A <- Actors]),
 
     %% add one here, but it's local so we don't want it selected for deliveries.
-    {ok, RC} = relcast:start(1, [1 | Actors], ?M, [], [{data_dir, Dir}]),
+    %Res = {call, relcast, start, [1, [1 | Actors], ?M, [], [{data_dir, Dir}]]},
 
     #s{actors = Actors,
-       rc = RC,
+       rc = undefined,
        inflight = Inf,
        running = true,
-       act_st = States,
-       dir = Dir}.
+       act_st = States}.
 
 %% -- Generators -------------------------------------------------------------
 
 command(S) ->
     frequency(
       [
-       %% {1, {call, ?M, open, [S#s.actors, S#s.dir]}},
+       {1, {call, ?M, open, [S#s.actors]}},
        %% {1, {call, ?M, close, [S#s.rc]}},
-       {10, {call, ?M, command, [S#s.rc, oneof(S#s.actors), binary()]}},
+       {10, {call, ?M, command, [S#s.rc, oneof(S#s.actors), ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
        {10, {call, ?M, take, [S#s.rc, oneof(S#s.actors)]}},
        {10, {call, ?M, deliver, [oneof(S#s.actors)]}},
        %% {10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
-       {10, {call, ?M, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st]}}%,
+       {10, {call, ?M, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st]}}
        %% {1, {call, ?M, reset, [S#s.rc, oneof(S#s.actors)]}}
       ]).
 
@@ -92,22 +91,22 @@ command(S) ->
 %% command_precondition_common(_, _) ->
 %%     true.
 
-%% precondition(S, {call, _, open, _}) when S#s.rc == undefined orelse
-%%                                          S#s.running == false ->
-%%     true;
+precondition(S, {call, _, open, _}) when S#s.rc == undefined orelse
+                                          S#s.running == false ->
+     S#s.rc == undefined;
 %% precondition(S, _) when S#s.rc == undefined orelse
 %%                         S#s.running == false ->
 %%     false;
 %% precondition(#s{inflight = #{}}, {call, _, deliver, _}) ->
 %%     false;
-precondition(_, _) ->
-    true.
+precondition(S, _) ->
+    S#s.rc /= undefined andalso S#s.running == true.
 
 postcondition(_, _, _) ->
     true.
 
-%% next_state(S, {ok, Ref}, {call, _, open, _}) ->
-%%     S#s{rc = Ref, running = true};
+next_state(S, Res, {call, _, open, _}) ->
+     S#s{rc = Res, running = true};
 next_state(#s{messages = Msgs,
               act_st = States} = S,
            RC, {_, _, command, [_RC0, Actor, Msg]}) ->
@@ -148,7 +147,7 @@ ack_states(Actor, States) ->
             States#{Actor => State#act{acked = Acked + 1}}
     end.
 
-deliver_states(Inf, Actor, States) ->
+deliver_st(Inf, Actor, States) ->
     case Inf of
         #{Actor := [_H|_T]} ->
             #{Actor := #act{sent = Sent} = State} = States,
@@ -178,8 +177,11 @@ extract_inf({ok, _Seq, Msg, _RC}, Actor, Inf) ->
 
 %% -- Commands ---------------------------------------------------------------
 
-open(Actors, Dir) ->
-    relcast:start(1, [1 | Actors], ?M, [], [{data_dir, Dir}]).
+open(Actors) ->
+    DirNum = erlang:unique_integer(),
+    Dir = "data/data-" ++ integer_to_list(DirNum),
+    {ok, RC} = relcast:start(1, [1 | Actors], ?M, [], [{data_dir, Dir}]),
+    RC.
 
 command(RC, Actor, Msg) ->
     {ok, RC1} = relcast:command({Actor, Msg}, RC),
