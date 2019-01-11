@@ -768,7 +768,7 @@ round_to_nearest_byte(Bits) ->
 
 %% get the maximum key ID used
 get_last_key(DB, CF) ->
-    {ok, InIter} = rocksdb:iterator(DB, CF, [{iterate_upper_bound, max_inbound_key()}]),
+    {ok, InIter} = rocksdb:iterator(DB, CF, [{iterate_lower_bound, min_inbound_key()}]),
     %% XXX iterate_upper_bound doesn't work, so we can't use it.
     %% instead we seek to the last possible key, and if that is not present,
     %% seek to the previous key
@@ -784,7 +784,7 @@ get_last_key(DB, CF) ->
             end
     end,
     rocksdb:iterator_close(InIter),
-    {ok, OutIter} = rocksdb:iterator(DB, CF, [{iterate_upper_bound, max_outbound_key()}]),
+    {ok, OutIter} = rocksdb:iterator(DB, CF, [{iterate_lower_bound, min_outbound_key()}]),
     MaxOutbound = case rocksdb:iterator_move(OutIter, max_outbound_key()) of
         {ok, <<"o", OutNum:10/binary>>, _} ->
             list_to_integer(binary_to_list(OutNum));
