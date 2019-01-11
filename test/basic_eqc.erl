@@ -69,7 +69,7 @@ initial_state() ->
 command(S) ->
     frequency(
       [
-       {1, {call, ?M, open, [S#s.actors]}},
+       {1, {call, ?M, open, [S#s.actors, S#s.dir]}},
        %% {1, {call, ?M, close, [S#s.rc]}},
        {10, {call, ?M, command, [S#s.rc, oneof(S#s.actors), ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
        {10, {call, ?M, take, [S#s.rc, oneof(S#s.actors)]}},
@@ -91,9 +91,8 @@ command(S) ->
 %% command_precondition_common(_, _) ->
 %%     true.
 
-precondition(S, {call, _, open, _}) when S#s.rc == undefined orelse
-                                          S#s.running == false ->
-     S#s.rc == undefined;
+precondition(S, {call, _, open, _}) ->
+     S#s.rc == undefined orelse S#s.running == false;
 %% precondition(S, _) when S#s.rc == undefined orelse
 %%                         S#s.running == false ->
 %%     false;
@@ -106,7 +105,7 @@ postcondition(_, _, _) ->
     true.
 
 next_state(S, Res, {call, _, open, _}) ->
-     S#s{rc = Res, running = true};
+     S#s{rc = {call, erlang, element, [1, Res]}, dir = {call, erlang, element, [2, Res]}, running = true};
 next_state(#s{messages = Msgs,
               act_st = States} = S,
            RC, {_, _, command, [_RC0, Actor, Msg]}) ->
@@ -177,11 +176,15 @@ extract_inf({ok, _Seq, Msg, _RC}, Actor, Inf) ->
 
 %% -- Commands ---------------------------------------------------------------
 
-open(Actors) ->
-    DirNum = erlang:unique_integer(),
-    Dir = "data/data-" ++ integer_to_list(DirNum),
+open(Actors, Dir0) ->
+    Dir = case Dir0 of
+              undefined ->
+                  DirNum = erlang:unique_integer(),
+                  "data/data-" ++ integer_to_list(DirNum);
+              Dir0 -> Dir0
+          end,
     {ok, RC} = relcast:start(1, [1 | Actors], ?M, [], [{data_dir, Dir}]),
-    RC.
+    {RC, Dir}.
 
 command(RC, Actor, Msg) ->
     {ok, RC1} = relcast:command({Actor, Msg}, RC),
@@ -205,10 +208,11 @@ ack(RC, Actor, States) ->
     end,
     RC1.
 
-cleanup(undefined) ->
+cleanup(#s{rc=undefined}) ->
     ok;
-cleanup(RC) ->
-    relcast:stop(reason, RC).
+cleanup(#s{rc=RC, dir=Dir}) ->
+    relcast:stop(reason, RC),
+    os:cmd("rm -rf " ++ Dir).
 
 %% -- Property ---------------------------------------------------------------
 prop_basic() ->
@@ -221,7 +225,7 @@ prop_basic() ->
            eqc_statem:pretty_commands(?M,
                                       Cmds,
                                       {H, S, Res},
-                                      cleanup(S#s.rc)),
+                                      cleanup(eqc_symbolic:eval(S))),
            Res == ok
        end).
 
