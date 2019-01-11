@@ -70,12 +70,12 @@ command(S) ->
     frequency(
       [
        {1, {call, ?M, open, [S#s.actors, S#s.dir]}},
-       %% {1, {call, ?M, close, [S#s.rc]}},
+       {1, {call, ?M, close, [S#s.rc]}},
        {10, {call, ?M, command, [S#s.rc, oneof(S#s.actors), ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
        {10, {call, ?M, take, [S#s.rc, oneof(S#s.actors)]}},
-       {10, {call, ?M, deliver, [oneof(S#s.actors)]}},
+       %{10, {call, ?M, deliver, [oneof(S#s.actors)]}},
        %% {10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
-       {10, {call, ?M, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st]}}
+       {10, {call, ?M, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st, S#s.inflight]}}
        %% {1, {call, ?M, reset, [S#s.rc, oneof(S#s.actors)]}}
       ]).
 
@@ -93,6 +93,8 @@ command(S) ->
 
 precondition(S, {call, _, open, _}) ->
      S#s.rc == undefined orelse S#s.running == false;
+precondition(S, {call, _, close, _}) ->
+    S#s.rc /= undefined andalso S#s.running == true;
 %% precondition(S, _) when S#s.rc == undefined orelse
 %%                         S#s.running == false ->
 %%     false;
@@ -101,22 +103,60 @@ precondition(S, {call, _, open, _}) ->
 precondition(S, _) ->
     S#s.rc /= undefined andalso S#s.running == true.
 
+postcondition(S, {call, _, take, [_, Actor]}, R) ->
+    io:format("took for ~p ~p~n", [Actor, S#s.messages]),
+    Foo = length(maps:get(Actor, S#s.inflight, [])) + 1,
+    #act{acked=Acked} = maps:get(Actor, S#s.act_st),
+    Expected = case Foo >= 20 of
+        true ->
+            pipeline_full;
+        false ->
+            maps:get({Actor, Foo+Acked}, S#s.messages, not_found)
+    end,
+
+    case R of
+        {ok, _Seq, Expected, _RC} ->
+            io:format("~p took ~p~n", [Actor, Expected]),
+            true;
+        {Expected, _RC} ->
+            io:format("~p took ~p~n", [Actor, Expected]),
+            true;
+        {ok, _Seq, Unexpected, _RC} ->
+            {unexpected_take, Actor, Expected, Unexpected, S#s.messages, S#s.inflight};
+        {Unexpected, _RC} ->
+            {unexpected_take, Actor, Expected, Unexpected, S#s.messages, S#s.inflight}
+    end;
+postcondition(S, {call, _, ack, [_, Actor, _, _]}, _R) ->
+    InFlight = maps:get(Actor, S#s.inflight),
+    #act{acked=Acked, sent=Sent} = maps:get(Actor, S#s.act_st),
+    case Sent == Acked of
+        false when Acked < length(InFlight) ->
+            {Seq, _} = lists:nth(Acked +1, InFlight),
+            io:format("~p acked ~p~n", [Actor, Seq]),
+            true;
+        _ ->
+            true
+    end;
 postcondition(_, _, _) ->
     true.
 
 next_state(S, Res, {call, _, open, _}) ->
      S#s{rc = {call, erlang, element, [1, Res]}, dir = {call, erlang, element, [2, Res]}, running = true};
+next_state(S, _, {call, _, close, _}) ->
+    Inf = maps:from_list([{A, []}
+                             || A <- S#s.actors]),
+    S#s{running=false, inflight=Inf};
 next_state(#s{messages = Msgs,
               act_st = States} = S,
            RC, {_, _, command, [_RC0, Actor, Msg]}) ->
     S#s{rc = RC,
         messages = {call, ?M, command_messages, [Actor, States, Msg, Msgs]},
         act_st = {call, ?M, command_states, [Actor, States]}};
-next_state(#s{act_st = States} = S,
+next_state(#s{act_st = States, inflight=InFlight} = S,
            RC,
-           {_, _, ack, [_, Actor, _]}) ->
+           {_, _, ack, [_, Actor, _, _]}) ->
     S#s{rc = RC,
-        act_st = {call, ?M, ack_states, [Actor, States]}};
+        act_st = {call, ?M, ack_states, [Actor, States, InFlight]}};
 next_state(#s{act_st = States,
               inflight = Inf} = S,
            _V, {_, _, deliver, [Actor]}) ->
@@ -137,13 +177,16 @@ command_messages(Actor, States, Msg, Msgs) ->
     #{Actor := #act{sent = Sent}} = States,
     Msgs#{{Actor, Sent + 1} => Msg}.
 
-ack_states(Actor, States) ->
+ack_states(Actor, States, InFlight) ->
+    io:format("~p in flight ~p~n", [Actor, InFlight]),
     #{Actor := State} = States,
     case State of
         #act{sent = Sent, acked = Acked} when Sent == Acked ->
             States;
-        #act{acked = Acked} ->
-            States#{Actor => State#act{acked = Acked + 1}}
+        #act{acked = Acked} when Acked < length(InFlight) ->
+            States#{Actor => State#act{acked = Acked + 1}};
+        _ ->
+            States
     end.
 
 deliver_st(Inf, Actor, States) ->
@@ -157,7 +200,7 @@ deliver_st(Inf, Actor, States) ->
 
 deliver_inf(Actor, Inf) ->
     case Inf of
-        #{Actor := [_H|T]} ->
+        #{Actor := T} ->
             Inf#{Actor => T};
         _ ->
             Inf
@@ -170,9 +213,9 @@ extract_state({ok, _, _, RC}) ->
 
 extract_inf({_, _}, _, Inf) ->
     Inf;
-extract_inf({ok, _Seq, Msg, _RC}, Actor, Inf) ->
+extract_inf({ok, Seq, Msg, _RC}, Actor, Inf) ->
     #{Actor := Q} = Inf,
-    Inf#{Actor => Q ++ [Msg]}.
+    Inf#{Actor => Q ++ [{Seq, Msg}]}.
 
 %% -- Commands ---------------------------------------------------------------
 
@@ -181,10 +224,14 @@ open(Actors, Dir0) ->
               undefined ->
                   DirNum = erlang:unique_integer(),
                   "data/data-" ++ integer_to_list(DirNum);
-              Dir0 -> Dir0
+              Dir0 ->
+                  Dir0
           end,
     {ok, RC} = relcast:start(1, [1 | Actors], ?M, [], [{data_dir, Dir}]),
     {RC, Dir}.
+
+close(RC) ->
+    relcast:stop(reason, RC).
 
 command(RC, Actor, Msg) ->
     {ok, RC1} = relcast:command({Actor, Msg}, RC),
@@ -198,20 +245,32 @@ take(RC, Actor) ->
 deliver(_Actor) ->
     ok.
 
-ack(RC, Actor, States) ->
+ack(RC, Actor, States, InFlight) ->
     #{Actor := State} = States,
     case State of
         #act{sent = Sent, acked = Acked} when Sent == Acked ->
             RC1 = RC;
         #act{acked = Acked} ->
-            {ok, RC1} = relcast:ack(Actor, Acked + 1, RC)
+            OurInFlight = maps:get(Actor, InFlight),
+            case length(OurInFlight) > Acked of
+                false ->
+                    RC1 = RC;
+                true ->
+                    {Seq, _} = lists:nth(Acked +1, OurInFlight),
+                    {ok, RC1} = relcast:ack(Actor, Seq, RC)
+            end
     end,
     RC1.
 
 cleanup(#s{rc=undefined}) ->
     ok;
-cleanup(#s{rc=RC, dir=Dir}) ->
-    relcast:stop(reason, RC),
+cleanup(#s{rc=RC, dir=Dir, running=Running}) ->
+    case Running of
+        true ->
+            catch relcast:stop(reason, RC);
+        false ->
+            ok
+    end,
     os:cmd("rm -rf " ++ Dir).
 
 %% -- Property ---------------------------------------------------------------
@@ -222,11 +281,15 @@ prop_basic() ->
 
        begin
            {H, S, Res} = run_commands(Cmds),
-           eqc_statem:pretty_commands(?M,
+           ?WHENFAIL(begin
+                         io:format("~p~n", [Res]),
+                         io:format("~p~n", [eqc_symbolic:eval(S)]),
+                         eqc_statem:pretty_commands(?M,
                                       Cmds,
                                       {H, S, Res},
-                                      cleanup(eqc_symbolic:eval(S))),
-           Res == ok
+                                      cleanup(eqc_symbolic:eval(S)))
+                     end,
+           Res == ok)
        end).
 
 %% @doc Run property repeatedly to find as many different bugs as
