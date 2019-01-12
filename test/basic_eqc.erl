@@ -37,7 +37,7 @@
 %% virtual, in that they don't have any pids themselves, hence no
 %% nondeterminism.  Todos:
 %%  - two relcast instances talking to each other (if possible in the
-%%    same VM
+%%    same VM)
 %%  - PULSE test
 %%  - non-virtual actors expressing some simple protocol
 
@@ -45,18 +45,13 @@
 %%      initial state is supplied explicitly to, e.g. commands/2.)
 -spec initial_state() -> eqc_statem:symbolic_state().
 initial_state() ->
-    Actors = lists:seq(2, 3),
-    %DirNum = erlang:unique_integer(),
-    %Dir = "data/data-" ++ integer_to_list(DirNum),
+    Actors = lists:seq(2, 2),
 
     States = maps:from_list([{A, #act{id = A}}
                              || A <- Actors]),
 
     Inf = maps:from_list([{A, []}
                              || A <- Actors]),
-
-    %% add one here, but it's local so we don't want it selected for deliveries.
-    %Res = {call, relcast, start, [1, [1 | Actors], ?M, [], [{data_dir, Dir}]]},
 
     #s{actors = Actors,
        rc = undefined,
@@ -71,47 +66,37 @@ command(S) ->
       [
        {1, {call, ?M, open, [S#s.actors, S#s.dir]}},
        {1, {call, ?M, close, [S#s.rc]}},
-       {10, {call, ?M, command, [S#s.rc, oneof(S#s.actors), ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
+       {15, {call, ?M, command, [S#s.rc, oneof(S#s.actors), ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
        {10, {call, ?M, take, [S#s.rc, oneof(S#s.actors)]}},
-       %{10, {call, ?M, deliver, [oneof(S#s.actors)]}},
-       %% {10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
-       {10, {call, ?M, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st, S#s.inflight]}}
-       %% {1, {call, ?M, reset, [S#s.rc, oneof(S#s.actors)]}}
+       %{10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
+       {10, {call, ?M, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st, S#s.inflight]}},
+       {2, {call, ?M, ack_all, [S#s.rc, oneof(S#s.actors), S#s.act_st, S#s.inflight]}},
+       {2, {call, ?M, reset, [S#s.rc, oneof(S#s.actors)]}}
       ]).
 
-%% -- Common pre-/post-conditions --------------------------------------------
-%% @doc General command filter, checked before a command is generated.
-%% -spec command_precondition_common(S, Cmd) -> boolean()
-%%     when S    :: eqc_statem:symbolic_state(),
-%%          Cmd  :: atom().
-%% command_precondition_common(#s{running = false}, {call, _, open, _}) ->
-%%     true;
-%% command_precondition_common(#s{running = false}, _) ->
-%%     false;
-%% command_precondition_common(_, _) ->
-%%     true.
 
 precondition(S, {call, _, open, _}) ->
      S#s.rc == undefined orelse S#s.running == false;
 precondition(S, {call, _, close, _}) ->
     S#s.rc /= undefined andalso S#s.running == true;
-%% precondition(S, _) when S#s.rc == undefined orelse
-%%                         S#s.running == false ->
-%%     false;
-%% precondition(#s{inflight = #{}}, {call, _, deliver, _}) ->
-%%     false;
 precondition(S, _) ->
     S#s.rc /= undefined andalso S#s.running == true.
 
+dynamic_precondition(_S, {_, _, ack, [_, Actor, _, Inf]}) ->
+    #{Actor := Q} = Inf,
+    Q /= [];
+dynamic_precondition(_S, _) ->
+    true.
+
 postcondition(S, {call, _, take, [_, Actor]}, R) ->
-    io:format("took for ~p ~p~n", [Actor, S#s.messages]),
-    Foo = length(maps:get(Actor, S#s.inflight, [])) + 1,
+    io:format("take for ~p ~p~n", [Actor, S#s.messages]),
+    MsgInFlight = length(maps:get(Actor, S#s.inflight, [])) + 1,
     #act{acked=Acked} = maps:get(Actor, S#s.act_st),
-    Expected = case Foo >= 20 of
+    Expected = case MsgInFlight >= 20 of
         true ->
             pipeline_full;
         false ->
-            maps:get({Actor, Foo+Acked}, S#s.messages, not_found)
+            maps:get({Actor, MsgInFlight+Acked}, S#s.messages, not_found)
     end,
 
     case R of
@@ -122,20 +107,24 @@ postcondition(S, {call, _, take, [_, Actor]}, R) ->
             io:format("~p took ~p~n", [Actor, Expected]),
             true;
         {ok, _Seq, Unexpected, _RC} ->
-            {unexpected_take, Actor, Expected, Unexpected, S#s.messages, S#s.inflight};
+            {unexpected_take1, Actor, Expected, Unexpected, S#s.messages, S#s.inflight};
         {Unexpected, _RC} ->
-            {unexpected_take, Actor, Expected, Unexpected, S#s.messages, S#s.inflight}
+            {unexpected_take2, Actor, Expected, Unexpected, S#s.messages, S#s.inflight}
     end;
-postcondition(S, {call, _, ack, [_, Actor, _, _]}, _R) ->
-    InFlight = maps:get(Actor, S#s.inflight),
-    #act{acked=Acked, sent=Sent} = maps:get(Actor, S#s.act_st),
-    case Sent == Acked of
-        false when length(InFlight) > 0 ->
-            {Seq, _} = lists:nth(1, InFlight),
-            io:format("~p acked ~p~n", [Actor, Seq]),
+postcondition(S, {call, _, peek, [_, Actor]}, R) ->
+    io:format("peek for ~p ~p~n", [Actor, S#s.messages]),
+    MsgInFlight = length(maps:get(Actor, S#s.inflight, [])) + 1,
+    #act{acked = Acked} = maps:get(Actor, S#s.act_st),
+    Expected = maps:get({Actor, MsgInFlight+Acked}, S#s.messages, not_found),
+
+    case R of
+        Expected ->
             true;
-        _ ->
-            true
+        {ok, Expected}->
+            true;
+        {ok, Unexpected}->
+            {unexpected_peek, Actor, {exp, Expected}, {got, Unexpected},
+             S#s.messages, S#s.inflight}
     end;
 postcondition(_, _, _) ->
     true.
@@ -158,6 +147,12 @@ next_state(#s{act_st = States, inflight=InFlight} = S,
     S#s{rc = RC,
         act_st = {call, ?M, ack_states, [Actor, States, InFlight]},
         inflight = {call, ?M, deliver_inf, [Actor, InFlight]}};
+next_state(#s{act_st = States, inflight = InFlight} = S,
+           RC,
+           {_, _, ack_all, [_, Actor, _, _]}) ->
+    S#s{rc = RC,
+        act_st = {call, ?M, ack_all_states, [Actor, States, InFlight]},
+        inflight = {call, ?M, reset_inf, [Actor, InFlight]}};
 next_state(#s{act_st = States,
               inflight = Inf} = S,
            _V, {_, _, deliver, [Actor]}) ->
@@ -166,6 +161,11 @@ next_state(#s{act_st = States,
 next_state(S, V, {_, _, take, [_, Actor]}) ->
     S#s{rc = {call, ?M, extract_state, [V]},
         inflight = {call, ?M, extract_inf, [V, Actor, S#s.inflight]}};
+next_state(S, _V, {_, _, peek, _}) ->
+    S;
+next_state(S, RC, {_, _, reset, [_, Actor]}) ->
+    S#s{rc = RC,
+        inflight = {call, ?M, reset_inf, [Actor, S#s.inflight]}};
 next_state(S, _V, _C) ->
     error({S, _V, _C}),
     S.
@@ -192,6 +192,20 @@ ack_states(Actor, States, InFlight) ->
             States
     end.
 
+ack_all_states(Actor, States, InFlight) ->
+    MyInFlight = maps:get(Actor, InFlight),
+    #{Actor := State} = States,
+    case State of
+        #act{sent = Sent, acked = Acked} when Sent == Acked ->
+            States;
+        #act{} when length(MyInFlight) > 0 ->
+            io:format("incrementing acks~n"),
+            {Seq, _} = lists:last(MyInFlight),
+            States#{Actor => State#act{acked = Seq + 1}};
+        _ ->
+            States
+    end.
+
 deliver_st(Inf, Actor, States) ->
     case Inf of
         #{Actor := [_H|_T]} ->
@@ -208,6 +222,10 @@ deliver_inf(Actor, Inf) ->
         _ ->
             Inf
     end.
+
+
+reset_inf(Actor, Inf) ->
+    Inf#{Actor => []}.
 
 extract_state({_, RC}) ->
     RC;
@@ -245,6 +263,9 @@ command(RC, Actor, Msg) ->
 take(RC, Actor) ->
     relcast:take(Actor, RC).
 
+peek(RC, Actor) ->
+    relcast:peek(Actor, RC).
+
 %% note that this simulates a deliver to a remote actor; we never
 %% actually make or deliver any messages to the local relcast instance.
 deliver(_Actor) ->
@@ -255,17 +276,39 @@ ack(RC, Actor, States, InFlight) ->
     case State of
         #act{sent = Sent, acked = Acked} when Sent == Acked ->
             RC1 = RC;
-        #act{acked = Acked} ->
+        _ ->
             OurInFlight = maps:get(Actor, InFlight),
-            case length(OurInFlight) > Acked of
+            case length(OurInFlight) > 0 of
                 false ->
                     RC1 = RC;
                 true ->
-                    {Seq, _} = lists:nth(Acked +1, OurInFlight),
+                    {Seq, _} = hd(OurInFlight),
                     {ok, RC1} = relcast:ack(Actor, Seq, RC)
             end
     end,
     RC1.
+
+ack_all(RC, Actor, States, InFlight) ->
+    #{Actor := State} = States,
+    case State of
+        #act{sent = Sent, acked = Acked} when Sent == Acked ->
+            RC1 = RC;
+        _ ->
+            OurInFlight = maps:get(Actor, InFlight),
+            case length(OurInFlight) > 0 of
+                false ->
+                    RC1 = RC;
+                true ->
+                    {Seq, _} = lists:last(OurInFlight),
+                    {ok, RC1} = relcast:ack(Actor, Seq, RC)
+            end
+    end,
+    RC1.
+
+reset(RC, Actor) ->
+    {ok, RC1} = relcast:reset_actor(Actor, RC),
+    RC1.
+
 
 cleanup(#s{rc=undefined}) ->
     ok;

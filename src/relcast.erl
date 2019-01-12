@@ -441,10 +441,10 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
             case lists:last(Pends) of
                 {_Ref, CF, Key, _Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
                     %% iterate until we find a key for this actor
-                    case find_next_outbound(ForActorID, CF, Key, State) of
+                    case find_next_outbound(ForActorID, CF, Key, State, false) of
                         {not_found, _LastKey, _CF2} ->
                             not_found;
-                        {Key, CF, Msg, _Multicast} ->
+                        {_Key2, _CF2, Msg, _Multicast} ->
                             {ok, Msg};
                         not_found ->
                             not_found
