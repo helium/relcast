@@ -101,7 +101,7 @@ postcondition(S, {call, _, take, [_, Actor]}, R) ->
 
     case R of
         {ok, _Seq, Expected, _RC} ->
-            io:format("~p took ~p~n", [Actor, Expected]),
+            io:format("~p took ~p ~p~n", [Actor, _Seq, Expected]),
             true;
         {Expected, _RC} ->
             io:format("~p took ~p~n", [Actor, Expected]),
@@ -198,10 +198,10 @@ ack_all_states(Actor, States, InFlight) ->
     case State of
         #act{sent = Sent, acked = Acked} when Sent == Acked ->
             States;
-        #act{} when length(MyInFlight) > 0 ->
-            io:format("incrementing acks~n"),
-            {Seq, _} = lists:last(MyInFlight),
-            States#{Actor => State#act{acked = Seq + 1}};
+        #act{acked = Acked} when length(MyInFlight) > 0 ->
+            io:format("ack all ~p ~p ~p ~n", [Actor, MyInFlight, State]),
+            {_Seq, _} = lists:last(MyInFlight),
+            States#{Actor => State#act{acked = Acked + length(MyInFlight)}};
         _ ->
             States
     end.
@@ -324,8 +324,7 @@ cleanup(#s{rc=RC, dir=Dir, running=Running}) ->
 %% -- Property ---------------------------------------------------------------
 prop_basic() ->
     ?FORALL(
-       Cmds, %?SIZED(20,
-       commands(?M),%)
+       Cmds, commands(?M),
 
        begin
            {H, S, Res} = run_commands(Cmds),
