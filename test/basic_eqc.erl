@@ -67,6 +67,7 @@ command(S) ->
        {1, {call, ?M, open, [S#s.actors, S#s.dir]}},
        {1, {call, ?M, close, [S#s.rc]}},
        {15, {call, ?M, command, [S#s.rc, oneof(S#s.actors), ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
+       {15, {call, ?M, command_multi, [S#s.rc, ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
        {10, {call, ?M, take, [S#s.rc, oneof(S#s.actors)]}},
        %{10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
        {10, {call, ?M, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st, S#s.inflight]}},
@@ -141,6 +142,12 @@ next_state(#s{messages = Msgs,
     S#s{rc = RC,
         messages = {call, ?M, command_messages, [Actor, States, Msg, Msgs]},
         act_st = {call, ?M, command_states, [Actor, States]}};
+next_state(#s{messages = Msgs,
+              act_st = States} = S,
+           RC, {_, _, command_multi, [_RC0, Msg]}) ->
+    S#s{rc = RC,
+        messages = {call, ?M, command_multi_messages, [States, Msg, Msgs]},
+        act_st = {call, ?M, command_multi_states, [States]}};
 next_state(#s{act_st = States, inflight=InFlight} = S,
            RC,
            {_, _, ack, [_, Actor, _, _]}) ->
@@ -177,6 +184,12 @@ command_states(Actor, States) ->
 command_messages(Actor, States, Msg, Msgs) ->
     #{Actor := #act{sent = Sent}} = States,
     Msgs#{{Actor, Sent + 1} => Msg}.
+
+command_multi_states(States) ->
+    maps:map(fun(_, State = #act{sent=Sent}) -> State#act{sent = Sent + 1} end, States).
+
+command_multi_messages(States, Msg, Msgs) ->
+    maps:fold(fun(Actor, #act{sent=Sent}, Acc) -> Acc#{{Actor, Sent + 1} => Msg} end, Msgs, States).
 
 ack_states(Actor, States, InFlight) ->
     io:format("~p in flight ~p~n", [Actor, InFlight]),
@@ -258,6 +271,10 @@ close(RC) ->
 
 command(RC, Actor, Msg) ->
     {ok, RC1} = relcast:command({Actor, Msg}, RC),
+    RC1.
+
+command_multi(RC,  Msg) ->
+    {ok, RC1} = relcast:command({all, Msg}, RC),
     RC1.
 
 take(RC, Actor) ->
@@ -361,6 +378,8 @@ bugs(Time, Bugs) ->
 init(_) ->
     {ok, []}.
 
+handle_command({all, Msg}, State) ->
+    {reply, ok, [{multicast, Msg}], State};
 handle_command({Actor, Msg}, State) ->
     {reply, ok, [{unicast, Actor, Msg}], State}.
 
