@@ -22,11 +22,13 @@
 -record(s,
         {
          rc :: term(),
+         epoch = 1 :: non_neg_integer(),
          dir :: string(),
          actors :: [pos_integer()],
          act_st = #{} :: #{pos_integer() => act()},
-         inflight = #{} :: #{pos_integer() => term()},
-         messages = #{} :: #{{pos_integer, pos_integer()} => term},
+         %% TODO should we move in-flight into the actor?
+         inflight = #{} :: #{pos_integer() => [{Seq ::  pos_integer(), Epoch :: non_neg_integer(), binary()}]},
+         messages = #{} :: #{{pos_integer, pos_integer()} => {Epoch :: non_neg_integer(), binary()}},
          running = false :: boolean()
         }).
 
@@ -45,7 +47,7 @@
 %%      initial state is supplied explicitly to, e.g. commands/2.)
 -spec initial_state() -> eqc_statem:symbolic_state().
 initial_state() ->
-    Actors = lists:seq(2, 2),
+    Actors = lists:seq(2, 10),
 
     States = maps:from_list([{A, #act{id = A}}
                              || A <- Actors]),
@@ -68,6 +70,7 @@ command(S) ->
        {1, {call, ?M, close, [S#s.rc]}},
        {15, {call, ?M, command, [S#s.rc, oneof(S#s.actors), ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
        {15, {call, ?M, command_multi, [S#s.rc, ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
+       {5, {call, ?M, new_epoch, [S#s.rc]}},
        {10, {call, ?M, take, [S#s.rc, oneof(S#s.actors)]}},
        %{10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
        {10, {call, ?M, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st, S#s.inflight]}},
@@ -90,22 +93,20 @@ dynamic_precondition(_S, _) ->
     true.
 
 postcondition(S, {call, _, take, [_, Actor]}, R) ->
-    io:format("take for ~p ~p~n", [Actor, S#s.messages]),
     MsgInFlight = length(maps:get(Actor, S#s.inflight, [])) + 1,
     #act{acked=Acked} = maps:get(Actor, S#s.act_st),
     Expected = case MsgInFlight >= 20 of
-        true ->
-            pipeline_full;
-        false ->
-            maps:get({Actor, MsgInFlight+Acked}, S#s.messages, not_found)
-    end,
+                   true ->
+                       pipeline_full;
+                   false ->
+                       {_Epoch, Msg} = maps:get({Actor, MsgInFlight+Acked}, S#s.messages, {0, not_found}),
+                       Msg
+               end,
 
     case R of
         {ok, _Seq, Expected, _RC} ->
-            io:format("~p took ~p ~p~n", [Actor, _Seq, Expected]),
             true;
         {Expected, _RC} ->
-            io:format("~p took ~p~n", [Actor, Expected]),
             true;
         {ok, _Seq, Unexpected, _RC} ->
             {unexpected_take1, Actor, Expected, Unexpected, S#s.messages, S#s.inflight};
@@ -140,14 +141,22 @@ next_state(#s{messages = Msgs,
               act_st = States} = S,
            RC, {_, _, command, [_RC0, Actor, Msg]}) ->
     S#s{rc = RC,
-        messages = {call, ?M, command_messages, [Actor, States, Msg, Msgs]},
+        messages = {call, ?M, command_messages, [Actor, States, Msg, Msgs, S#s.epoch]},
         act_st = {call, ?M, command_states, [Actor, States]}};
 next_state(#s{messages = Msgs,
               act_st = States} = S,
            RC, {_, _, command_multi, [_RC0, Msg]}) ->
     S#s{rc = RC,
-        messages = {call, ?M, command_multi_messages, [States, Msg, Msgs]},
+        messages = {call, ?M, command_multi_messages, [States, Msg, Msgs, S#s.epoch]},
         act_st = {call, ?M, command_multi_states, [States]}};
+next_state(#s{messages = Msgs,
+              act_st = States,
+              inflight = InFlight,
+              epoch = Epoch} = S,
+           RC, {_, _, new_epoch, [_RC0]}) ->
+    S#s{rc = RC, epoch = Epoch + 1,
+        inflight = {call, ?M, filter_old_inflight, [InFlight, Epoch + 1]},
+        act_st = {call, ?M, filter_old_states, [States, Msgs, Epoch + 1]}};
 next_state(#s{act_st = States, inflight=InFlight} = S,
            RC,
            {_, _, ack, [_, Actor, _, _]}) ->
@@ -167,7 +176,7 @@ next_state(#s{act_st = States,
         inflight = {call, ?M, deliver_inf, [Actor, Inf]}};
 next_state(S, V, {_, _, take, [_, Actor]}) ->
     S#s{rc = {call, ?M, extract_state, [V]},
-        inflight = {call, ?M, extract_inf, [V, Actor, S#s.inflight]}};
+        inflight = {call, ?M, extract_inf, [V, Actor, S#s.inflight, S#s.messages, S#s.act_st]}};
 next_state(S, _V, {_, _, peek, _}) ->
     S;
 next_state(S, RC, {_, _, reset, [_, Actor]}) ->
@@ -181,25 +190,23 @@ command_states(Actor, States) ->
     #{Actor := St = #act{sent = Sent}} = States,
     States#{Actor => St#act{sent = Sent + 1}}.
 
-command_messages(Actor, States, Msg, Msgs) ->
+command_messages(Actor, States, Msg, Msgs, Epoch) ->
     #{Actor := #act{sent = Sent}} = States,
-    Msgs#{{Actor, Sent + 1} => Msg}.
+    Msgs#{{Actor, Sent + 1} => {Epoch, Msg}}.
 
 command_multi_states(States) ->
     maps:map(fun(_, State = #act{sent=Sent}) -> State#act{sent = Sent + 1} end, States).
 
-command_multi_messages(States, Msg, Msgs) ->
-    maps:fold(fun(Actor, #act{sent=Sent}, Acc) -> Acc#{{Actor, Sent + 1} => Msg} end, Msgs, States).
+command_multi_messages(States, Msg, Msgs, Epoch) ->
+    maps:fold(fun(Actor, #act{sent=Sent}, Acc) -> Acc#{{Actor, Sent + 1} => {Epoch, Msg}} end, Msgs, States).
 
 ack_states(Actor, States, InFlight) ->
-    io:format("~p in flight ~p~n", [Actor, InFlight]),
     MyInFlight = maps:get(Actor, InFlight),
     #{Actor := State} = States,
     case State of
         #act{sent = Sent, acked = Acked} when Sent == Acked ->
             States;
         #act{acked = Acked} when length(MyInFlight) > 0 ->
-            io:format("incrementing acks~n"),
             States#{Actor => State#act{acked = Acked + 1}};
         _ ->
             States
@@ -212,8 +219,6 @@ ack_all_states(Actor, States, InFlight) ->
         #act{sent = Sent, acked = Acked} when Sent == Acked ->
             States;
         #act{acked = Acked} when length(MyInFlight) > 0 ->
-            io:format("ack all ~p ~p ~p ~n", [Actor, MyInFlight, State]),
-            {_Seq, _} = lists:last(MyInFlight),
             States#{Actor => State#act{acked = Acked + length(MyInFlight)}};
         _ ->
             States
@@ -236,6 +241,27 @@ deliver_inf(Actor, Inf) ->
             Inf
     end.
 
+filter_old_states(States, Msgs, Epoch) ->
+    maps:map(fun(Actor, State = #act{sent=Sent, acked=Acked}) ->
+                     %% first figure out how many old messages there are for this actor
+                    OldMsgCount = maps:fold(fun({A, _}, {MEpoch, _}, Acc) when Actor == A ->
+                                                     case MEpoch < Epoch - 1 of
+                                                         true ->
+                                                             Acc + 1;
+                                                         false ->
+                                                             Acc
+                                                     end;
+                                                (_, _, Acc) ->
+                                                     Acc
+                                             end, 0, Msgs),
+                    %% the new ack count is at minimum the number of old messages
+                     State#act{sent = Sent, acked = max(Acked, OldMsgCount) }
+             end, States).
+
+filter_old_inflight(InFlight, Epoch) ->
+    maps:map(fun(_, V) ->
+                     lists:filter(fun({_Seq, E, _Msg}) -> E > Epoch - 2 end, V)
+             end, InFlight).
 
 reset_inf(Actor, Inf) ->
     Inf#{Actor => []}.
@@ -245,11 +271,14 @@ extract_state({_, RC}) ->
 extract_state({ok, _, _, RC}) ->
     RC.
 
-extract_inf({_, _}, _, Inf) ->
+extract_inf({_, _}, _, Inf, _, _) ->
     Inf;
-extract_inf({ok, Seq, Msg, _RC}, Actor, Inf) ->
+extract_inf({ok, Seq, Msg, _RC}, Actor, Inf, Msgs, States) ->
+    %% find which epoch this message was from
+    #act{acked = Acked} = maps:get(Actor, States),
     #{Actor := Q} = Inf,
-    Inf#{Actor => Q ++ [{Seq, Msg}]}.
+    {Epoch, _Msg} = maps:get({Actor, length(Q)+Acked + 1}, Msgs),
+    Inf#{Actor => Q ++ [{Seq, Epoch, Msg}]}.
 
 %% -- Commands ---------------------------------------------------------------
 
@@ -277,6 +306,10 @@ command_multi(RC,  Msg) ->
     {ok, RC1} = relcast:command({all, Msg}, RC),
     RC1.
 
+new_epoch(RC) -> 
+    {ok, RC1} = relcast:command(new_epoch, RC),
+    RC1.
+
 take(RC, Actor) ->
     relcast:take(Actor, RC).
 
@@ -299,7 +332,7 @@ ack(RC, Actor, States, InFlight) ->
                 false ->
                     RC1 = RC;
                 true ->
-                    {Seq, _} = hd(OurInFlight),
+                    {Seq, _Epoch, _Msg} = hd(OurInFlight),
                     {ok, RC1} = relcast:ack(Actor, Seq, RC)
             end
     end,
@@ -316,7 +349,7 @@ ack_all(RC, Actor, States, InFlight) ->
                 false ->
                     RC1 = RC;
                 true ->
-                    {Seq, _} = lists:last(OurInFlight),
+                    {Seq, _Epoch, _Msg} = lists:last(OurInFlight),
                     {ok, RC1} = relcast:ack(Actor, Seq, RC)
             end
     end,
@@ -378,6 +411,8 @@ bugs(Time, Bugs) ->
 init(_) ->
     {ok, []}.
 
+handle_command(new_epoch, State) ->
+    {reply, ok, [new_epoch], State};
 handle_command({all, Msg}, State) ->
     {reply, ok, [{multicast, Msg}], State};
 handle_command({Actor, Msg}, State) ->
