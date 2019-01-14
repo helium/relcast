@@ -47,7 +47,7 @@
 %%      initial state is supplied explicitly to, e.g. commands/2.)
 -spec initial_state() -> eqc_statem:symbolic_state().
 initial_state() ->
-    Actors = lists:seq(2, 10),
+    Actors = lists:seq(2, 4),
 
     States = maps:from_list([{A, #act{id = A}}
                              || A <- Actors]),
@@ -117,8 +117,13 @@ postcondition(S, {call, _, peek, [_, Actor]}, R) ->
     io:format("peek for ~p ~p~n", [Actor, S#s.messages]),
     MsgInFlight = length(maps:get(Actor, S#s.inflight, [])) + 1,
     #act{acked = Acked} = maps:get(Actor, S#s.act_st),
-    Expected = maps:get({Actor, MsgInFlight+Acked}, S#s.messages, not_found),
-
+    Expected =
+        case maps:get({Actor, MsgInFlight+Acked}, S#s.messages, not_found) of
+            {_Epoch, Msg} ->
+                Msg;
+            Else ->
+                Else
+        end,
     case R of
         Expected ->
             true;
