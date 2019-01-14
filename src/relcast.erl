@@ -444,7 +444,7 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
                     case find_next_outbound(ForActorID, CF, Key, State, false) of
                         {not_found, _LastKey, _CF2} ->
                             not_found;
-                        {_Key2, _CF2, Msg, _Multicast} ->
+                        {_Key2, _CF2, Msg, _Multicast2} ->
                             {ok, Msg};
                         not_found ->
                             not_found

@@ -69,7 +69,7 @@ command(S) ->
        {15, {call, ?M, command, [S#s.rc, oneof(S#s.actors), ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
        {15, {call, ?M, command_multi, [S#s.rc, ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
        {10, {call, ?M, take, [S#s.rc, oneof(S#s.actors)]}},
-       %{10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
+       {10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
        {10, {call, ?M, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st, S#s.inflight]}},
        {2, {call, ?M, ack_all, [S#s.rc, oneof(S#s.actors), S#s.act_st, S#s.inflight]}},
        {2, {call, ?M, reset, [S#s.rc, oneof(S#s.actors)]}}
