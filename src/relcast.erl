@@ -398,7 +398,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                                              {CF0, StartKey0};
                                          false ->
                                              %% reset the start key as well
-                                             {State#state.prev_cf, min_inbound_key()}
+                                             {State#state.prev_cf, min_outbound_key()}
                                      end,
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
@@ -468,7 +468,7 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
                                              {CF0, StartKey0};
                                          false ->
                                              %% reset the start key as well
-                                             {State#state.prev_cf, min_inbound_key()}
+                                             {State#state.prev_cf, min_outbound_key()}
                                      end,
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
@@ -538,7 +538,6 @@ ack(FromActorID, Seq, State = #state{db = DB}) ->
 %% @doc Stop the relcast instance.
 -spec stop(any(), relcast_state()) -> ok.
 stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
-    lager:info("AAAAAAAA in stop fun"),
     case erlang:function_exported(Module, terminate, 2) of
         true ->
             Module:terminate(Reason, ModuleState);
@@ -652,7 +651,6 @@ handle_message(Key, CF, FromActorID, Message, Batch, State = #state{module=Modul
                     ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     {ok, NewState};
                 {stop, Timeout, NewState} ->
-                    lager:info("stoppping"),
                     ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     {stop, Timeout, NewState}
             end
