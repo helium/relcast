@@ -22,7 +22,8 @@
 -record(state,
         {
          counters = [0] :: [pos_integer()],
-         current_counter = 1 :: pos_integer()
+         current_counter = 1 :: pos_integer(),
+         seq = 0 :: non_neg_integer()
         }).
 
 -record(s,
@@ -36,6 +37,7 @@
          inflight = #{} :: #{pos_integer() => [{Seq ::  pos_integer(), Epoch :: non_neg_integer(), binary()}]},
          messages = #{} :: #{{pos_integer(), pos_integer()} => {Epoch :: non_neg_integer(), binary()}},
 
+         seq = [] :: [non_neg_integer()],
          counters = [0] :: [pos_integer()],
          current_counter = 1 :: pos_integer(),
 
@@ -43,6 +45,9 @@
         }).
 
 -define(M, ?MODULE).
+
+-define(PIPELINE_DEPTH, 5).
+-define(MAX_DEFERS, 5).
 
 %% this module describes a simple relcast setup of extremely simple
 %% actors that send and receive random messages.  The actors are
@@ -77,10 +82,13 @@ command(S) ->
     frequency(
       [
        {1, {call, ?M, open, [S#s.actors, S#s.dir]}},
-       {1, {call, ?M, close, [S#s.rc]}},
+       {2, {call, ?M, close, [S#s.rc]}},
+       {1, {call, ?M, stop_command, [S#s.rc]}},
+       {1, {call, ?M, stop_message, [S#s.rc]}},
        {15, {call, ?M, command, [S#s.rc, oneof(S#s.actors), ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
-       {15, {call, ?M, command_multi, [S#s.rc, ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
-       {2, {call, ?M, new_epoch, [S#s.rc]}},
+       {10, {call, ?M, command_multi, [S#s.rc, ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
+       {10, {call, ?M, callback, [S#s.rc, ?SUCHTHAT(X, binary(), byte_size(X) > 0)]}},
+       {4, {call, ?M, new_epoch, [S#s.rc]}},
 
        {10, {call, ?M, message,
              [S#s.rc,
@@ -89,11 +97,15 @@ command(S) ->
               nat()]}},
        {4, {call, ?M, next_col, [S#s.rc]}}, %% called for model side effects
 
+       {10, {call, ?M, seq_message,
+             [S#s.rc, nat()]}},
+
        {10, {call, ?M, take, [S#s.rc, oneof(S#s.actors)]}},
        {10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
+       {5, {call, ?M, in_flight, [S#s.rc, oneof(S#s.actors)]}},
        {10, {call, ?M, ack, [S#s.rc, oneof(S#s.actors), S#s.act_st, S#s.inflight]}},
        {2, {call, ?M, ack_all, [S#s.rc, oneof(S#s.actors), S#s.act_st, S#s.inflight]}},
-       {2, {call, ?M, reset, [S#s.rc, oneof(S#s.actors)]}}
+       {4, {call, ?M, reset, [S#s.rc, oneof(S#s.actors)]}}
       ]).
 
 
@@ -113,7 +125,7 @@ dynamic_precondition(_S, _) ->
 postcondition(S, {call, _, take, [_, Actor]}, R) ->
     MsgInFlight = length(maps:get(Actor, S#s.inflight, [])) + 1,
     #act{acked=Acked} = maps:get(Actor, S#s.act_st),
-    Expected = case MsgInFlight >= 20 of
+    Expected = case MsgInFlight > ?PIPELINE_DEPTH of
                    true ->
                        pipeline_full;
                    false ->
@@ -160,14 +172,45 @@ postcondition(#s{current_counter = MCC,
             counters = SCtrs}, _RC} = relcast:command(state, RC),
     MCC == SCC andalso
         comp_ctrs(inc_counters(Col, Val, MCtrs), SCtrs, MCC);
+postcondition(#s{seq = Seq},
+              {_, _, seq_message, [_RC, Val]}, {_, MySeq, InboundQueue}) ->
+    Values = lists:sort([Val|Seq]),
+    ExpectedSeq = seq_value(lists:usort([Val|Seq]), 0),
+    RemainingValues = [ V || V <- Values, V > MySeq],
+    RemainingValuesInQueue = lists:sort([ N ||  {seq, N} <- [binary_to_term(Bin) || {1, Bin} <- InboundQueue]]),
+    %io:format("Seq ~p MySeq ~p -- ~p~n", [[Val|Seq], MySeq, seq_value(lists:usort([Val|Seq]), 0)]),
+    %io:format("Remaining values ~p~n", [RemainingValues]),
+    %io:format("inbound queue ~p~n", [RemainingValuesInQueue]),
+    case MySeq == ExpectedSeq of
+        false ->
+            {sequence_mismatch, ExpectedSeq, MySeq};
+        true ->
+            case RemainingValues == RemainingValuesInQueue of
+                false ->
+                    {defer_mismatch, RemainingValues, RemainingValuesInQueue};
+                true ->
+                    true
+            end
+    end;
+%% if we're full, don't add anything
+postcondition(_,
+              {_, _, seq_message, [_RC, _Val]}, _) ->
+    true;
+postcondition(S,
+              {_, _, in_flight, [_, Actor]},
+              N) ->
+    #{Actor := Q} = S#s.inflight,
+    length(Q) == N;
 postcondition(_, _, _) ->
     true.
 
 next_state(S, Res, {call, _, open, _}) ->
      S#s{rc = {call, erlang, element, [1, Res]}, dir = {call, erlang, element, [2, Res]}, running = true};
-next_state(S, _, {call, _, close, _}) ->
+next_state(S, _, {call, _, Stop, _}) when Stop == close;
+                                          Stop == stop_command;
+                                          Stop == stop_message ->
     Inf = maps:from_list([{A, []}
-                             || A <- S#s.actors]),
+                          || A <- S#s.actors]),
     S#s{running=false, inflight=Inf};
 next_state(#s{messages = Msgs,
               act_st = States} = S,
@@ -177,7 +220,8 @@ next_state(#s{messages = Msgs,
         act_st = {call, ?M, command_states, [Actor, States]}};
 next_state(#s{messages = Msgs,
               act_st = States} = S,
-           RC, {_, _, command_multi, [_RC0, Msg]}) ->
+           RC, {_, _, Multi, [_RC0, Msg]}) when Multi == command_multi;
+                                                Multi == callback ->
     S#s{rc = RC,
         messages = {call, ?M, command_multi_messages, [States, Msg, Msgs, S#s.epoch]},
         act_st = {call, ?M, command_multi_states, [States]}};
@@ -211,9 +255,14 @@ next_state(S, V, {_, _, take, [_, Actor]}) ->
         inflight = {call, ?M, extract_inf, [V, Actor, S#s.inflight, S#s.messages, S#s.act_st]}};
 next_state(S, _V, {_, _, peek, _}) ->
     S;
+next_state(S, _V, {_, _, in_flight, _}) ->
+    S;
 next_state(S, V, {_, _, message, _}) ->
     S#s{rc = {call, erlang, element, [1, V]},
         counters = {call, ?M, update_counters, [V, S#s.counters]}};
+next_state(S, V, {_, _, seq_message, [_, Seq]}) ->
+    S#s{rc = {call, erlang, element, [1, V]},
+        seq = {call, ?M, update_seq, [Seq, S#s.seq, V]}};
 next_state(S, RC, {_, _, next_col, _}) ->
     S#s{rc = RC,
         current_counter = S#s.current_counter + 1};
@@ -223,6 +272,11 @@ next_state(S, RC, {_, _, reset, [_, Actor]}) ->
 next_state(S, _V, _C) ->
     error({S, _V, _C}),
     S.
+
+update_seq(Seq, Seqs, {_, _, _})->
+    [Seq | Seqs];
+update_seq(_Discard, Seqs, _) ->
+    Seqs.
 
 command_states(Actor, States) ->
     #{Actor := St = #act{sent = Sent}} = States,
@@ -318,13 +372,18 @@ extract_inf({ok, Seq, Msg, _RC}, Actor, Inf, Msgs, States) ->
     {Epoch, _Msg} = maps:get({Actor, length(Q)+Acked + 1}, Msgs),
     Inf#{Actor => Q ++ [{Seq, Epoch, Msg}]}.
 
-update_counters({_, Msg}, Cols0) ->
+update_counters({_RC, Msg}, Cols0) ->
     {add, Col, Val} = binary_to_term(Msg),
     inc_counters(Col, Val, Cols0).
 
 %% -- Commands ---------------------------------------------------------------
 
 open(Actors, Dir0) ->
+    %% make sure that the settings are lowered so we run into more
+    %% edge cases.
+    application:set_env(relcast, max_defers, ?MAX_DEFERS),
+    application:set_env(relcast, pipeline_depth, ?PIPELINE_DEPTH),
+
     Dir = case Dir0 of
               undefined ->
                   DirNum = erlang:unique_integer(),
@@ -340,12 +399,24 @@ open(Actors, Dir0) ->
 close(RC) ->
     relcast:stop(reason, RC).
 
+stop_command(RC) ->
+    {stop, ok, 0, RC1} = relcast:command(stop, RC),
+    relcast:stop(reason, RC1).
+
+stop_message(RC) ->
+    {stop, 0, RC1} = relcast:deliver(term_to_binary(stop), 1, RC),
+    relcast:stop(reason, RC1).
+
 command(RC, Actor, Msg) ->
     {ok, RC1} = relcast:command({Actor, Msg}, RC),
     RC1.
 
 command_multi(RC,  Msg) ->
     {ok, RC1} = relcast:command({all, Msg}, RC),
+    RC1.
+
+callback(RC,  Msg) ->
+    {ok, RC1} = relcast:command({callback, Msg}, RC),
     RC1.
 
 new_epoch(RC) ->
@@ -358,10 +429,8 @@ take(RC, Actor) ->
 peek(RC, Actor) ->
     relcast:peek(Actor, RC).
 
-%% note that this simulates a deliver to a remote actor; we never
-%% actually make or deliver any messages to the local relcast instance.
-deliver(_Actor) ->
-    ok.
+in_flight(RC, Actor) ->
+    relcast:in_flight(Actor, RC).
 
 ack(RC, Actor, States, InFlight) ->
     #{Actor := State} = States,
@@ -392,7 +461,7 @@ ack_all(RC, Actor, States, InFlight) ->
                     RC1 = RC;
                 true ->
                     {Seq, _Epoch, _Msg} = lists:last(OurInFlight),
-                    {ok, RC1} = relcast:ack(Actor, Seq, RC)
+                    {ok, RC1} = relcast:multi_ack(Actor, Seq, RC)
             end
     end,
     RC1.
@@ -410,6 +479,17 @@ next_col(RC) ->
     {ok, RC1} = relcast:command(next_col, RC),
     RC1.
 
+seq_message(RC, Seq) ->
+    Msg = term_to_binary({seq, Seq}),
+    case relcast:deliver(Msg, 1, RC) of
+        {ok, RC1} ->
+            {#state{seq=MySeq}, RC2} = relcast:command(state, RC1),
+            {_Ms, InboundQueue, _OutboundQueue} = relcast:status(RC2),
+            {RC2, MySeq, InboundQueue};
+        full ->
+            {RC}
+    end.
+
 cleanup(#s{rc=undefined}) ->
     true;
 cleanup(#s{rc=RC, dir=Dir, running=Running}) ->
@@ -426,7 +506,7 @@ cleanup(#s{rc=RC, dir=Dir, running=Running}) ->
 prop_basic() ->
     ?FORALL(
        %% default to longer commands sequences for better coverage
-       Cmds, more_commands(2, commands(?M)),
+       Cmds, more_commands(5, commands(?M)),
        with_parameters(
          [{show_states, false},  % make true to print state at each transition
           {print_counterexample, true}],
@@ -462,10 +542,14 @@ bugs(Time, Bugs) ->
 init(_) ->
     {ok, #state{}}.
 
+handle_command(stop, State) ->
+    {reply, ok, [{stop, 0}], State};
 handle_command(new_epoch, State) ->
     {reply, ok, [new_epoch], State};
 handle_command({all, Msg}, State) ->
     {reply, ok, [{multicast, Msg}], State};
+handle_command({callback, Msg}, State) ->
+    {reply, ok, [{callback, Msg}], State};
 handle_command(state, State) ->
     {reply, State, ignore};
 handle_command(next_col, #state{current_counter = CC} = State) ->
@@ -485,12 +569,20 @@ restore(_A, #state{} = B) ->
     {ok, B}.
 
 handle_message(Msg, _From, #state{current_counter = CC,
-                                  counters = Counters} = State) ->
+                                  counters = Counters, seq=MySeq} = State) ->
     case catch binary_to_term(Msg) of
         {add, Col, _Val} when Col > CC ->
             defer;
         {add, Col, Val} ->
             {State#state{counters = inc_counters(Col, Val, Counters)}, []};
+        {seq, Seq} when Seq =< MySeq ->
+            ignore;
+        {seq, Seq} when Seq == (MySeq + 1) ->
+            {State#state{seq=Seq}, []};
+        {seq, _Seq} ->
+            defer;
+        stop ->
+            {State, [{stop, 0}]};
         %% multicast crap also ends up here, which will feed us garbage
         _ ->
             ignore
@@ -498,8 +590,12 @@ handle_message(Msg, _From, #state{current_counter = CC,
 handle_message(_, _, _) ->
     ignore.
 
-callback_message(_, _, _) ->
-    ignore.
+callback_message(_ToActor, Message, _State) ->
+    Message.
+
+%% juice that coverage!
+terminate(_, _) ->
+    ok.
 
 %%% helpers
 
@@ -537,21 +633,21 @@ comp_ctrs(Model, State, Column) ->
                        true ->
                            Ct + 1;
                        false ->
-                           {defer, {mod, Model}, {state, State}}
+                           {defer, Column, {mod, Model}, {state, State}}
                    end;
               ({M, S}, Ct) when Ct == Column ->
                    case M >= S of
                        true ->
                            Ct + 1;
                        false ->
-                           {defer1, {mod, Model}, {state, State}}
+                           {defer1, Column, {mod, Model}, {state, State}}
                    end;
               ({_M, S}, Ct) ->
                    case S == 0 of
                        true ->
                            Ct + 1;
                        false ->
-                           {defer2, {mod, Model}, {state, State}}
+                           {defer2, Column, {mod, Model}, {state, State}}
                    end
            end,
            1,
@@ -561,3 +657,10 @@ comp_ctrs(Model, State, Column) ->
         Else ->
             Else
     end.
+
+seq_value([H|T], Acc) when H =< Acc ->
+    seq_value(T, Acc);
+seq_value([H|T], Acc) when H == Acc + 1 ->
+    seq_value(T, H);
+seq_value(_, Acc) ->
+    Acc.
