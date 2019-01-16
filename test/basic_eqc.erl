@@ -411,7 +411,7 @@ next_col(RC) ->
     RC1.
 
 cleanup(#s{rc=undefined}) ->
-    ok;
+    true;
 cleanup(#s{rc=RC, dir=Dir, running=Running}) ->
     case Running of
         true ->
@@ -419,25 +419,26 @@ cleanup(#s{rc=RC, dir=Dir, running=Running}) ->
         false ->
             ok
     end,
-    os:cmd("rm -rf " ++ Dir).
+    os:cmd("rm -rf " ++ Dir),
+    true.
 
 %% -- Property ---------------------------------------------------------------
 prop_basic() ->
     ?FORALL(
-       Cmds, commands(?M),
-
-       begin
-           {H, S, Res} = run_commands(Cmds),
-           ?WHENFAIL(begin
-                         io:format("~p~n", [Res]),
-                         io:format("~p~n", [eqc_symbolic:eval(S)]),
-                         eqc_statem:pretty_commands(?M,
-                                      Cmds,
-                                      {H, S, Res},
-                                      cleanup(eqc_symbolic:eval(S)))
-                     end,
-           Res == ok)
-       end).
+       %% default to longer commands sequences for better coverage
+       Cmds, more_commands(2, commands(?M)),
+       with_parameters(
+         [{show_states, false},  % make true to print state at each transition
+          {print_counterexample, true}],
+         aggregate(command_names(Cmds),
+           begin
+               {H, S, Res} = run_commands(Cmds),
+               eqc_statem:pretty_commands(?M,
+                                          Cmds,
+                                          {H, S, Res},
+                                          cleanup(eqc_symbolic:eval(S))
+                                          andalso Res == ok)
+           end))).
 
 %% @doc Run property repeatedly to find as many different bugs as
 %% possible. Runs for 10 seconds before giving up finding more bugs.
