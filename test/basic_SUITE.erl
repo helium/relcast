@@ -209,7 +209,7 @@ epochs(_Config) ->
     {ok, _Ref2, <<"hai">>, RC1_9} = relcast:take(2, RC1_8),
     relcast:stop(normal, RC1_9),
     {ok, CFs} = rocksdb:list_column_families("data5", []),
-    ["default", "epoch0000000000", "epoch0000000001"] = CFs,
+    ["default", "Inbound", "epoch0000000000", "epoch0000000001"] = CFs,
     %% reopen the relcast and make sure it didn't delete any wrong column
     %% families
     {ok, RC1_10} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
@@ -235,18 +235,18 @@ epochs_gc(_Config) ->
     {ok, RC1_6} = relcast:command(next_round, RC1_5),
     %% check the deferred message from the previous epoch gets handled
     {Map, _} = relcast:command(seqmap, RC1_6),
-    [] = maps:to_list(Map),
+    [{2, 1}] = maps:to_list(Map),
     %% go to the next round
     {ok, RC1_7} = relcast:command(next_round, RC1_6),
     {2, _} = relcast:command(round, RC1_7),
     %% check the deferred message from the previous epoch gets handled
     {Map2, _} = relcast:command(seqmap, RC1_7),
-    [] = maps:to_list(Map2),
+    [{2, 2}] = maps:to_list(Map2),
     %% the data from the original epoch has been GC'd
     {not_found, _} = relcast:take(2, RC1_7),
     relcast:stop(normal, RC1_7),
     {ok, CFs} = rocksdb:list_column_families("data6", []),
-    ["default", "epoch0000000001", "epoch0000000002"] = CFs,
+    ["default", "Inbound", "epoch0000000001", "epoch0000000002"] = CFs,
     %% reopen the relcast and make sure it didn't delete any wrong column
     %% families
     {ok, RC1_10} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
@@ -255,6 +255,7 @@ epochs_gc(_Config) ->
     %% Re-add the old epoch 0 CF and check it gets removed
     {ok, DB, _} = rocksdb:open_with_cf("data6", [{create_if_missing, true}],
                                        [{"default", []},
+                                        {"Inbound", []},
                                         {"epoch0000000001", []},
                                         {"epoch0000000002", []}]),
     {ok, _Epoch0} = rocksdb:create_column_family(DB, "epoch0000000000", []),
@@ -263,8 +264,9 @@ epochs_gc(_Config) ->
     relcast:stop(normal, RC1_11),
     {ok, CFs} = rocksdb:list_column_families("data6", []),
     %% delete epoch 1, re-add epoch 0 and check 0 is pruned again because it's non-contiguous
-    {ok, DB2, [_, Epoch1, _]} = rocksdb:open_with_cf("data6", [{create_if_missing, true}],
+    {ok, DB2, [_, _, Epoch1, _]} = rocksdb:open_with_cf("data6", [{create_if_missing, true}],
                                        [{"default", []},
+                                        {"Inbound", []},
                                         {"epoch0000000001", []},
                                         {"epoch0000000002", []}]),
     {ok, _} = rocksdb:create_column_family(DB2, "epoch0000000000", []),
@@ -272,7 +274,7 @@ epochs_gc(_Config) ->
     rocksdb:close(DB2),
     {ok, RC1_12} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
     relcast:stop(normal, RC1_12),
-    {ok, ["default", "epoch0000000002"]} = rocksdb:list_column_families("data6", []),
+    {ok, ["default", "Inbound", "epoch0000000002"]} = rocksdb:list_column_families("data6", []),
     ok.
 
 callback_message(_Config) ->
@@ -314,9 +316,10 @@ epoch_no_state(_Config) ->
     {0, _} = relcast:command(round, RC1_2),
     relcast:stop(normal, RC1_2),
     {ok, CFs} = rocksdb:list_column_families("data10", []),
-    ["default", "epoch0000000000"] = CFs,
+    ["default","Inbound",  "epoch0000000000"] = CFs,
     {ok, DB, _} = rocksdb:open_with_cf("data10", [{create_if_missing, true}],
                                        [{"default", []},
+                                        {"Inbound", []},
                                         {"epoch0000000000", []}]),
     {ok, Epoch1} = rocksdb:create_column_family(DB, "epoch0000000001", []),
     not_found = rocksdb:get(DB, Epoch1, <<"stored_module_state">>, []),
@@ -324,9 +327,10 @@ epoch_no_state(_Config) ->
     {ok, RC2} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data10"}]),
     relcast:stop(normal, RC2),
     {ok, CFs2} = rocksdb:list_column_families("data10", []),
-    ["default", "epoch0000000000", "epoch0000000001"] = CFs2,
-    {ok, DB2, [_, _, CF1]} = rocksdb:open_with_cf("data10", [{create_if_missing, true}],
+    ["default", "Inbound", "epoch0000000000", "epoch0000000001"] = CFs2,
+    {ok, DB2, [_, _, _, CF1]} = rocksdb:open_with_cf("data10", [{create_if_missing, true}],
                                        [{"default", []},
+                                        {"Inbound", []},
                                         {"epoch0000000000", []},
                                         {"epoch0000000001", []}]),
     {ok, _Result} = rocksdb:get(DB2, CF1, <<"stored_module_state">>, []),
@@ -342,24 +346,37 @@ pipeline(_Config) ->
                     end,
                     {ok, RC1},
                     [N || N <- lists:seq(1, 30)]),
-    {ok, Ref, <<"hello - 20">>, RC3} =
+    {ok, Ref1, <<"hello - 18">>, RC3} =
         lists:foldl(fun(_Idx, {ok, _R, _Msg, Acc}) ->
                             relcast:take(2, Acc)
                     end,
                     {ok, ign, ign, RC2},
-                    [N || N <- lists:seq(1, 20)]),
-    {pipeline_full, _RC3} = relcast:take(2, RC3),
+                    [N || N <- lists:seq(1, 18)]),
+    {ok, Ref2, <<"hello - 19">>, RC4} = relcast:take(2, RC3),
+    {ok, Ref3, <<"hello - 20">>, RC5} = relcast:take(2, RC4),
+    {pipeline_full, _RC4} = relcast:take(2, RC5),
+    20 = relcast:in_flight(2, RC5),
+    %% singly ack the second-to-last message first
+    {ok, RC6} = relcast:ack(2, Ref2, RC5),
+    19 = relcast:in_flight(2, RC6),
     %% test multi-ack
-    {ok, RC4} = relcast:ack(2, Ref, RC3),
+    {ok, RC7} = relcast:multi_ack(2, Ref1, RC6),
+    1 = relcast:in_flight(2, RC7),
+    %% ack the last message singly
+    {ok, RC8} = relcast:ack(2, Ref3, RC7),
+    0 = relcast:in_flight(2, RC8),
     %% test single acks
-    RC5 =
+    RC9 =
         lists:foldl(fun(Idx, Acc) ->
                             Msg = <<"hello - ", (integer_to_binary(Idx))/binary>>,
+                            0 = relcast:in_flight(2, Acc),
                             {ok, R, Msg, Acc1} = relcast:take(2, Acc),
-                            {ok, Acc2} = relcast:ack(R, 2, Acc1),
+                            1 = relcast:in_flight(2, Acc1),
+                            {ok, Acc2} = relcast:ack(2, R, Acc1),
+                            0 = relcast:in_flight(2, Acc2),
                             Acc2
                     end,
-                    RC4,
+                    RC8,
                     [N || N <- lists:seq(21, 30)]),
-    {not_found, _} = relcast:take(2, RC5),
+    {not_found, _} = relcast:take(2, RC9),
     ok.
