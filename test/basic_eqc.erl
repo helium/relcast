@@ -213,6 +213,7 @@ next_state(S, _V, {_, _, peek, _}) ->
     S;
 next_state(S, V, {_, _, message, _}) ->
     S#s{rc = {call, erlang, element, [1, V]},
+%%    S#s{rc = {call, ?M, message_st, [V]},
         counters = {call, ?M, update_counters, [V, S#s.counters]}};
 next_state(S, RC, {_, _, next_col, _}) ->
     S#s{rc = RC,
@@ -318,7 +319,10 @@ extract_inf({ok, Seq, Msg, _RC}, Actor, Inf, Msgs, States) ->
     {Epoch, _Msg} = maps:get({Actor, length(Q)+Acked + 1}, Msgs),
     Inf#{Actor => Q ++ [{Seq, Epoch, Msg}]}.
 
-update_counters({_, Msg}, Cols0) ->
+message_st({RC, _}) ->
+    RC.
+
+update_counters({_RC, Msg}, Cols0) ->
     {add, Col, Val} = binary_to_term(Msg),
     inc_counters(Col, Val, Cols0).
 
@@ -537,21 +541,21 @@ comp_ctrs(Model, State, Column) ->
                        true ->
                            Ct + 1;
                        false ->
-                           {defer, {mod, Model}, {state, State}}
+                           {defer, Column, {mod, Model}, {state, State}}
                    end;
               ({M, S}, Ct) when Ct == Column ->
                    case M >= S of
                        true ->
                            Ct + 1;
                        false ->
-                           {defer1, {mod, Model}, {state, State}}
+                           {defer1, Column, {mod, Model}, {state, State}}
                    end;
               ({_M, S}, Ct) ->
                    case S == 0 of
                        true ->
                            Ct + 1;
                        false ->
-                           {defer2, {mod, Model}, {state, State}}
+                           {defer2, Column, {mod, Model}, {state, State}}
                    end
            end,
            1,

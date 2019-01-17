@@ -329,22 +329,15 @@ deliver(Message, FromActorID, State = #state{in_key_count=KeyCount, db=DB, activ
                  defer ->
                      DefersForThisActor = maps:get(FromActorID, Defers, []),
                      MsgHash = erlang:phash2(Message),
-                     case lists:keyfind(MsgHash, 3, DefersForThisActor) of
-                         false ->
-                             MaxDefers = application:get_env(relcast, max_defers, 100),
-                             case DefersForThisActor of
-                                 N when length(N) < MaxDefers ->
-                                     Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
-                                     ok = rocksdb:batch_put(Batch, State#state.inbound_cf, Key, <<FromActorID:16/integer, Message/binary>>),
-                                     {ok, State#state{in_key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key, MsgHash}|N], Defers)}};
-                                 _ ->
-                                     %% sorry buddy, no room on the couch
-                                     full
-                             end;
+                     MaxDefers = application:get_env(relcast, max_defers, 100),
+                     case DefersForThisActor of
+                         N when length(N) < MaxDefers ->
+                             Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
+                             ok = rocksdb:batch_put(Batch, State#state.inbound_cf, Key, <<FromActorID:16/integer, Message/binary>>),
+                             {ok, State#state{in_key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key, MsgHash}|N], Defers)}};
                          _ ->
-                             %% we already have a copy of this, this is likely a retry.
-                             %% we can accept it without changing our state at all
-                             {ok, State}
+                             %% sorry buddy, no room on the couch
+                             full
                      end
              end,
     ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
