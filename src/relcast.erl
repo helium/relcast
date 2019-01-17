@@ -123,7 +123,8 @@
                                  Epoch :: rocksdb:cf_handle(),
                                  Key :: binary(),
                                  Multicast :: boolean()}]},
-          key_count = 0 :: non_neg_integer(),
+          in_key_count = 0 :: non_neg_integer(),
+          out_key_count = 0 :: non_neg_integer(),
           epoch = 0 :: non_neg_integer(),
           bitfieldsize :: pos_integer(),
           inbound_cf :: rocksdb:cf_handle(),
@@ -243,7 +244,8 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                               not_found ->
                                   ModuleState0
                           end,
-            LastKey = get_last_key(DB, ActiveCF),
+            LastKeyIn = get_last_key(DB, InboundCF),
+            LastKeyOut = get_last_key(DB, ActiveCF),
             BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
             State = #state{module=Module, id=ActorID,
                            inbound_cf = InboundCF,
@@ -251,7 +253,8 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                            active_cf = ActiveCF,
                            ids=ActorIDs,
                            modulestate=ModuleState, db=DB,
-                           key_count=LastKey+1,
+                           out_key_count=LastKeyOut+1,
+                           in_key_count=LastKeyIn+1,
                            epoch=Epoch,
                            bitfieldsize=BitFieldSize},
             {ok, Iter} = rocksdb:iterator(State#state.db, InboundCF, [{iterate_upper_bound, max_inbound_key()}]),
@@ -302,7 +305,7 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
 %% later, or this function returns `full' to indicate it cannot absorb any more
 %% deferred messages from this Actor.
 -spec deliver(binary(), pos_integer(), relcast_state()) -> {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
-deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_cf=CF, defers=Defers}) ->
+deliver(Message, FromActorID, State = #state{in_key_count=KeyCount, db=DB, active_cf=CF, defers=Defers}) ->
     {ok, Batch} = rocksdb:batch(),
     Result = case handle_message(undefined, undefined, FromActorID, Message, Batch, State) of
                  {ok, NewState} ->
@@ -333,7 +336,7 @@ deliver(Message, FromActorID, State = #state{key_count=KeyCount, db=DB, active_c
                                  N when length(N) < MaxDefers ->
                                      Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
                                      ok = rocksdb:batch_put(Batch, State#state.inbound_cf, Key, <<FromActorID:16/integer, Message/binary>>),
-                                     {ok, State#state{key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key, MsgHash}|N], Defers)}};
+                                     {ok, State#state{in_key_count=KeyCount+1, defers=maps:put(FromActorID, [{CF, Key, MsgHash}|N], Defers)}};
                                  _ ->
                                      %% sorry buddy, no room on the couch
                                      full
@@ -686,9 +689,9 @@ handle_actions([new_epoch|Tail], Batch, State) ->
     end,
     %% when we're done handling actions, we will write the module state (and all subsequent outbound messages from this point on)
     %% into the active CF, which is this new one now
-    handle_actions(Tail, Batch, State#state{key_count=0, active_cf=NewCF, prev_cf=State#state.active_cf, epoch=State#state.epoch + 1, defers=Defers, pending_acks=Pends});
+    handle_actions(Tail, Batch, State#state{out_key_count=0, active_cf=NewCF, prev_cf=State#state.active_cf, epoch=State#state.epoch + 1, defers=Defers, pending_acks=Pends});
 handle_actions([{multicast, Message}|Tail], Batch, State =
-               #state{key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
+               #state{out_key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
     Key = make_outbound_key(KeyCount),
     ok = rocksdb:batch_put(Batch, CF, Key, <<0:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
@@ -696,26 +699,26 @@ handle_actions([{multicast, Message}|Tail], Batch, State =
     %% deferring your own message is an error
     case Module:handle_message(Message, ID, State#state.modulestate) of
         ignore ->
-            handle_actions(Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{key_count=KeyCount+1}));
+            handle_actions(Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
         {ModuleState, Actions} ->
-            handle_actions(Actions++Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, key_count=KeyCount+1}))
+            handle_actions(Actions++Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, out_key_count=KeyCount+1}))
     end;
 handle_actions([{callback, Message}|Tail], Batch, State =
-               #state{key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
+               #state{out_key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
     Key = make_outbound_key(KeyCount),
     ok = rocksdb:batch_put(Batch, CF, Key, <<2:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
     case Module:callback_message(ID, Message, State#state.modulestate) of
         none ->
-            handle_actions(Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{key_count=KeyCount+1}));
+            handle_actions(Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
         OurMessage when is_binary(OurMessage) ->
             %% handle our own copy of the message
             %% deferring your own message is an error
             case Module:handle_message(OurMessage, ID, State#state.modulestate) of
                 ignore ->
-                    handle_actions(Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{key_count=KeyCount+1}));
+                    handle_actions(Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
                 {ModuleState, Actions} ->
-                    handle_actions(Actions++Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, key_count=KeyCount+1}))
+                    handle_actions(Actions++Tail, Batch, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, out_key_count=KeyCount+1}))
             end
     end;
 handle_actions([{unicast, ID, Message}|Tail], Batch, State = #state{module=Module, id=ID}) ->
@@ -727,10 +730,10 @@ handle_actions([{unicast, ID, Message}|Tail], Batch, State = #state{module=Modul
         {ModuleState, Actions} ->
             handle_actions(Actions++Tail, Batch, State#state{modulestate=ModuleState})
     end;
-handle_actions([{unicast, ToActorID, Message}|Tail], Batch, State = #state{key_count=KeyCount, active_cf=CF}) ->
+handle_actions([{unicast, ToActorID, Message}|Tail], Batch, State = #state{out_key_count=KeyCount, active_cf=CF}) ->
     Key = make_outbound_key(KeyCount),
     ok = rocksdb:batch_put(Batch, CF, Key, <<1:2/integer, ToActorID:14/integer, Message/binary>>),
-    handle_actions(Tail, Batch, update_next([ToActorID], CF, Key, State#state{key_count=KeyCount+1}));
+    handle_actions(Tail, Batch, update_next([ToActorID], CF, Key, State#state{out_key_count=KeyCount+1}));
 handle_actions([{stop, Timeout}|_Tail], _Batch, State) ->
     logger:info("YYYYYYYYYY ~p stopping", [self()]),
     {stop, Timeout, State}.
