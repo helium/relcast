@@ -530,6 +530,7 @@ ack(FromActorID, Seq, State = #state{db = DB}) ->
                           Pends),
                     %% then reverse them since we've changed the order.
                     NewPends = lists:reverse(NewPends0),
+                    error_logger:info_msg("deleted ~p pending messages", [length(Pends) - length(NewPends)]),
                     NewPending = (State#state.pending_acks)#{FromActorID => NewPends},
                     {ok, State#state{pending_acks=NewPending, last_sent = maps:put(FromActorID, {CF, AKey}, State#state.last_sent)}};
                 _ ->
