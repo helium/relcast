@@ -22,7 +22,8 @@
 -record(state,
         {
          counters = [0] :: [pos_integer()],
-         current_counter = 1 :: pos_integer()
+         current_counter = 1 :: pos_integer(),
+         seq = 0 :: non_neg_integer()
         }).
 
 -record(s,
@@ -36,6 +37,7 @@
          inflight = #{} :: #{pos_integer() => [{Seq ::  pos_integer(), Epoch :: non_neg_integer(), binary()}]},
          messages = #{} :: #{{pos_integer(), pos_integer()} => {Epoch :: non_neg_integer(), binary()}},
 
+         seq = [] :: [non_neg_integer()],
          counters = [0] :: [pos_integer()],
          current_counter = 1 :: pos_integer(),
 
@@ -88,6 +90,9 @@ command(S) ->
               oneof(lists:seq(S#s.current_counter, S#s.current_counter + 2)),
               nat()]}},
        {4, {call, ?M, next_col, [S#s.rc]}}, %% called for model side effects
+
+       {10, {call, ?M, seq_message,
+             [S#s.rc, nat()]}},
 
        {10, {call, ?M, take, [S#s.rc, oneof(S#s.actors)]}},
        {10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
@@ -160,6 +165,26 @@ postcondition(#s{current_counter = MCC,
             counters = SCtrs}, _RC} = relcast:command(state, RC),
     MCC == SCC andalso
         comp_ctrs(inc_counters(Col, Val, MCtrs), SCtrs, MCC);
+postcondition(#s{seq = Seq},
+              {_, _, seq_message, [_RC, Val]}, {_, MySeq, InboundQueue}) ->
+    Values = lists:sort([Val|Seq]),
+    ExpectedSeq = seq_value(lists:usort([Val|Seq]), 0),
+    RemainingValues = [ V || V <- Values, V > MySeq],
+    RemainingValuesInQueue = lists:sort([ N ||  {seq, N} <- [binary_to_term(Bin) || {1, Bin} <- InboundQueue]]),
+    %io:format("Seq ~p MySeq ~p -- ~p~n", [[Val|Seq], MySeq, seq_value(lists:usort([Val|Seq]), 0)]),
+    %io:format("Remaining values ~p~n", [RemainingValues]),
+    %io:format("inbound queue ~p~n", [RemainingValuesInQueue]),
+    case MySeq == ExpectedSeq of
+        false ->
+            {sequence_mismatch, ExpectedSeq, MySeq};
+        true ->
+            case RemainingValues == RemainingValuesInQueue of
+                false ->
+                    {defer_mismatch, RemainingValues, RemainingValuesInQueue};
+                true ->
+                    true
+            end
+    end;
 postcondition(_, _, _) ->
     true.
 
@@ -215,6 +240,9 @@ next_state(S, V, {_, _, message, _}) ->
     S#s{rc = {call, erlang, element, [1, V]},
 %%    S#s{rc = {call, ?M, message_st, [V]},
         counters = {call, ?M, update_counters, [V, S#s.counters]}};
+next_state(S, V, {_, _, seq_message, [_, Seq]}) ->
+    S#s{rc = {call, erlang, element, [1, V]},
+        seq=[Seq|S#s.seq]};
 next_state(S, RC, {_, _, next_col, _}) ->
     S#s{rc = RC,
         current_counter = S#s.current_counter + 1};
@@ -414,6 +442,14 @@ next_col(RC) ->
     {ok, RC1} = relcast:command(next_col, RC),
     RC1.
 
+seq_message(RC, Seq) ->
+    Msg = term_to_binary({seq, Seq}),
+    {ok, RC1} = relcast:deliver(Msg, 1, RC),
+    {#state{seq=MySeq}, RC2} = relcast:command(state, RC1),
+    {_Ms, InboundQueue, _OutboundQueue} = relcast:status(RC2),
+    {RC2, MySeq, InboundQueue}.
+
+
 cleanup(#s{rc=undefined}) ->
     true;
 cleanup(#s{rc=RC, dir=Dir, running=Running}) ->
@@ -489,12 +525,18 @@ restore(_A, #state{} = B) ->
     {ok, B}.
 
 handle_message(Msg, _From, #state{current_counter = CC,
-                                  counters = Counters} = State) ->
+                                  counters = Counters, seq=MySeq} = State) ->
     case catch binary_to_term(Msg) of
         {add, Col, _Val} when Col > CC ->
             defer;
         {add, Col, Val} ->
             {State#state{counters = inc_counters(Col, Val, Counters)}, []};
+        {seq, Seq} when Seq =< MySeq ->
+            ignore;
+        {seq, Seq} when Seq == (MySeq + 1) ->
+            {State#state{seq=Seq}, []};
+        {seq, _Seq} ->
+            defer;
         %% multicast crap also ends up here, which will feed us garbage
         _ ->
             ignore
@@ -565,3 +607,10 @@ comp_ctrs(Model, State, Column) ->
         Else ->
             Else
     end.
+
+seq_value([H|T], Acc) when H =< Acc ->
+    seq_value(T, Acc);
+seq_value([H|T], Acc) when H == Acc + 1 ->
+    seq_value(T, H);
+seq_value(_, Acc) ->
+    Acc.
