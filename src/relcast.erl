@@ -244,8 +244,8 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                               not_found ->
                                   ModuleState0
                           end,
-            LastKeyIn = get_last_key(DB, InboundCF),
-            LastKeyOut = get_last_key(DB, ActiveCF),
+            LastKeyIn = get_last_key_in(DB, InboundCF),
+            LastKeyOut = get_last_key_out(DB, ActiveCF),
             BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
             State = #state{module=Module, id=ActorID,
                            inbound_cf = InboundCF,
@@ -257,6 +257,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                            in_key_count=LastKeyIn+1,
                            epoch=Epoch,
                            bitfieldsize=BitFieldSize},
+            %io:format("in ~p out ~p~n", [LastKeyIn, LastKeyIn]),
             {ok, Iter} = rocksdb:iterator(State#state.db, InboundCF, [{iterate_upper_bound, max_inbound_key()}]),
             Defers = build_defer_list(rocksdb:iterator_move(Iter, {seek, min_inbound_key()}), Iter, InboundCF, #{}),
             %% try to deliver any old queued inbound messages
@@ -332,6 +333,7 @@ deliver(Message, FromActorID, State = #state{in_key_count=KeyCount, db=DB, defer
                      case DefersForThisActor of
                          N when length(N) < MaxDefers ->
                              Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
+                             %io:format("made key ~p for ~p~n", [Key, binary_to_term(Message)]),
                              ok = rocksdb:batch_put(Batch, State#state.inbound_cf, Key, <<FromActorID:16/integer, Message/binary>>),
                              {ok, State#state{in_key_count=KeyCount+1, defers=maps:put(FromActorID, [Key|N], Defers)}};
                          _ ->
@@ -636,6 +638,7 @@ handle_message(Key, CF, FromActorID, Message, Batch, State = #state{module=Modul
         ignore ->
             case Key /= undefined of
                 true ->
+                    %io:format("delete ~p~n", [Key]),
                     ok = rocksdb:batch_delete(Batch, CF, Key);
                 false ->
                     ok
@@ -644,9 +647,10 @@ handle_message(Key, CF, FromActorID, Message, Batch, State = #state{module=Modul
         defer ->
             defer;
         {NewModuleState, Actions} ->
-            %% write new output messages, update the state and (if present) delete the message atomically
+            %% write new outbound messages, update the state and (if present) delete the message atomically
             case Key /= undefined of
                 true ->
+                    %io:format("delete ~p~n", [Key]),
                     ok = rocksdb:batch_delete(Batch, CF, Key);
                 false ->
                     ok
@@ -673,7 +677,7 @@ handle_actions([new_epoch|Tail], Batch, State) ->
                 ok = rocksdb:drop_column_family(State#state.prev_cf),
                 ok = rocksdb:destroy_column_family(State#state.prev_cf),
                 maps:map(fun(_, V) ->
-                                 lists:keydelete(State#state.prev_cf, 2, V)
+                                 lists:filter(fun({_, CF, _, _}) -> CF /= State#state.prev_cf end, V)
                          end, State#state.pending_acks)
         end,
     %% when we're done handling actions, we will write the module state (and all subsequent outbound
@@ -768,37 +772,44 @@ round_to_nearest_byte(Bits) ->
     end.
 
 %% get the maximum key ID used
-get_last_key(DB, CF) ->
+get_last_key_in(DB, CF) ->
     {ok, InIter} = rocksdb:iterator(DB, CF, [{iterate_lower_bound, min_inbound_key()}]),
     %% XXX iterate_upper_bound doesn't work, so we can't use it.
     %% instead we seek to the last possible key, and if that is not present,
     %% seek to the previous key
-    MaxInbound = case rocksdb:iterator_move(InIter, max_inbound_key()) of
+    MaxInbound = case rocksdb:iterator_move(InIter, last) of
         {ok, <<"i", InNum:10/binary>>, _} ->
-            list_to_integer(binary_to_list(InNum));
-        _ ->
+        %%io:format("found~n"),
+        list_to_integer(binary_to_list(InNum));
+        _E1 ->
             case rocksdb:iterator_move(InIter, prev) of
                 {ok, <<"i", InNum:10/binary>>, _} ->
+                    %io:format("seekback~n"),
                     list_to_integer(binary_to_list(InNum));
-                _ ->
+                _E2 ->
+                    %io:format("default ~p ~p ~p ~n", [InIter, _E1, _E2]),
                     0
             end
     end,
     rocksdb:iterator_close(InIter),
+    MaxInbound.
+
+get_last_key_out(DB, CF) ->
     {ok, OutIter} = rocksdb:iterator(DB, CF, [{iterate_lower_bound, min_outbound_key()}]),
-    MaxOutbound = case rocksdb:iterator_move(OutIter, max_outbound_key()) of
+    MaxOutbound = case rocksdb:iterator_move(OutIter, last) of
         {ok, <<"o", OutNum:10/binary>>, _} ->
             list_to_integer(binary_to_list(OutNum));
-        _ ->
+        _E1 ->
             case rocksdb:iterator_move(OutIter, prev) of
                 {ok, <<"o", OutNum:10/binary>>, _} ->
                     list_to_integer(binary_to_list(OutNum));
-                _ ->
+                _E2 ->
+                    %io:format("default ~p ~p ~p ~n", [OutIter, _E1, _E2]),
                     0
             end
     end,
     rocksdb:iterator_close(OutIter),
-    max(MaxInbound, MaxOutbound).
+    MaxOutbound.
 
 %% iterate the outbound messages until we find one for this ActorID
 find_next_outbound(ActorID, CF, StartKey, State) ->
