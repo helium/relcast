@@ -461,7 +461,7 @@ ack_all(RC, Actor, States, InFlight) ->
                     RC1 = RC;
                 true ->
                     {Seq, _Epoch, _Msg} = lists:last(OurInFlight),
-                    {ok, RC1} = relcast:ack(Actor, Seq, RC)
+                    {ok, RC1} = relcast:multi_ack(Actor, Seq, RC)
             end
     end,
     RC1.
