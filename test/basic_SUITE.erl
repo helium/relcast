@@ -346,24 +346,37 @@ pipeline(_Config) ->
                     end,
                     {ok, RC1},
                     [N || N <- lists:seq(1, 30)]),
-    {ok, Ref, <<"hello - 20">>, RC3} =
+    {ok, Ref1, <<"hello - 18">>, RC3} =
         lists:foldl(fun(_Idx, {ok, _R, _Msg, Acc}) ->
                             relcast:take(2, Acc)
                     end,
                     {ok, ign, ign, RC2},
-                    [N || N <- lists:seq(1, 20)]),
-    {pipeline_full, _RC3} = relcast:take(2, RC3),
+                    [N || N <- lists:seq(1, 18)]),
+    {ok, Ref2, <<"hello - 19">>, RC4} = relcast:take(2, RC3),
+    {ok, Ref3, <<"hello - 20">>, RC5} = relcast:take(2, RC4),
+    {pipeline_full, _RC4} = relcast:take(2, RC5),
+    20 = relcast:in_flight(2, RC5),
+    %% singly ack the second-to-last message first
+    {ok, RC6} = relcast:ack(2, Ref2, RC5),
+    19 = relcast:in_flight(2, RC6),
     %% test multi-ack
-    {ok, RC4} = relcast:ack(2, Ref, RC3),
+    {ok, RC7} = relcast:multi_ack(2, Ref1, RC6),
+    1 = relcast:in_flight(2, RC7),
+    %% ack the last message singly
+    {ok, RC8} = relcast:ack(2, Ref3, RC7),
+    0 = relcast:in_flight(2, RC8),
     %% test single acks
-    RC5 =
+    RC9 =
         lists:foldl(fun(Idx, Acc) ->
                             Msg = <<"hello - ", (integer_to_binary(Idx))/binary>>,
+                            0 = relcast:in_flight(2, Acc),
                             {ok, R, Msg, Acc1} = relcast:take(2, Acc),
-                            {ok, Acc2} = relcast:ack(R, 2, Acc1),
+                            1 = relcast:in_flight(2, Acc1),
+                            {ok, Acc2} = relcast:ack(2, R, Acc1),
+                            0 = relcast:in_flight(2, Acc2),
                             Acc2
                     end,
-                    RC4,
+                    RC8,
                     [N || N <- lists:seq(21, 30)]),
-    {not_found, _} = relcast:take(2, RC5),
+    {not_found, _} = relcast:take(2, RC9),
     ok.

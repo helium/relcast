@@ -157,7 +157,7 @@
          reset_actor/2,
          in_flight/2,
          peek/2,
-         ack/3,
+         ack/3, multi_ack/3,
          stop/2,
          status/1
         ]).
@@ -487,49 +487,68 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
             end
     end.
 
+ack(FromActorID, Seq, State) ->
+    ack(FromActorID, Seq, false, State).
+
+multi_ack(FromActorID, Seq, State) ->
+    ack(FromActorID, Seq, true, State).
+
 %% @doc Indicate to relcast that `FromActorID' has acknowledged receipt of the
 %% message associated with `Seq'.
--spec ack(pos_integer(), non_neg_integer(), relcast_state()) -> {ok, relcast_state()}.
-ack(FromActorID, Seq, State = #state{db = DB}) ->
+-spec ack(pos_integer(), non_neg_integer(), boolean(), relcast_state()) -> {ok, relcast_state()}.
+ack(FromActorID, Seq, MultiAck, State = #state{db = DB}) ->
     case maps:get(FromActorID, State#state.pending_acks, []) of
         [] ->
             {ok, State};
         Pends ->
             case lists:keyfind(Seq, 1, Pends) of
-                {Seq, CF, AKey, _Multicast} when CF == State#state.active_cf;
+                {Seq, CF, AKey, Multicast} when CF == State#state.active_cf;
                                                  CF == State#state.prev_cf ->
-                    %% in the case that we get an ack that is not the first, we
-                    %% ack everything up to the acked message.  keyfind is fast
-                    %% but sadly doesn't return the index, so we get this fold:
-                    {_, NewPends0} =
-                        lists:foldl(
-                          %% this clause iterates through the list until it
-                          %% finds the entry with Seq, deleting as it goes.
-                          fun({R, Fam, Key, MCast}, false) ->
-                                  case MCast of
-                                      false ->
-                                          %% unicast message, fine to delete now
-                                          rocksdb:delete(DB, Fam, Key, []);
-                                      true ->
-                                          %% flip the bit, we can delete it next time we iterate
-                                          flip_actor_bit(FromActorID, DB, Fam, Key)
-                                  end,
-                                  case R of
-                                      Seq ->
-                                          %% when we find it we switch over to
-                                          %% clause #2
-                                          {true, []};
-                                      _ ->
-                                          false
-                                  end;
-                             %% once we're here just accumulate the leftovers
-                             (Elt, {true, Acc}) ->
-                                  {true, [Elt | Acc]}
-                          end,
-                          false,
-                          Pends),
-                    %% then reverse them since we've changed the order.
-                    NewPends = lists:reverse(NewPends0),
+                    NewPends = case MultiAck of
+                                   true ->
+                                       %% in the case that we get an ack that is not the first, we
+                                       %% ack everything up to the acked message.  keyfind is fast
+                                       %% but sadly doesn't return the index, so we get this fold:
+                                       {_, NewPends0} =
+                                       lists:foldl(
+                                         %% this clause iterates through the list until it
+                                         %% finds the entry with Seq, deleting as it goes.
+                                         fun({R, Fam, Key, MCast}, false) ->
+                                                 case MCast of
+                                                     false ->
+                                                         %% unicast message, fine to delete now
+                                                         rocksdb:delete(DB, Fam, Key, []);
+                                                     true ->
+                                                         %% flip the bit, we can delete it next time we iterate
+                                                         flip_actor_bit(FromActorID, DB, Fam, Key)
+                                                 end,
+                                                 case R of
+                                                     Seq ->
+                                                         %% when we find it we switch over to
+                                                         %% clause #2
+                                                         {true, []};
+                                                     _ ->
+                                                         false
+                                                 end;
+                                            %% once we're here just accumulate the leftovers
+                                            (Elt, {true, Acc}) ->
+                                                 {true, [Elt | Acc]}
+                                         end,
+                                         false,
+                                         Pends),
+                                       %% then reverse them since we've changed the order.
+                                       lists:reverse(NewPends0);
+                                   false ->
+                                       case Multicast of
+                                           false ->
+                                               %% unicast message, fine to delete now
+                                               rocksdb:delete(DB, CF, AKey, []);
+                                           true ->
+                                               %% flip the bit, we can delete it next time we iterate
+                                               flip_actor_bit(FromActorID, DB, CF, AKey)
+                                       end,
+                                       lists:keydelete(Seq, 1, Pends)
+                               end,
                     NewPending = (State#state.pending_acks)#{FromActorID => NewPends},
                     {ok, State#state{pending_acks=NewPending, last_sent = maps:put(FromActorID, {CF, AKey}, State#state.last_sent)}};
                 _ ->
