@@ -18,7 +18,6 @@
          epochs_gc/1,
          callback_message/1,
          self_callback_message/1,
-         epoch_no_state/1,
          pipeline/1
         ]).
 
@@ -32,7 +31,6 @@ all() ->
      epochs_gc,
      callback_message,
      self_callback_message,
-     %epoch_no_state,
      pipeline
     ].
 
@@ -289,35 +287,6 @@ self_callback_message(_Config) ->
     {not_found, RC1_8} = relcast:take(3, RC1_7),
     {true, _} = relcast:command(was_saluted, RC1_8),
     relcast:stop(normal, RC1_8),
-    ok.
-
-epoch_no_state(_Config) ->
-    Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data10"}]),
-    %% try to put an entry in the seq map, it will be deferred because the
-    %% relcast is in round 0
-    {ok, RC1_1a} = relcast:deliver(<<"hello">>, 2, RC1),
-    {ok, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1_1a),
-    {0, _} = relcast:command(round, RC1_2),
-    relcast:stop(normal, RC1_2),
-    {ok, CFs} = rocksdb:list_column_families("data10", []),
-    ["default","Inbound",  "epoch0000000000"] = CFs,
-    {ok, DB, _} = rocksdb:open_with_cf("data10", [{create_if_missing, true}],
-                                       [{"default", []},
-                                        {"Inbound", []},
-                                        {"epoch0000000000", []}]),
-    {ok, Epoch1} = rocksdb:create_column_family(DB, "epoch0000000001", []),
-    not_found = rocksdb:get(DB, Epoch1, <<"stored_module_state">>, []),
-    rocksdb:close(DB),
-    {ok, RC2} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data10"}]),
-    relcast:stop(normal, RC2),
-    {ok, CFs2} = rocksdb:list_column_families("data10", []),
-    ["default", "Inbound", "epoch0000000001"] = CFs2,
-    {ok, DB2, [_, _, CF1]} = rocksdb:open_with_cf("data10", [{create_if_missing, true}],
-                                       [{"default", []},
-                                        {"Inbound", []},
-                                        {"epoch0000000001", []}]),
-    {ok, _Result} = rocksdb:get(DB2, CF1, <<"stored_module_state">>, []),
     ok.
 
 pipeline(_Config) ->
