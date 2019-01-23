@@ -461,6 +461,7 @@ multi_ack(FromActorID, Seq, State) ->
 %% message associated with `Seq'.
 -spec ack(pos_integer(), non_neg_integer(), boolean(), relcast_state()) -> {ok, relcast_state()}.
 ack(FromActorID, Seq, MultiAck, State = #state{db = DB}) ->
+    io:format("ack ~p ~p", [FromActorID, Seq]),
     case maps:get(FromActorID, State#state.pending_acks, []) of
         [] ->
             {ok, State};
@@ -923,6 +924,7 @@ flip_actor_bit(ActorID, DB, CF, Key) ->
 flip_actor_bit(ActorID, DBorBatch, CF, Key, Batch) ->
     ActorIDStr = ["-", integer_to_list(ActorID+1)],
     %% this can crash for odd reasons, but we don't care
+    io:format("flipping ~p ~p ~p", [Key, Batch, ActorIDStr]),
     case Batch of
         false ->
             catch rocksdb:merge(DBorBatch, CF, Key, list_to_binary(ActorIDStr), []);
