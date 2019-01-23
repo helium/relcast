@@ -139,9 +139,11 @@ postcondition(S, {call, _, take, [_, Actor]}, R) ->
         {Expected, _RC} ->
             true;
         {ok, _Seq, Unexpected, _RC} ->
-            {unexpected_take1, Actor, Expected, Unexpected, S#s.messages, S#s.inflight};
+            {unexpected_take1, Actor, {exp, Expected}, {got, Unexpected},
+             S#s.messages, S#s.inflight};
         {Unexpected, _RC} ->
-            {unexpected_take2, Actor, Expected, Unexpected, S#s.messages, S#s.inflight}
+            {unexpected_take2, Actor, {exp, Expected}, {got, Unexpected},
+             S#s.messages, S#s.inflight}
     end;
 postcondition(S, {call, _, peek, [_, Actor]}, R) ->
     MsgInFlight = length(maps:get(Actor, S#s.inflight, [])) + 1,
