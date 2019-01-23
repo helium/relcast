@@ -337,7 +337,7 @@ filter_old_states(States, Msgs, Epoch) ->
     maps:map(fun(Actor, State = #act{sent=Sent, acked=Acked}) ->
                      %% first figure out how many old messages there are for this actor
                     OldMsgCount = maps:fold(fun({A, _}, {MEpoch, _}, Acc) when Actor == A ->
-                                                     case MEpoch < Epoch - 1 of
+                                                     case MEpoch /= Epoch of
                                                          true ->
                                                              Acc + 1;
                                                          false ->
@@ -352,7 +352,7 @@ filter_old_states(States, Msgs, Epoch) ->
 
 filter_old_inflight(InFlight, Epoch) ->
     maps:map(fun(_, V) ->
-                     lists:filter(fun({_Seq, E, _Msg}) -> E > Epoch - 2 end, V)
+                     lists:filter(fun({_Seq, E, _Msg}) -> E == Epoch end, V)
              end, InFlight).
 
 reset_inf(Actor, Inf) ->
@@ -372,6 +372,8 @@ extract_inf({ok, Seq, Msg, _RC}, Actor, Inf, Msgs, States) ->
     {Epoch, _Msg} = maps:get({Actor, length(Q)+Acked + 1}, Msgs),
     Inf#{Actor => Q ++ [{Seq, Epoch, Msg}]}.
 
+update_counters({_, full}, Cols) ->
+    Cols;
 update_counters({_RC, Msg}, Cols0) ->
     {add, Col, Val} = binary_to_term(Msg),
     inc_counters(Col, Val, Cols0).
@@ -472,8 +474,12 @@ reset(RC, Actor) ->
 
 message(RC, FromActor, Col, Val) ->
     Msg = term_to_binary({add, Col, Val}),
-    {ok, RC1} = relcast:deliver(Msg, FromActor, RC),
-    {RC1, Msg}.
+    case relcast:deliver(Msg, FromActor, RC) of
+        {ok, RC1} ->
+            {RC1, Msg};
+        full ->
+            {RC, full}
+    end.
 
 next_col(RC) ->
     {ok, RC1} = relcast:command(next_col, RC),
