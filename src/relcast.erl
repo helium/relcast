@@ -465,6 +465,7 @@ ack(FromActorID, Seq, MultiAck, State = #state{db = DB}) ->
         [] ->
             {ok, State};
         Pends ->
+            {ok, Batch} = rocksdb:batch(),
             case lists:keyfind(Seq, 1, Pends) of
                 {Seq, CF, AKey, Multicast} when CF == State#state.active_cf ->
                     NewPends = case MultiAck of
@@ -480,10 +481,10 @@ ack(FromActorID, Seq, MultiAck, State = #state{db = DB}) ->
                                                  case MCast of
                                                      false ->
                                                          %% unicast message, fine to delete now
-                                                         rocksdb:delete(DB, Fam, Key, []);
+                                                         ok = rocksdb:batch_delete(Batch, Fam, Key);
                                                      true ->
                                                          %% flip the bit, we can delete it next time we iterate
-                                                         flip_actor_bit(FromActorID, DB, Fam, Key)
+                                                         flip_actor_bit(FromActorID, Batch, Fam, Key, true)
                                                  end,
                                                  case R of
                                                      Seq ->
@@ -505,13 +506,15 @@ ack(FromActorID, Seq, MultiAck, State = #state{db = DB}) ->
                                        case Multicast of
                                            false ->
                                                %% unicast message, fine to delete now
-                                               rocksdb:delete(DB, CF, AKey, []);
+                                               ok = rocksdb:batch_delete(Batch, CF, AKey);
                                            true ->
                                                %% flip the bit, we can delete it next time we iterate
-                                               flip_actor_bit(FromActorID, DB, CF, AKey)
+                                               flip_actor_bit(FromActorID, Batch, CF, AKey, true)
                                        end,
                                        lists:keydelete(Seq, 1, Pends)
                                end,
+                    %% we don't need to do this sync, it's OK if we lose acks
+                    ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
                     NewPending = (State#state.pending_acks)#{FromActorID => NewPends},
                     {ok, State#state{pending_acks=NewPending, last_sent = maps:put(FromActorID, {CF, AKey}, State#state.last_sent)}};
                 _ ->
@@ -915,9 +918,17 @@ actor_list(<<0:1/integer, Tail/bits>>, I, List) ->
     actor_list(Tail, I+1, List).
 
 flip_actor_bit(ActorID, DB, CF, Key) ->
+    flip_actor_bit(ActorID, DB, CF, Key, false).
+
+flip_actor_bit(ActorID, DBorBatch, CF, Key, Batch) ->
     ActorIDStr = ["-", integer_to_list(ActorID+1)],
     %% this can crash for odd reasons, but we don't care
-    catch rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), []).
+    case Batch of
+        false ->
+            catch rocksdb:merge(DBorBatch, CF, Key, list_to_binary(ActorIDStr), []);
+        true ->
+            catch rocksdb:batch_merge(DBorBatch, CF, Key, list_to_binary(ActorIDStr))
+    end.
 
 %% generates a partitioned sequence number with the actor ID in the high bits
 %% rollover happens naturally because once the sequence number uses more than 32-PrefixLen
