@@ -65,11 +65,9 @@
 %%  Epochs
 %%  Relcast has the notion of epochs for protocols that have the property of "if
 %%  one honest node can complete the round, all nodes can". When appropriate,
-%%  the module can return the 'new_epoch' which moves the current epoch to the
-%%  previous epoch and destroys the old previous epoch, if any. This means only
-%%  the last two epochs need to be kept. Messages older than that are, by
-%%  definition, not necessary for the protocol to continue advancing and are
-%%  discarded.
+%%  the module can return the 'new_epoch' which deletes all queued outbound messages.
+%%  Messages older than that are, by definition, not necessary for the protocol to
+%%  continue advancing and can be discarded.
 %%
 %%  To do this, relcast uses rocksdb's column families feature. On initial
 %%  startup it creates the column family "epoch0000000000". Each 'new_epoch'
@@ -128,19 +126,9 @@
           epoch = 0 :: non_neg_integer(),
           bitfieldsize :: pos_integer(),
           inbound_cf :: rocksdb:cf_handle(),
-          prev_cf :: undefined | rocksdb:cf_handle(),
           active_cf :: rocksdb:cf_handle(),
           defers = #{} :: #{pos_integer() => [binary()]},
           seq_map = #{} :: #{pos_integer() => pos_integer()}
-         }).
-
--record(iterator, {
-          db :: rocksdb:db_handle(),
-          iterator :: rocksdb:itr_handle(),
-          args :: list(),
-          cf :: rocksdb:cf_handle(),
-          next_cf :: undefined | rocksdb:cf_handle(),
-          message_type :: inbound | outbound | both
          }).
 
 -type relcast_state() :: #state{}.
@@ -196,30 +184,20 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                         end,
     %% check if we have some to prune
     %% delete all but the two newest *contiguous* column families
-    {Epoch, PrevCF, ActiveCF} = case lists:reverse(ColumnFamilies -- ["Inbound"]) of
+    {Epoch, ActiveCF} = case lists:reverse(ColumnFamilies -- ["Inbound"]) of
                              [] ->
                                  %% no column families, create epoch 0
                                  {ok, FirstCF} = rocksdb:create_column_family(DB, make_column_family_name(0), DBOptions),
-                                 {0, undefined, FirstCF};
+                                 {0, FirstCF};
                              [JustOne] ->
                                  %% only a single column family, no need to prune
-                                 {cf_to_epoch(JustOne), undefined, hd(CFHs)};
-                             [Last, SecondToLast|_Tail] ->
-                                 %% check if the last two are contiguous
-                                 case cf_to_epoch(Last) - cf_to_epoch(SecondToLast) == 1 of
-                                     true ->
-                                         %% the last two are contiguous, delete all but those
-                                         CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 2),
-                                         [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
-                                         [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
-                                         list_to_tuple([cf_to_epoch(Last)|lists:sublist(CFHs, length(CFHs) + 1 - 2, 2)]);
-                                     false ->
-                                         %% the last two are non contiguous, gotta prune all but the last one
-                                         CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 1),
-                                         [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
-                                         [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
-                                         {cf_to_epoch(Last), undefined, hd(lists:sublist(CFHs, length(CFHs) + 1 - 1, 1))}
-                                 end
+                                 {cf_to_epoch(JustOne), hd(CFHs)};
+                             [Last | _Tail] ->
+                                %% Prune all but the latest epoch
+                                CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 1),
+                                [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
+                                [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
+                                {cf_to_epoch(Last), hd(lists:sublist(CFHs, length(CFHs) + 1 - 1, 1))}
                          end,
     case Module:init(Arguments) of
         {ok, ModuleState0} ->
@@ -228,19 +206,6 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                   OldModuleState = Module:deserialize(SerializedModuleState),
                                   {ok, RestoredModuleState} = Module:restore(OldModuleState, ModuleState0),
                                   RestoredModuleState;
-                              not_found when PrevCF /= undefined ->
-                                  %% there might be a chance we crashed between creating the next column family
-                                  %% and writing the module state into it, so we check for this:
-                                  case rocksdb:get(DB, PrevCF, <<"stored_module_state">>, []) of
-                                      {ok, SerializedModuleState} ->
-                                          OldModuleState = Module:deserialize(SerializedModuleState),
-                                          {ok, RestoredModuleState} = Module:restore(OldModuleState, ModuleState0),
-                                          %% write the module state to the new epoch so it's here the next time
-                                          ok = rocksdb:put(DB, ActiveCF, <<"stored_module_state">>, Module:serialize(RestoredModuleState), [{sync, true}]),
-                                          RestoredModuleState;
-                                      not_found ->
-                                          ModuleState0
-                                  end;
                               not_found ->
                                   ModuleState0
                           end,
@@ -249,7 +214,6 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
             BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
             State = #state{module=Module, id=ActorID,
                            inbound_cf = InboundCF,
-                           prev_cf = PrevCF,
                            active_cf = ActiveCF,
                            ids=ActorIDs,
                            modulestate=ModuleState, db=DB,
@@ -372,7 +336,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
             {pipeline_full, State};
         Pends when Pends /= [] ->
             case lists:last(Pends) of
-                {_Seq, CF, Key, _Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
+                {_Seq, CF, Key, _Multicast} when CF == State#state.active_cf ->
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, Key, State, false) of
                         {not_found, LastKey, CF2} ->
@@ -392,18 +356,18 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
             end;
         _ ->
             %% default to the "first" key"
-            case maps:get(ForActorID, State#state.last_sent, {prev_cf(State), min_outbound_key()}) of
+            case maps:get(ForActorID, State#state.last_sent, {State#state.active_cf, min_outbound_key()}) of
                 none ->
                     %% we *know* there's nothing pending for this actor
                     {not_found, State};
                 {CF0, StartKey0} ->
                     %% check if the column family is still valid
-                    {CF, StartKey} = case CF0 == State#state.active_cf orelse CF0 == State#state.prev_cf of
+                    {CF, StartKey} = case CF0 == State#state.active_cf of
                                          true ->
                                              {CF0, StartKey0};
                                          false ->
                                              %% reset the start key as well
-                                             {State#state.prev_cf, min_outbound_key()}
+                                             {State#state.active_cf, min_outbound_key()}
                                      end,
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
@@ -428,7 +392,7 @@ reset_actor(ForActorID, State = #state{pending_acks = Pending, last_sent = LastS
 in_flight(ForActorID, State = #state{pending_acks = Pending}) ->
     P = maps:get(ForActorID, Pending, []),
     Active = lists:filter(fun ({_Ref, CF, _Key, _Multicast}) ->
-                                  CF == State#state.active_cf orelse CF == State#state.prev_cf
+                                  CF == State#state.active_cf
                           end, P),
     length(Active).
 
@@ -444,7 +408,7 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
     case maps:get(ForActorID, Pending, []) of
         Pends when Pends /= [] ->
             case lists:last(Pends) of
-                {_Ref, CF, Key, _Multicast} when CF == State#state.active_cf; CF == State#state.prev_cf ->
+                {_Ref, CF, Key, _Multicast} when CF == State#state.active_cf ->
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, Key, State, false) of
                         {not_found, _LastKey, _CF2} ->
@@ -462,18 +426,18 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
             end;
         _ ->
             %% default to the "first" key"
-            case maps:get(ForActorID, State#state.last_sent, {prev_cf(State), min_outbound_key()}) of
+            case maps:get(ForActorID, State#state.last_sent, {State#state.active_cf, min_outbound_key()}) of
                 none ->
                     %% we *know* there's nothing pending for this actor
                     not_found;
                 {CF0, StartKey0} ->
                     %% check if the column family is still valid
-                    {CF, StartKey} = case CF0 == State#state.active_cf orelse CF0 == State#state.prev_cf of
+                    {CF, StartKey} = case CF0 == State#state.active_cf of
                                          true ->
                                              {CF0, StartKey0};
                                          false ->
                                              %% reset the start key as well
-                                             {State#state.prev_cf, min_outbound_key()}
+                                             {State#state.active_cf, min_outbound_key()}
                                      end,
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
@@ -502,8 +466,7 @@ ack(FromActorID, Seq, MultiAck, State = #state{db = DB}) ->
             {ok, State};
         Pends ->
             case lists:keyfind(Seq, 1, Pends) of
-                {Seq, CF, AKey, Multicast} when CF == State#state.active_cf;
-                                                 CF == State#state.prev_cf ->
+                {Seq, CF, AKey, Multicast} when CF == State#state.active_cf ->
                     NewPends = case MultiAck of
                                    true ->
                                        %% in the case that we get an ack that is not the first, we
@@ -574,8 +537,8 @@ stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
 %% outbound queue.
 -spec status(relcast_state()) -> status().
 status(State = #state{modulestate=ModuleState}) ->
-    {ok, Iter} = cf_iterator(State, prev_cf(State), outbound, [{iterate_upper_bound, max_outbound_key()}]),
-    OutboundQueue = build_outbound_status(cf_iterator_move(Iter, {seek, min_outbound_key()}), Iter, State#state.bitfieldsize, #{}),
+    {ok, Iter} = rocksdb:iterator(State#state.db, State#state.active_cf, [{iterate_upper_bound, max_outbound_key()}]),
+    OutboundQueue = build_outbound_status(rocksdb:iterator_move(Iter, {seek, min_outbound_key()}), Iter, State#state.bitfieldsize, #{}),
     {ok, InIter} = rocksdb:iterator(State#state.db, State#state.inbound_cf, [{iterate_upper_bound, max_inbound_key()}]),
     InboundQueue = build_inbound_status(rocksdb:iterator_move(InIter, {seek, min_inbound_key()}), InIter, []),
     {ModuleState, InboundQueue, OutboundQueue}.
@@ -685,20 +648,12 @@ handle_actions([], _Batch, State) ->
     {ok, State};
 handle_actions([new_epoch|Tail], Batch, State) ->
     {ok, NewCF} = rocksdb:create_column_family(State#state.db, make_column_family_name(State#state.epoch + 1), db_options(length(State#state.ids))),
-    Pends =
-        case State#state.prev_cf of
-            undefined -> State#state.pending_acks;
-            _ ->
-                ok = rocksdb:drop_column_family(State#state.prev_cf),
-                ok = rocksdb:destroy_column_family(State#state.prev_cf),
-                maps:map(fun(_, V) ->
-                                 lists:filter(fun({_, CF, _, _}) -> CF /= State#state.prev_cf end, V)
-                         end, State#state.pending_acks)
-        end,
+    ok = rocksdb:drop_column_family(State#state.active_cf),
+    ok = rocksdb:destroy_column_family(State#state.active_cf),
     %% when we're done handling actions, we will write the module state (and all subsequent outbound
     %% messages from this point on) into the active CF, which is this new one now
-    handle_actions(Tail, Batch, State#state{out_key_count=0, active_cf=NewCF, prev_cf=State#state.active_cf,
-                                            epoch=State#state.epoch + 1, pending_acks=Pends});
+    handle_actions(Tail, Batch, State#state{out_key_count=0, active_cf=NewCF,
+                                            epoch=State#state.epoch + 1, pending_acks=#{}});
 handle_actions([{multicast, Message}|Tail], Batch, State =
                #state{out_key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
@@ -826,38 +781,37 @@ find_next_outbound(ActorID, CF, StartKey, State) ->
     find_next_outbound(ActorID, CF, StartKey, State, true).
 
 find_next_outbound(ActorID, CF, StartKey, State, AcceptStart) ->
-    {ok, Iter} = cf_iterator(State, CF, outbound, [{iterate_upper_bound, max_outbound_key()}]),
+    {ok, Iter} = rocksdb:iterator(State#state.db, CF, [{iterate_upper_bound, max_outbound_key()}]),
     Res =
         case AcceptStart of
             true ->
-                cf_iterator_move(Iter, StartKey);
+                rocksdb:iterator_move(Iter, StartKey);
             false ->
                 %% on the paths where this is called, we're calling this with a
                 %% known to be existing start key, so we need to move the
                 %% iterator past it initially so we don't get it back
-                cf_iterator_move(Iter, StartKey),
-                cf_iterator_move(Iter, next)
+                rocksdb:iterator_move(Iter, StartKey),
+                rocksdb:iterator_move(Iter, next)
         end,
     find_next_outbound_(ActorID, Res, Iter, State).
 
-find_next_outbound_(_ActorId, {error, _}, Iter, _State) ->
+find_next_outbound_(_ActorId, {error, _}, Iter, State) ->
     %% try to return the *highest* key we saw, so we can try starting here next time
-    Res = case cf_iterator_move(Iter, prev) of
+    Res = case rocksdb:iterator_move(Iter, prev) of
         {ok, Key, _} ->
-            {not_found, Key, cf_iterator_id(Iter)};
+            {not_found, Key, State#state.active_cf};
         _ ->
             not_found
     end,
-    cf_iterator_close(Iter),
+    rocksdb:iterator_close(Iter),
     Res;
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, _State) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, State) ->
     %% unicast message for this actor
-    CF = cf_iterator_id(Iter),
-    cf_iterator_close(Iter),
-    {Key, CF, Value, false};
+    rocksdb:iterator_close(Iter),
+    {Key, State#state.active_cf, Value, false};
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:2/integer, _/bits>>}, Iter, State) ->
     %% unicast message for someone else
-    find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
+    find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, State);
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tail/bits>>}, Iter, State = #state{bitfieldsize=BitfieldSize}) when Type == 0; Type == 2 ->
     <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
     case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
@@ -866,28 +820,26 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tai
             case ActorMask == 0 of
                 true ->
                     %% everyone has gotten this message, we can delete it now
-                    ok = rocksdb:delete(State#state.db, cf_iterator_id(Iter), Key, []);
+                    ok = rocksdb:delete(State#state.db, State#state.active_cf, Key, []);
                 false ->
                     ok
             end,
-            find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
+            find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, State);
         _  when Type == 0 ->
             %% multicast message with the high bit set for this actor
-            CF = cf_iterator_id(Iter),
-            cf_iterator_close(Iter),
-            {Key, CF, Value, true};
+            rocksdb:iterator_close(Iter),
+            {Key, State#state.active_cf, Value, true};
         _  when Type == 2 ->
             %% callback message with the high bit set for this actor
-            CF = cf_iterator_id(Iter),
             Module = State#state.module,
             case Module:callback_message(ActorID, Value, State#state.modulestate) of
                 none ->
                     %% nothing for this actor
-                    flip_actor_bit(ActorID, State#state.db, CF, Key),
-                    find_next_outbound_(ActorID, cf_iterator_move(Iter, next), Iter, State);
+                    flip_actor_bit(ActorID, State#state.db, State#state.active_cf, Key),
+                    find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, State);
                 Message ->
-                    cf_iterator_close(Iter),
-                    {Key, CF, Message, true}
+                    rocksdb:iterator_close(Iter),
+                    {Key, State#state.active_cf, Message, true}
             end
 
     end.
@@ -916,26 +868,18 @@ make_column_family_name(EpochCount) ->
 cf_to_epoch([$e, $p, $o, $c, $h|EpochString]) ->
     list_to_integer(EpochString).
 
-prev_cf(State) ->
-    case State#state.prev_cf of
-        undefined ->
-            State#state.active_cf;
-        CF ->
-            CF
-    end.
-
 build_outbound_status({error, _}, Iter, _BFS, OutboundQueue) ->
-    cf_iterator_close(Iter),
+    rocksdb:iterator_close(Iter),
     maps:map(fun(_K, V) -> lists:reverse(V) end, OutboundQueue);
 build_outbound_status({ok, <<"o", _/binary>>, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, BFS, OutboundQueue) ->
     %% unicast message
-    build_outbound_status(cf_iterator_move(Iter, next), Iter, BFS, prepend_message([ActorID], Value, OutboundQueue));
+    build_outbound_status(rocksdb:iterator_move(Iter, next), Iter, BFS, prepend_message([ActorID], Value, OutboundQueue));
 build_outbound_status({ok, <<"o", _/binary>>, <<0:2/integer, Tail/bits>>}, Iter, BFS, OutboundQueue) ->
     <<ActorMask:BFS/bits, Value/binary>> = Tail,
     ActorIDs = actor_list(ActorMask, 1, []),
-    build_outbound_status(cf_iterator_move(Iter, next), Iter, BFS, prepend_message(ActorIDs, Value, OutboundQueue));
+    build_outbound_status(rocksdb:iterator_move(Iter, next), Iter, BFS, prepend_message(ActorIDs, Value, OutboundQueue));
 build_outbound_status({ok, _Key, _Value}, Iter, BFS,  OutboundQueue) ->
-    build_outbound_status(cf_iterator_move(Iter, next), Iter, BFS, OutboundQueue).
+    build_outbound_status(rocksdb:iterator_move(Iter, next), Iter, BFS, OutboundQueue).
 
 build_inbound_status({error, _}, Iter, InboundQueue) ->
     rocksdb:iterator_close(Iter),
@@ -974,71 +918,6 @@ flip_actor_bit(ActorID, DB, CF, Key) ->
     ActorIDStr = ["-", integer_to_list(ActorID+1)],
     %% this can crash for odd reasons, but we don't care
     catch rocksdb:merge(DB, CF, Key, list_to_binary(ActorIDStr), []).
-
-
-%% wrapper around rocksdb iterators that will iterate across column families.
-%% Requirements to use this:
-%% * you only iterate forwards
-%% * you only iterate inbound/outbound messages
-%% * jumps across column families will start in the next
-%%   column family at the first key inbound/outbound key
--spec cf_iterator(relcast_state(), rocksdb:cf_handle(), inbound | outbound | both, list()) -> {ok, reference()}.
-cf_iterator(State, CF, MsgType, Args) when MsgType == outbound ->
-    Ref = make_ref(),
-    {CF, NextCF} = case {State#state.prev_cf, State#state.active_cf} of
-                       {undefined, Active} ->
-                           %% only one CF
-                           {Active, undefined};
-                       {CF, Active} ->
-                           %% we want to start on the previous CF
-                           {CF, Active};
-                       {_, CF} ->
-                           %% we want to start on the current CF
-                           {CF, undefined}
-                   end,
-    {ok, Iter} = rocksdb:iterator(State#state.db, CF, Args),
-    erlang:put(Ref, #iterator{db=State#state.db, iterator=Iter, args=Args, cf=CF, next_cf=NextCF, message_type=MsgType}),
-    {ok, Ref}.
-
--spec cf_iterator_move(reference(), next | prev | {seek, binary()} | binary()) -> {ok, Key::binary(), Value::binary()} | {ok, Key::binary()} | {error, invalid_iterator} | {error, iterator_closed}.
-cf_iterator_move(Ref, Args) ->
-    Iterator = erlang:get(Ref),
-    Type = Iterator#iterator.message_type,
-    case rocksdb:iterator_move(Iterator#iterator.iterator, Args) of
-        {ok, <<"i", _/binary>>, _Value} = Res when Type == inbound; Type == both ->
-            Res;
-        {ok, <<"o", _/binary>>, _Value} = Res when Type == outbound; Type == both ->
-            Res;
-        {error, _} = Res when Iterator#iterator.next_cf == undefined ->
-            Res;
-        {ok, _Key, _Value} when Iterator#iterator.next_cf == undefined ->
-            {error, invalid_iterator};
-        _ ->
-            %% error or out-of-range key
-            %% try the next column family
-            ok = rocksdb:iterator_close(Iterator#iterator.iterator),
-            {ok, Iter} = rocksdb:iterator(Iterator#iterator.db, Iterator#iterator.next_cf, Iterator#iterator.args),
-            erlang:put(Ref, Iterator#iterator{next_cf=undefined, cf=Iterator#iterator.next_cf, iterator=Iter}),
-            case Iterator#iterator.message_type of
-                inbound ->
-                    rocksdb:iterator_move(Iter, min_inbound_key());
-                both ->
-                    rocksdb:iterator_move(Iter, min_inbound_key());
-                outbound ->
-                    rocksdb:iterator_move(Iter, min_outbound_key())
-            end
-    end.
-
--spec cf_iterator_id(reference()) -> rocksdb:cf_handle().
-cf_iterator_id(Ref) ->
-    Iterator = erlang:get(Ref),
-    Iterator#iterator.cf.
-
--spec cf_iterator_close(reference()) -> ok.
-cf_iterator_close(Ref) ->
-    Iterator = erlang:get(Ref),
-    erlang:erase(Ref),
-    rocksdb:iterator_close(Iterator#iterator.iterator).
 
 %% generates a partitioned sequence number with the actor ID in the high bits
 %% rollover happens naturally because once the sequence number uses more than 32-PrefixLen
