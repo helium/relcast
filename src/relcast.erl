@@ -321,7 +321,7 @@ take(ID, State) ->
 %% messages were lost in flight.
 -spec take(pos_integer(), relcast_state(), boolean()) ->
                   {not_found, relcast_state()} |
-                  {pipeine_full, relcast_state()} |
+                  {pipeline_full, relcast_state()} |
                   {ok, non_neg_integer(), binary(), relcast_state()}.
 take(ForActorID, State, true) ->
     {ok, NewState} = reset_actor(ForActorID, State),
