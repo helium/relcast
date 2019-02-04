@@ -6,7 +6,8 @@
 -export([trace/1, trace/2,
          send_messages/3,
          start_test/4,
-         start_test/5]).
+         start_test/5,
+         print_message/1]).
 
 -callback init(term()) -> {ok, Settings :: settings(), InitialState :: term()}.
 -callback model(Message :: message(),
