@@ -201,7 +201,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                          end,
     case Module:init(Arguments) of
         {ok, ModuleState0} ->
-            ModuleState = case rocksdb:get(DB, ActiveCF, <<"stored_module_state">>, []) of
+            ModuleState = case rocksdb:get(DB, InboundCF, <<"stored_module_state">>, []) of
                               {ok, SerializedModuleState} ->
                                   OldModuleState = Module:deserialize(SerializedModuleState),
                                   {ok, RestoredModuleState} = Module:restore(OldModuleState, ModuleState0),
@@ -248,7 +248,7 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
             %% write new output messages & update the state atomically
             Result = case handle_actions(Actions, Batch, State#state{modulestate=NewModuleState}) of
                          {ok, NewState} ->
-                             ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
+                             ok = rocksdb:batch_put(Batch, NewState#state.inbound_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                              case handle_pending_inbound(Batch, NewState) of
                                  {ok, NewerState} ->
                                      {Reply, NewerState};
@@ -256,7 +256,7 @@ command(Message, State = #state{module=Module, modulestate=ModuleState, db=DB}) 
                                      {stop, Reply, Timeout, NewerState}
                              end;
                          {stop, Timeout, NewState} ->
-                             ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
+                             ok = rocksdb:batch_put(Batch, NewState#state.inbound_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                              {stop, Reply, Timeout, NewState}
                      end,
             ok = rocksdb:write_batch(DB, Batch, [{sync, true}]),
@@ -638,10 +638,10 @@ handle_message(Key, CF, FromActorID, Message, Batch, State = #state{module=Modul
             end,
             case handle_actions(Actions, Batch, State#state{modulestate=NewModuleState}) of
                 {ok, NewState} ->
-                    ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
+                    ok = rocksdb:batch_put(Batch, NewState#state.inbound_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     {ok, NewState};
                 {stop, Timeout, NewState} ->
-                    ok = rocksdb:batch_put(Batch, NewState#state.active_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
+                    ok = rocksdb:batch_put(Batch, NewState#state.inbound_cf, <<"stored_module_state">>, Module:serialize(NewState#state.modulestate)),
                     {stop, Timeout, NewState}
             end
     end.
