@@ -32,8 +32,8 @@ all() ->
      epochs_gc,
      callback_message,
      self_callback_message,
-     pipeline,
-     write_reduction
+     pipeline %,
+     %%write_reduction  %% this isn't really baked enough, just call manually
     ].
 
 init_per_suite(Config) ->
