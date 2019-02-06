@@ -18,7 +18,8 @@
          epochs_gc/1,
          callback_message/1,
          self_callback_message/1,
-         pipeline/1
+         pipeline/1,
+         write_reduction/1
         ]).
 
 all() ->
@@ -31,7 +32,8 @@ all() ->
      epochs_gc,
      callback_message,
      self_callback_message,
-     pipeline
+     pipeline,
+     write_reduction
     ].
 
 init_per_suite(Config) ->
@@ -333,3 +335,34 @@ pipeline(_Config) ->
                     [N || N <- lists:seq(21, 30)]),
     {not_found, _} = relcast:take(2, RC9),
     ok.
+
+write_reduction(_Config) ->
+    Actors = lists:seq(1, 3),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data12"}]),
+
+    {ok, RC2} =
+        lists:foldl(fun(Idx, {ok, Acc}) ->
+                            {ok, Acc1} = relcast:deliver(<<"unicast: hello - ",
+                                                           (integer_to_binary(Idx))/binary>>, 2, Acc),
+                            {ok, R, _Msg, Acc2} = relcast:take(2, Acc1),
+                            relcast:ack(2, R, Acc2)
+                    end,
+                    {ok, RC1},
+                    [N || N <- lists:seq(1, 10000)]),
+
+    RCF = RC2,
+    DB = element(2, RCF),
+    Stats =
+        [begin
+             {ok, S} = rocksdb:stats(DB, CF),
+             io:fwrite(standard_error, "~s~n", [S])
+         end
+         || CF <- [get_active(RCF), get_inbound(RCF)]],
+    ?assertEqual(ok, Stats),
+    ok.
+
+get_active(S) ->
+    element(13, S).
+
+get_inbound(S) ->
+    element(12, S).

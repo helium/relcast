@@ -84,11 +84,11 @@ callback_message(Actor, <<"salute">>, _State) ->
 
 
 serialize(State) ->
-    ct:pal("Serialize: ~p~n", [State]),
+    %%ct:pal("Serialize: ~p~n", [State]),
     term_to_binary(State).
 
 deserialize(Binary) ->
-    ct:pal("Deserialize: ~p~n", [Binary]),
+    %%ct:pal("Deserialize: ~p~n", [Binary]),
     binary_to_term(Binary).
 
 restore(OldState, NewState) ->
