@@ -86,7 +86,7 @@
 -callback handle_message(Message :: binary(), ActorId :: pos_integer(), State :: term()) ->
     {NewState :: term(), Actions :: actions()} | defer | ignore.
 -callback handle_command(Request :: term(), State :: term()) ->
-   {reply, Reply :: term(), Actions :: actions(), NewState :: term()} |
+   {reply, Reply :: term(), Actions :: actions(), NewState :: term() | ignore} |
    {reply, Reply :: term(), ignore}. %% when there's no changes, likely just returning information
 -callback callback_message(ActorID :: pos_integer(), Message :: binary(), State :: term()) ->
     binary() | none.
