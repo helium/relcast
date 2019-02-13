@@ -209,7 +209,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                          end,
     case Module:init(Arguments) of
         {ok, ModuleState0} ->
-            ModuleState = case rocksdb:get(DB, InboundCF, ?stored_module_state, []) of
+            ModuleState = case rocksdb:get(DB, ?stored_module_state, []) of
                               {ok, SerializedModuleState} ->
                                   OldModuleState = Module:deserialize(SerializedModuleState),
                                   {ok, RestoredModuleState} = Module:restore(OldModuleState, ModuleState0),
@@ -263,8 +263,8 @@ command(Message, State = #state{module = Module,
                 {ok, NewState} ->
                     Dirty = maybe_serialize(Module, ModuleState,
                                             NewState#state.modulestate,
-                                            Transaction, NewState#state.inbound_cf),
-                    case handle_pending_inbound(Transaction, maybe_dirty(Dirty, NewState)) of
+                                            NewState#state.transaction),
+                    case handle_pending_inbound(NewState#state.transaction, maybe_dirty(Dirty, NewState)) of
                         {ok, NewerState} ->
                             {Reply, NewerState};
                         {stop, Timeout, NewerState} ->
@@ -273,7 +273,7 @@ command(Message, State = #state{module = Module,
                 {stop, Timeout, NewState} ->
                     Dirty = maybe_serialize(Module, ModuleState,
                                             NewState#state.modulestate,
-                                            Transaction, NewState#state.inbound_cf),
+                                            NewState#state.transaction),
                     {stop, Reply, Timeout, maybe_dirty(Dirty, NewState)}
             end
     end.
@@ -285,17 +285,19 @@ command(Message, State = #state{module = Module,
 %% deferred messages from this Actor.
 -spec deliver(binary(), pos_integer(), relcast_state()) -> {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
 deliver(Message, FromActorID, State = #state{in_key_count = KeyCount,
-                                             defers = Defers,
-                                             transaction = Transaction}) ->
-    case handle_message(undefined, undefined, FromActorID, Message, Transaction, State) of
-        {ok, NewState} ->
+                                             defers = Defers}) ->
+    case handle_message(undefined, undefined, FromActorID, Message, State#state.transaction, State) of
+        {ok, NewState0} ->
+            %% we only need to do this until we get control over what
+            %% acks a client can issue, but need it now for safety
+            NewState = maybe_commit(NewState0),
             %% something happened, evaluate if we can handle any other blocked messages
             case length(maps:keys(Defers)) of
                 0 ->
                     %% no active defers, no queued inbound messages to evaluate
                     {ok, NewState};
                 _ ->
-                    case handle_pending_inbound(Transaction, NewState) of
+                    case handle_pending_inbound(NewState#state.transaction, NewState) of
                         {ok, NewerState} ->
                             {ok, NewerState};
                         {stop, Timeout, NewerState} ->
@@ -312,7 +314,7 @@ deliver(Message, FromActorID, State = #state{in_key_count = KeyCount,
             case DefersForThisActor of
                 N when length(N) < MaxDefers ->
                     Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
-                    ok = rocksdb:transaction_put(Transaction, State#state.inbound_cf, Key,
+                    ok = rocksdb:transaction_put(State#state.transaction, State#state.inbound_cf, Key,
                                                  <<FromActorID:16/integer, Message/binary>>),
                     {ok, State#state{in_key_count = KeyCount + 1,
                                      transaction_dirty = true,
@@ -348,14 +350,12 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
     %% we should remember the last acked message for this actor ID and start there
     %% check if there's a pending ACK and use that to find the "last" key, if present
     PipelineDepth = application:get_env(relcast, pipeline_depth, 50),
-    ct:pal("take ~p", [ForActorID]),
     case maps:get(ForActorID, Pending, []) of
         Pends when length(Pends) >= PipelineDepth ->
             {pipeline_full, State};
         Pends when Pends /= [] ->
             case lists:last(Pends) of
                 {_Seq, CF, Key, _Multicast} when CF == State#state.active_cf ->
-                    ct:pal("last pends ~p", [Key]),
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, Key, State, false) of
                         {not_found, LastKey, CF2} ->
@@ -381,7 +381,6 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                     %% we *know* there's nothing pending for this actor
                     {not_found, State};
                 {CF0, StartKey0} ->
-                    ct:pal("start ~p", [StartKey0]),
                     %% check if the column family is still valid
                     {CF, StartKey} = case CF0 == State#state.active_cf of
                                          true ->
@@ -390,13 +389,11 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                                              %% reset the start key as well
                                              {State#state.active_cf, min_outbound_key()}
                                      end,
-                    ct:pal("start 2 ~p", [StartKey]),
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
                         {not_found, LastKey, CF2} ->
                             {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
                         {Key, CF2, Msg, Multicast} ->
-                            ct:pal("got from find next ~p", [Msg]),
                             {Seq, State2} = make_seq(ForActorID, State),
                             State3 = maybe_commit(State2),
                             {ok, Seq, Msg,
@@ -503,7 +500,6 @@ ack(FromActorID, Seq, MultiAck, State = #state{transaction = Transaction,
                                          %% this clause iterates through the list until it
                                          %% finds the entry with Seq, deleting as it goes.
                                          fun({R, Fam, Key, MCast}, false) ->
-                                                 ct:pal("deleting ~p", [Key]),
                                                  erlang:put(dirty, true),
                                                  case MCast of
                                                      false ->
@@ -531,7 +527,6 @@ ack(FromActorID, Seq, MultiAck, State = #state{transaction = Transaction,
                                        lists:reverse(NewPends0);
                                    false ->
                                        erlang:put(dirty, true),
-                                       ct:pal("deleting ~p", [AKey]),
                                        case Multicast of
                                            false ->
                                                %% unicast message, fine to delete now
@@ -681,12 +676,12 @@ handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module
                 {ok, NewState} ->
                     Dirty2 = maybe_serialize(Module, ModuleState,
                                              NewState#state.modulestate,
-                                             Transaction, NewState#state.inbound_cf),
+                                             Transaction),
                     {ok, maybe_dirty(Dirty1 orelse Dirty2, NewState)};
                 {stop, Timeout, NewState} ->
                     Dirty2 = maybe_serialize(Module, ModuleState,
                                              NewState#state.modulestate,
-                                             Transaction, NewState#state.inbound_cf),
+                                             Transaction),
                     {stop, Timeout, maybe_dirty(Dirty1 orelse Dirty2, NewState)}
             end
     end.
@@ -695,13 +690,17 @@ handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module
 handle_actions([], _Transaction, State) ->
     {ok, State};
 handle_actions([new_epoch|Tail], Transaction, State) ->
+    ok = rocksdb:transaction_commit(Transaction),
     {ok, NewCF} = rocksdb:create_column_family(State#state.db, make_column_family_name(State#state.epoch + 1), db_options(length(State#state.ids))),
     ok = rocksdb:drop_column_family(State#state.active_cf),
     ok = rocksdb:destroy_column_family(State#state.active_cf),
     %% when we're done handling actions, we will write the module state (and all subsequent outbound
     %% messages from this point on) into the active CF, which is this new one now
-    handle_actions(Tail, Transaction, State#state{out_key_count=0, active_cf=NewCF,
-                                            epoch=State#state.epoch + 1, pending_acks=#{}});
+    {ok, Transaction1} = rocksdb:transaction(State#state.db, [{sync, true}]),
+    handle_actions(Tail, Transaction1, State#state{out_key_count=0, active_cf=NewCF,
+                                                   transaction = Transaction1,
+                                                   transaction_dirty = false,
+                                                   epoch=State#state.epoch + 1, pending_acks=#{}});
 handle_actions([{multicast, Message}|Tail], Transaction, State =
                #state{out_key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
@@ -864,10 +863,8 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:2/integer, _/bits>>}, I
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tail/bits>>}, Iter,
                     State = #state{bitfieldsize=BitfieldSize}) when Type == 0; Type == 2 ->
     <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
-    ct:pal("bfs ~p AM ~p", [BitfieldSize, ActorMask]),
     case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
         0 ->
-            ct:pal("0 bfs ~p AM ~p", [BitfieldSize, ActorMask]),
             %% not for us, keep looking
             case ActorMask == 0 of
                 true ->
@@ -878,7 +875,6 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tai
             end,
             find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, maybe_dirty(ActorMask == 0, State));
         _  when Type == 0 ->
-            ct:pal("1 t 0 bfs ~p AM ~p", [BitfieldSize, ActorMask]),
             %% multicast message with the high bit set for this actor
             rocksdb:iterator_close(Iter),
             {Key, State#state.active_cf, Value, true};
@@ -971,10 +967,8 @@ flip_actor_bit(ActorID, Transaction, CF, Key, BFS) ->
     %% with transactions, we can't actually do a merge at this point,
     %% so we need to read, edit, and write the bitfield inside the transaction
     {ok, Bits} = rocksdb:transaction_get(Transaction, CF, Key),
-    ct:pal("bits pre ~p", [Bits]),
     <<Type:2/bits, ActorMask:BFS/integer-unsigned-big, Post/bits>> = Bits,
     Mask2 = ActorMask band (bnot (1 bsl (BFS - ActorID))),
-    ct:pal("bits post ~p", [<<Type/bits, Mask2:BFS/integer-unsigned-big, Post/bits>>]),
     ok = rocksdb:transaction_put(Transaction, CF, Key, <<Type/bits, Mask2:BFS/integer-unsigned-big, Post/bits>>).
 
 %% generates a partitioned sequence number with the actor ID in the high bits
@@ -990,10 +984,10 @@ make_seq(ID, #state{seq_map=SeqMap, ids=A}=State) ->
 reset_seq(ID, #state{seq_map=SeqMap}=State) ->
     State#state{seq_map=maps:remove(ID, SeqMap)}.
 
-maybe_serialize(_Mod, Old, New, _Transaction, _CF) when Old == New ->
+maybe_serialize(_Mod, Old, New, _Transaction) when Old == New ->
     false;
-maybe_serialize(Mod, _Old, New, Transaction, CF) ->
-    ok = rocksdb:transaction_put(Transaction, CF, ?stored_module_state, Mod:serialize(New)),
+maybe_serialize(Mod, _Old, New, Transaction) ->
+    ok = rocksdb:transaction_put(Transaction, ?stored_module_state, Mod:serialize(New)),
     true.
 
 maybe_update_state(State, ignore) ->
@@ -1005,8 +999,8 @@ maybe_commit(#state{transaction_dirty = false} = S) ->
     S;
 maybe_commit(#state{transaction = Txn, db = DB} = S) ->
     ok = rocksdb:transaction_commit(Txn),
-    {ok, Txn2} = rocksdb:transaction(DB, [{sync, true}]),
-    S#state{transaction = Txn2, transaction_dirty = false}.
+    {ok, Txn1} = rocksdb:transaction(DB, [{sync, true}]),
+    S#state{transaction = Txn1, transaction_dirty = false}.
 
 maybe_dirty(false, S) ->
     S;
