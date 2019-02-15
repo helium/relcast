@@ -783,18 +783,14 @@ round_to_nearest_byte(Bits) ->
 get_mod_state(DB, OldCF, Module, ModuleState0) ->
     case rocksdb:get(DB, OldCF, ?stored_module_state, []) of
         {ok, SerializedModuleState} ->
-            ct:pal("found old"),
             ok = rocksdb:put(DB, ?stored_module_state, SerializedModuleState, []),
             ok = rocksdb:delete(DB, OldCF, ?stored_module_state, []),
             rehydrate(Module, SerializedModuleState, ModuleState0);
         not_found ->
-            ct:pal("not found old"),
             case rocksdb:get(DB, ?stored_module_state, []) of
                 {ok, SerializedModuleState} ->
-                    ct:pal("found new"),
                     rehydrate(Module, SerializedModuleState, ModuleState0);
                 not_found ->
-                    ct:pal("not found new"),
                     ModuleState0
             end
     end.
