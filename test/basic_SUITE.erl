@@ -12,6 +12,7 @@
 -export([
          basic/1,
          stop_resume/1,
+         upgrade_stop_resume/1,
          defer/1,
          defer_stop_resume/1,
          epochs/1,
@@ -26,6 +27,7 @@ all() ->
     [
      basic,
      stop_resume,
+     upgrade_stop_resume,
      defer,
      defer_stop_resume,
      epochs,
@@ -96,6 +98,65 @@ stop_resume(_Config) ->
     {ok, Ref3, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7, true),
     relcast:stop(normal, RC1_7a),
     {ok, RC1_8} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2"}]),
+    %% ack both of the outstanding messages
+    {ok, RC1_9} = relcast:ack(2, Ref2, RC1_8),
+    %% we lost the ack, so the message is still in-queue
+    {ok, Ref4, <<"hai">>, RC1_10} = relcast:take(2, RC1_9),
+    {ok, RC1_11} = relcast:ack(3, Ref3, RC1_10),
+    {ok, Ref5, <<"hai">>, RC1_12} = relcast:take(2, RC1_11, true),
+    %% ack both of the outstanding messages again
+    {ok, RC1_13} = relcast:ack(2, Ref4, RC1_12),
+    {not_found, _} = relcast:take(2, RC1_13),
+    {ok, RC1_14} = relcast:ack(3, Ref5, RC1_13),
+    {not_found, _} = relcast:take(2, RC1_14),
+    relcast:stop(normal, RC1_14),
+    ok.
+
+-define(stored_module_state, <<"stored_module_state">>).
+
+upgrade_stop_resume(_Config) ->
+    Actors = lists:seq(1, 3),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2a"}]),
+    {not_found, _} = relcast:take(2, RC1),
+    {false, _} = relcast:command(is_done, RC1),
+    {ok, RC1_2} = relcast:deliver(<<"hello">>, 2, RC1),
+    {true, _} = relcast:command(is_done, RC1_2),
+    {_, [], Outbound} = relcast:status(RC1_2),
+    [<<"ehlo">>, <<"hai">>] = maps:get(2, Outbound),
+    [<<"hai">>] = maps:get(3, Outbound),
+    {ok, Ref, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
+    %% ack it
+    {ok, RC1_3a} = relcast:ack(2, Ref, RC1_3),
+    relcast:stop(normal, RC1_3a),
+
+    %% now that we've stopped, perform some surgery on the underlying rocks
+    {ok, DB, [_, CF, _]} = rocksdb:open_with_cf("data2a", [{create_if_missing, true}],
+                                                [{"default", []},
+                                                 {"Inbound", []},
+                                                 {"epoch0000000000", []}]),
+    %% get the data from the default
+    {ok, SerializedModuleState} = rocksdb:get(DB, ?stored_module_state, []),
+    %% write to old CF
+    ok = rocksdb:put(DB, CF, ?stored_module_state, SerializedModuleState, []),
+    {ok, SerializedModuleState} = rocksdb:get(DB, CF, ?stored_module_state, []),
+    %% delete from default CF
+    ok = rocksdb:delete(DB, ?stored_module_state, []),
+    %% close
+    rocksdb:close(DB),
+
+    %%proceed as planned
+
+    {ok, RC1_4} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2a"}]),
+    %% check it's gone
+    {ok, Ref2, <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
+    %% take for actor 3
+    {ok, _Ref3, <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
+    %% ack with the wrong ref
+    {ok, RC1_7} = relcast:ack(3, Ref, RC1_6),
+    %% actor 3 still has pending data
+    {ok, Ref3, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7, true),
+    relcast:stop(normal, RC1_7a),
+    {ok, RC1_8} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2a"}]),
     %% ack both of the outstanding messages
     {ok, RC1_9} = relcast:ack(2, Ref2, RC1_8),
     %% we lost the ack, so the message is still in-queue
