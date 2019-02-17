@@ -178,9 +178,10 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                            %% Assume the database doesn't exist yet, if we can't open it we will fail later
                                            {[], false}
                                    end,
+    OpenOpts = application:get_env(relcast, db_open_opts, []),
     {ok, DB, [_DefaultCF|CFHs0]} =
         rocksdb:open_optimistic_transaction_db(DataDir,
-                                               [{create_if_missing, true}],
+                                               [{create_if_missing, true}] ++ OpenOpts,
                                                [ {CF, DBOptions}
                                                  || CF <- ["default"|ColumnFamilies] ]),
     {InboundCF, CFHs} = case HasInbound of
@@ -585,7 +586,7 @@ handle_pending_inbound(Transaction, State) ->
     %% try to handle them again, as the module may now be ready to handle them.
     {ok, Iter} = rocksdb:transaction_iterator(State#state.db, Transaction, State#state.inbound_cf,
                                               [{iterate_upper_bound, max_inbound_key()}]),
-    Res = rocksdb:iterator_move(Iter, {seek, min_inbound_key()}),
+    Res = rocksdb:iterator_move(Iter, first),
     case find_next_inbound(Res, Iter, Transaction, false, [], State) of
         {stop, Timeout, State} ->
             {stop, Timeout, State};
