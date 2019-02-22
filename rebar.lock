@@ -2,8 +2,8 @@
 [{<<"goldrush">>,{pkg,<<"goldrush">>,<<"0.1.9">>},1},
  {<<"lager">>,{pkg,<<"lager">>,<<"3.6.7">>},0},
  {<<"rocksdb">>,
-  {git,"https://gitlab.com/evanmcc/erlang-rocksdb",
-       {ref,"6f7fc2138100d62b068b6d2003ac735e7c71a325"}},
+  {git,"https://gitlab.com/barrel-db/erlang-rocksdb",
+       {ref,"acf4dd2610b15fadd18e217bdf6bf93aace89f1d"}},
   0}]}.
 [
 {pkg_hash,[
