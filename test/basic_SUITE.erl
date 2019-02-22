@@ -20,7 +20,8 @@
          callback_message/1,
          self_callback_message/1,
          pipeline/1,
-         write_reduction/1
+         write_reduction/1,
+         state_split/1
         ]).
 
 all() ->
@@ -34,8 +35,9 @@ all() ->
      epochs_gc,
      callback_message,
      self_callback_message,
-     pipeline %,
+     pipeline,
      %%write_reduction  %% this isn't really baked enough, just call manually
+     state_split
     ].
 
 init_per_suite(Config) ->
@@ -398,6 +400,123 @@ pipeline(_Config) ->
                     [N || N <- lists:seq(21, 30)]),
     {not_found, _} = relcast:take(2, RC9),
     ok.
+
+state_split(_Config) ->
+    Actors = lists:seq(1, 3),
+    {ok, RC1} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
+    {ok, _} = relcast:command(populate, RC1),
+    %% normal stop and start
+    relcast:stop(normal, RC1),
+    {ok, RC2} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
+    {State, _} = relcast:command(get, RC2),
+    ?assertEqual({state, a, b, c, d, e}, State),
+    relcast:stop(normal, RC2),
+
+    ct:pal("stopped"),
+
+    %%ct:pal("~s", [os:cmd("pwd")]),
+    %%ct:pal("~s", [os:cmd("ls ../../../../test/")]),
+
+    true = code:add_patha("."),
+    [] = os:cmd("cp ../../../../test/handler* ."),
+
+    [] = os:cmd("mv handler1-a.er handler1.erl"),
+    [] = os:cmd("erlc -DCOMMON_TEST -DTEST handler1.erl; sync; sync"),
+
+    true = code:delete(handler1),
+    false = code:purge(handler1),
+    {module, handler1} = code:load_abs("handler1"),
+    [] = os:cmd("rm handler1.beam"),
+
+    ct:pal("loaded a"),
+
+    {ok, RC3} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
+    {State2, _} = relcast:command(get, RC3),
+    ?assertEqual({state, a, b, c, d, e}, State2),
+    {ok, RC4} = relcast:command(populate2, RC3),
+    relcast:stop(normal, RC4),
+
+    {ok, RC3a} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
+    {State2a, _} = relcast:command(get, RC3a),
+    ?assertEqual({state, a1, b1, c1, d1, e1}, State2a),
+    relcast:stop(normal, RC3a),
+
+    %% upgrade to a bigger state tuple
+
+    [] = os:cmd("mv handler1-b.er handler1.erl"),
+    [] = os:cmd("erlc -DCOMMON_TEST -DTEST handler1.erl; sync; sync"),
+
+    true = code:delete(handler1),
+    false = code:purge(handler1),
+    {module, handler1} = code:load_abs("handler1"),
+    [] = os:cmd("rm handler1.beam"),
+
+    ct:pal("loaded b"),
+
+    {ok, RC5} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
+    {State3, _} = relcast:command(get, RC5),
+
+    ?assertEqual({state, a1, b1, c1, d1, e1, undefined, undefined}, State3),
+    {ok, RC6} = relcast:command(populate3, RC5),
+    relcast:stop(normal, RC6),
+
+    {ok, RC5a} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
+    {State3a, _} = relcast:command(get, RC5a),
+    ?assertEqual({state, a2, b2, c2, d2, e2, f2, g2}, State3a),
+    relcast:stop(normal, RC5a),
+
+    %% add a sub-behavior
+
+    [] = os:cmd("mv handler1-c.er handler1.erl"),
+    [] = os:cmd("erlc -DCOMMON_TEST -DTEST handler1.erl; sync; sync"),
+
+    true = code:delete(handler1),
+    false = code:purge(handler1),
+    {module, handler1} = code:load_abs("handler1"),
+    [] = os:cmd("rm handler1.beam"),
+
+    ct:pal("loaded c"),
+
+    {ok, RC7} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
+    {State4, _} = relcast:command(get, RC7),
+
+    ?assertEqual({state, a2, b2, c2, {dstate, d2, d2, d2}, e2, f2, g2}, State4),
+    {ok, RC8} = relcast:command(populate4, RC7),
+    relcast:stop(normal, RC8),
+
+    {ok, RC7a} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
+    {State4a, _} = relcast:command(get, RC7a),
+
+    ?assertEqual({state, a3, b3, c3, {dstate, d3a, d3b, d3c}, e3, f3, g3}, State4a),
+    relcast:stop(normal, RC7a),
+
+    %% downgrade back to binary
+
+    [] = os:cmd("mv handler1-d.er handler1.erl"),
+    [] = os:cmd("erlc -DCOMMON_TEST -DTEST handler1.erl; sync; sync"),
+
+    true = code:delete(handler1),
+    false = code:purge(handler1),
+    {module, handler1} = code:load_abs("handler1"),
+    [] = os:cmd("rm handler1.beam"),
+
+    ct:pal("loaded d"),
+
+    {ok, RC9} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
+    {State5, _} = relcast:command(get, RC9),
+
+    ?assertEqual({state, a3, b3, c3, {dstate, d3a, d3b, d3c}, e3, f3, g3}, State5),
+    {ok, RC10} = relcast:command(populate5, RC9),
+    relcast:stop(normal, RC10),
+
+    {ok, RC9a} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
+    {State5a, _} = relcast:command(get, RC9a),
+
+    ?assertEqual({state, a4, b4, c4, {dstate, d4a, d4b, d4c}, e4, f4, g4}, State5a),
+    relcast:stop(normal, RC9a),
+
+    ok.
+
 
 write_reduction(_Config) ->
     Actors = lists:seq(1, 3),

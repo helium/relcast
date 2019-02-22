@@ -1,0 +1,79 @@
+-module(handler1).
+
+%-behavior(relcast).
+
+%% -compile({parse_transform, cth_readable_transform}).
+
+-export([
+         init/1,
+         handle_command/2,
+         handle_message/3,
+         callback_message/3,
+         serialize/1,
+         deserialize/1,
+         restore/2
+        ]).
+
+-record(state, {
+                a :: atom(),
+                b :: atom(),
+                c :: atom(),
+                d :: atom(),
+                e :: atom()
+               }).
+
+init([]) ->
+    {ok, #state{}}.
+
+handle_command(populate, State) ->
+    {reply, ok, [], State#state{a=a, b=b, c=c, d=d, e=e}};
+handle_command(populate2, State) ->
+    {reply, ok, [], State#state{a=a1, b=b1, c=c1, d=d1, e=e1}};
+handle_command(get, State) ->
+    {reply, State, [], State};
+handle_command(Msg, _State) ->
+    io:format("handle_call, Msg: ~p", [Msg]),
+    {reply, ok, ignore}.
+
+handle_message(Msg, Actor, State) ->
+    ct:pal("handle_message, Msg: ~p, Actor: ~p~n", [Msg, Actor]),
+    {State, []}.
+
+callback_message(_, _, _) ->
+    ignore.
+
+serialize(#state{a = A,
+                 b = B,
+                 c = C,
+                 d = D,
+                 e = E} = State) ->
+
+    %% figure out how to get CT
+    cthr:pal("Serialize a: ~p~n", [State]),
+    M = #{a => A,
+          b => B,
+          c => C,
+          d => D,
+          e => E},
+    maps:map(fun(_K, V) -> term_to_binary(V) end, M).
+
+deserialize(B) when is_binary(B) ->
+    cthr:pal("Deserialize a bin: ~p~n", [B]),
+    binary_to_term(B);
+deserialize(M) ->
+    cthr:pal("Deserialize a map: ~p~n", [M]),
+    M1 = maps:map(fun(_K, V) -> binary_to_term(V) end, M),
+    #{a := A,
+      b := B,
+      c := C,
+      d := D,
+      e := E} = M1,
+    #state{a = A,
+           b = B,
+           c = C,
+           d = D,
+           e = E}.
+
+restore(OldState, NewState) ->
+    cthr:pal("a OldState: ~p, NewState: ~p~n", [OldState, NewState]),
+    {ok, OldState}.
