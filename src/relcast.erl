@@ -133,6 +133,7 @@
           transaction_dirty = false :: boolean(),
           new_defers :: undefined | integer(),  % right now this is just a counter for delivers
           last_defer_check :: undefined | integer(),
+          floated_acks = #{} :: #{pos_integer() => [non_neg_integer()]},
           db_opts = [] :: [any()],
           write_opts = [] :: [any()]
          }).
@@ -297,13 +298,11 @@ command(Message, State = #state{module = Module,
 %% later, or this function returns `full' to indicate it cannot absorb any more
 %% deferred messages from this Actor.
 -spec deliver(binary(), pos_integer(), relcast_state()) -> {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
-deliver(Message, FromActorID, State = #state{in_key_count = KeyCount,
-                                             defers = Defers}) ->
+deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
+                                                  defers = Defers}) ->
     case handle_message(undefined, undefined, FromActorID, Message, State#state.transaction, State) of
         {ok, NewState0} ->
-            %% we only need to do this until we get control over what
-            %% acks a client can issue, but need it now for safety
-            NewState = maybe_commit(NewState0),
+            NewState = store_ack(Seq, From, NewState0),
             %% something happened, evaluate if we can handle any other blocked messages
             case length(maps:keys(Defers)) of
                 0 ->
@@ -318,21 +317,25 @@ deliver(Message, FromActorID, State = #state{in_key_count = KeyCount,
                             {stop, Timeout, NewerState}
                     end
             end;
-        {stop, Timeout, NewState} ->
+        {stop, Timeout, NewState0} ->
+            NewState = store_ack(Seq, From, NewState0),
             {stop, Timeout, NewState};
         ignore ->
-            {ok, State};
+            NewState = store_ack(Seq, From, State),
+            {ok, NewState};
         defer ->
+            NewState = store_ack(Seq, From, State),
             DefersForThisActor = maps:get(FromActorID, Defers, []),
             MaxDefers = application:get_env(relcast, max_defers, 100),
             case DefersForThisActor of
                 N when length(N) < MaxDefers ->
                     Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
-                    ok = rocksdb:transaction_put(State#state.transaction, State#state.inbound_cf, Key,
+                    ok = rocksdb:transaction_put(NewState#state.transaction, NewState#state.inbound_cf,
+                                                 Key,
                                                  <<FromActorID:16/integer, Message/binary>>),
-                    {ok, State#state{in_key_count = KeyCount + 1,
-                                     transaction_dirty = true,
-                                     defers = maps:put(FromActorID, [Key|N], Defers)}};
+                    {ok, NewState#state{in_key_count = KeyCount + 1,
+                                        transaction_dirty = true,
+                                        defers = maps:put(FromActorID, [Key|N], Defers)}};
                 _ ->
                     %% sorry buddy, no room on the couch
                     full
@@ -355,7 +358,11 @@ take(ID, State) ->
 -spec take(pos_integer(), relcast_state(), boolean()) ->
                   {not_found, relcast_state()} |
                   {pipeline_full, relcast_state()} |
-                  {ok, non_neg_integer(), binary(), relcast_state()}.
+                  {ok,
+                   Seq :: non_neg_integer(),
+                   Acks :: [non_neg_number()],
+                   Msg :: binary(),
+                   NewState :: relcast_state()}.
 take(ForActorID, State, true) ->
     {ok, NewState} = reset_actor(ForActorID, State),
     take(ForActorID, NewState, false);
@@ -377,9 +384,11 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                         {Key2, CF2, Msg, Multicast} ->
                             {Seq2, State2} = make_seq(ForActorID, State),
                             Pends1 = Pends ++ [{Seq2, CF2, Key2, Multicast}],
-                            State3 = maybe_commit(State2),
-                            {ok, Seq2, Msg,
-                             State3#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}};
+                            %% merge these?
+                            {Acks, State3} = get_acks(State2),
+                            State4 = maybe_commit(State3),
+                            {ok, Acks, Seq2, Msg,
+                             State4#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}};
                         not_found ->
                             {not_found, State#state{last_sent=maps:put(ForActorID, none, State#state.last_sent)}}
                     end;
@@ -409,9 +418,10 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                             {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
                         {Key, CF2, Msg, Multicast} ->
                             {Seq, State2} = make_seq(ForActorID, State),
-                            State3 = maybe_commit(State2),
-                            {ok, Seq, Msg,
-                             State3#state{pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
+                            {Acks, State3} = get_acks(State2),
+                            State4 = maybe_commit(State3),
+                            {ok, Seq, Acks, Msg,
+                             State4#state{pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
                         not_found ->
                             {not_found, State#state{last_sent = maps:put(ForActorID, none, State#state.last_sent)}}
                     end
@@ -1078,6 +1088,15 @@ mark_defers(S) ->
             last_defer_check = erlang:monotonic_time(milli_seconds)}.
 
 
+store_ack(Seq, From, S) ->
+    %% should we be able to infer the seq without external tracking?
+    ActorAcks = maps:get(From, S#state.deferred_acks, []),
+    %% at some point we might not need to keep them in order?
+    S#state{deferred_acks = Acks#{FromActorID => ActorAcks ++ [Seq]}}.
+
+get_acks(From, #state{deferred_acks = Acks} = S) ->
+    ActorAcks = maps:get(From, Acks, []),
+    {ActorAcks, S#state{deferred_acks = Acks#{From => []}}}.
 
 -ifdef(TEST).
 
