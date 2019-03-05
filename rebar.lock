@@ -3,7 +3,7 @@
  {<<"lager">>,{pkg,<<"lager">>,<<"3.6.7">>},0},
  {<<"rocksdb">>,
   {git,"https://gitlab.com/barrel-db/erlang-rocksdb",
-       {ref,"acf4dd2610b15fadd18e217bdf6bf93aace89f1d"}},
+       {ref,"b7d0c2b400916bca09a70480afaab638b7609405"}},
   0}]}.
 [
 {pkg_hash,[
