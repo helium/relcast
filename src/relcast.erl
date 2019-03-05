@@ -163,7 +163,9 @@
 -spec start(pos_integer(), [pos_integer(),...], atom(), list(), list()) -> error | {ok, relcast_state()} | {stop, pos_integer(), relcast_state()}.
 start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     DataDir = proplists:get_value(data_dir, RelcastOptions),
-    DBOptions = db_options(length(ActorIDs)),
+    DBOptions0 = db_options(length(ActorIDs)),
+    OpenOpts = application:get_env(relcast, db_open_opts, []),
+    DBOptions = DBOptions0 ++ OpenOpts,
     {ColumnFamilies, HasInbound} = case rocksdb:list_column_families(DataDir, DBOptions) of
                                        {ok, CFs0} ->
                                            CFs = lists:sort(CFs0) -- ["default"],
@@ -180,7 +182,6 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                            %% Assume the database doesn't exist yet, if we can't open it we will fail later
                                            {[], false}
                                    end,
-    OpenOpts = application:get_env(relcast, db_open_opts, []),
     {ok, DB, [_DefaultCF|CFHs0]} =
         rocksdb:open_optimistic_transaction_db(DataDir,
                                                [{create_if_missing, true}] ++ OpenOpts,
