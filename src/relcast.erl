@@ -558,7 +558,7 @@ stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
         false ->
             ok
     end,
-    rocksdb:transaction_commit(State#state.transaction),
+    catch rocksdb:transaction_commit(State#state.transaction),
     rocksdb:close(State#state.db).
 
 %% @doc Get a representation of the relcast's module state, inbound queue and
