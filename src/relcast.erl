@@ -130,7 +130,9 @@
           defers = #{} :: #{pos_integer() => [binary()]},
           seq_map = #{} :: #{pos_integer() => pos_integer()},
           transaction :: undefined | reference(),
-          transaction_dirty = false :: boolean()
+          transaction_dirty = false :: boolean(),
+          new_defers :: undefined | pos_integer(),  % right now this is just a counter for delivers
+          last_defer_check :: undefined | erlang:monotonic_time()
          }).
 
 -type relcast_state() :: #state{}.
@@ -161,7 +163,9 @@
 -spec start(pos_integer(), [pos_integer(),...], atom(), list(), list()) -> error | {ok, relcast_state()} | {stop, pos_integer(), relcast_state()}.
 start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     DataDir = proplists:get_value(data_dir, RelcastOptions),
-    DBOptions = db_options(length(ActorIDs)),
+    DBOptions0 = db_options(length(ActorIDs)),
+    OpenOpts = application:get_env(relcast, db_open_opts, []),
+    DBOptions = DBOptions0 ++ OpenOpts,
     {ColumnFamilies, HasInbound} = case rocksdb:list_column_families(DataDir, DBOptions) of
                                        {ok, CFs0} ->
                                            CFs = lists:sort(CFs0) -- ["default"],
@@ -178,7 +182,6 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                            %% Assume the database doesn't exist yet, if we can't open it we will fail later
                                            {[], false}
                                    end,
-    OpenOpts = application:get_env(relcast, db_open_opts, []),
     {ok, DB, [_DefaultCF|CFHs0]} =
         rocksdb:open_optimistic_transaction_db(DataDir,
                                                [{create_if_missing, true}] ++ OpenOpts,
@@ -291,7 +294,8 @@ deliver(Message, FromActorID, State = #state{in_key_count = KeyCount,
                     %% no active defers, no queued inbound messages to evaluate
                     {ok, NewState};
                 _ ->
-                    case handle_pending_inbound(NewState#state.transaction, NewState) of
+                    case handle_pending_inbound(NewState#state.transaction,
+                                                NewState#state{new_defers = State#state.new_defers + 1}) of
                         {ok, NewerState} ->
                             {ok, NewerState};
                         {stop, Timeout, NewerState} ->
@@ -554,7 +558,7 @@ stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
         false ->
             ok
     end,
-    rocksdb:transaction_commit(State#state.transaction),
+    catch rocksdb:transaction_commit(State#state.transaction),
     rocksdb:close(State#state.db).
 
 %% @doc Get a representation of the relcast's module state, inbound queue and
@@ -576,7 +580,24 @@ status(State = #state{modulestate = ModuleState, transaction = Transaction}) ->
 
 -spec handle_pending_inbound(rocksdb:transaction_handle(), relcast_state()) ->
                                     {stop, pos_integer(), relcast_state()} | {ok, relcast_state()}.
-handle_pending_inbound(Transaction, State) ->
+handle_pending_inbound(Transaction, #state{new_defers = Defers,
+                                           last_defer_check = Last0} = State) ->
+    CountThreshold = application:get_env(relcast, defer_count_threshold, 20),
+    TimeThreshold =  application:get_env(relcast, defer_time_threshold, 5000),
+    Last = case Last0 of
+               undefined -> 0;
+               _ -> Last0
+           end,
+    Time = erlang:monotonic_time(milli_seconds) - Last,
+    case (Defers == undefined orelse Defers > CountThreshold) orelse
+        (Last0 == undefined orelse Time > TimeThreshold) of
+        false ->
+            {ok, State};
+        true ->
+            handle_pending_inbound_(Transaction, State)
+    end.
+
+handle_pending_inbound_(Transaction, State) ->
     %% so we need to start at the oldest messages in the inbound queue and
     %% attempt Module:handle_message on each one. If the module returns `defer'
     %% we need to not attempt to deliver any newer messages from that actor.
@@ -589,14 +610,14 @@ handle_pending_inbound(Transaction, State) ->
     Res = rocksdb:iterator_move(Iter, first),
     case find_next_inbound(Res, Iter, Transaction, false, [], State) of
         {stop, Timeout, State} ->
-            {stop, Timeout, State};
+            {stop, Timeout, mark_defers(State)};
         {ok, false, _, State} ->
             %% nothing changed, we're done here
-            {ok, State};
+            {ok, mark_defers(State)};
         {ok, true, Acc, NewState} ->
             %% we changed something, try handling other deferreds again
             %% we have them in an accumulator, so we can just try to handle/delete them
-            handle_defers(Transaction, Acc, [], false, NewState)
+            handle_defers(Transaction, Acc, [], false, mark_defers(NewState))
     end.
 
 find_next_inbound({error, _}, Iter, _Transaction, Changed, Acc, State) ->
@@ -1020,6 +1041,12 @@ maybe_dirty(false, S) ->
     S;
 maybe_dirty(_, S) ->
     S#state{transaction_dirty = true}.
+
+mark_defers(S) ->
+    S#state{new_defers = 0,
+            last_defer_check = erlang:monotonic_time(milli_seconds)}.
+
+
 
 -ifdef(TEST).
 

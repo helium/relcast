@@ -387,6 +387,8 @@ open(Actors, Dir0) ->
     %% edge cases.
     application:set_env(relcast, max_defers, ?MAX_DEFERS),
     application:set_env(relcast, pipeline_depth, ?PIPELINE_DEPTH),
+    %% this is not great, but I'm not sure how to get the model right otherwise
+    application:set_env(relcast, defer_count_threshold, 0),
 
     Dir = case Dir0 of
               undefined ->
