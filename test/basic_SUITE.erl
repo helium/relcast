@@ -40,6 +40,8 @@ all() ->
 
 init_per_suite(Config) ->
     application:load(relcast),
+    application:set_env(relcast, defer_count_threshold, -1),
+    application:set_env(relcast, defer_time_threshold, -1),
     Config.
 
 end_per_suite(Config) ->
