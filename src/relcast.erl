@@ -150,6 +150,7 @@
          in_flight/2,
          peek/2,
          ack/3, multi_ack/3,
+         process_inbound/1,
          stop/2,
          status/1
         ]).
@@ -547,6 +548,20 @@ ack(FromActorID, Seq, MultiAck, State = #state{transaction = Transaction,
                     NewPending = (State#state.pending_acks)#{FromActorID => NewPends},
                     {ok, State#state{pending_acks=NewPending}}
             end
+    end.
+
+%% @doc Allow inbound processing to be externally triggered so that we
+%% don't get "stuck" with delayed defers blocking the forward progress
+%% of the state machine defined by the behavior.
+-spec process_inbound(relcast_state()) ->
+                             {ok, relcast_state()} |
+                             {stop, pos_integer(), relcast_state()}.
+process_inbound(State) ->
+    case handle_pending_inbound(State#state.transaction, State) of
+        {ok, NewState} ->
+            {ok, NewState};
+        {stop, Timeout, NewState} ->
+            {stop, Timeout, NewState}
     end.
 
 %% @doc Stop the relcast instance.
