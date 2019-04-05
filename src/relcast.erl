@@ -132,7 +132,9 @@
           transaction :: undefined | reference(),
           transaction_dirty = false :: boolean(),
           new_defers :: undefined | pos_integer(),  % right now this is just a counter for delivers
-          last_defer_check :: undefined | erlang:monotonic_time()
+          last_defer_check :: undefined | erlang:monotonic_time(),
+          db_opts = [] :: [any()],
+          write_opts = [] :: [any()]
          }).
 
 -type relcast_state() :: #state{}.
@@ -165,7 +167,15 @@
 start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     DataDir = proplists:get_value(data_dir, RelcastOptions),
     DBOptions0 = db_options(length(ActorIDs)),
-    OpenOpts = application:get_env(relcast, db_open_opts, []),
+    OpenOpts1 = application:get_env(relcast, db_open_opts, []),
+    OpenOpts2 = proplists:get_value(db_opts, RelcastOptions, []),
+    WriteOpts = case proplists:get_value(write_opts, RelcastOptions, []) of
+                    [] ->
+                        [{sync, true}];
+                    WriteOptions ->
+                        WriteOptions
+                end,
+    OpenOpts = OpenOpts1 ++ OpenOpts2,
     DBOptions = DBOptions0 ++ OpenOpts,
     {ColumnFamilies, HasInbound} = case rocksdb:list_column_families(DataDir, DBOptions) of
                                        {ok, CFs0} ->
@@ -228,14 +238,16 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                            out_key_count = LastKeyOut + 1,
                            in_key_count = LastKeyIn + 1,
                            epoch = Epoch,
-                           bitfieldsize = BitFieldSize},
+                           bitfieldsize = BitFieldSize,
+                           db_opts = DBOptions,
+                           write_opts = WriteOpts},
             {ok, Iter} = rocksdb:iterator(State#state.db, InboundCF, [{iterate_upper_bound, max_inbound_key()}]),
             Defers = build_defer_list(rocksdb:iterator_move(Iter, {seek, min_inbound_key()}), Iter, InboundCF, #{}),
             %% try to deliver any old queued inbound messages
-            {ok, Transaction} = rocksdb:transaction(DB, [{sync, true}]),
+            {ok, Transaction} = rocksdb:transaction(DB, WriteOpts),
             {ok, NewState} = handle_pending_inbound(Transaction, State#state{defers=Defers}),
             ok = rocksdb:transaction_commit(Transaction),
-            {ok, Transaction1} = rocksdb:transaction(DB, [{sync, true}]),
+            {ok, Transaction1} = rocksdb:transaction(DB, WriteOpts),
             {ok, NewState#state{transaction = Transaction1}};
         _ ->
             error
@@ -721,12 +733,13 @@ handle_actions([], _Transaction, State) ->
     {ok, State};
 handle_actions([new_epoch|Tail], Transaction, State) ->
     ok = rocksdb:transaction_commit(Transaction),
-    {ok, NewCF} = rocksdb:create_column_family(State#state.db, make_column_family_name(State#state.epoch + 1), db_options(length(State#state.ids))),
+    {ok, NewCF} = rocksdb:create_column_family(State#state.db, make_column_family_name(State#state.epoch + 1),
+                                               State#state.db_opts),
     ok = rocksdb:drop_column_family(State#state.active_cf),
     ok = rocksdb:destroy_column_family(State#state.active_cf),
     %% when we're done handling actions, we will write the module state (and all subsequent outbound
     %% messages from this point on) into the active CF, which is this new one now
-    {ok, Transaction1} = rocksdb:transaction(State#state.db, [{sync, true}]),
+    {ok, Transaction1} = rocksdb:transaction(State#state.db, State#state.write_opts),
     handle_actions(Tail, Transaction1, State#state{out_key_count=0, active_cf=NewCF,
                                                    transaction = Transaction1,
                                                    transaction_dirty = false,
@@ -1047,9 +1060,9 @@ maybe_update_state(State, NewModuleState) ->
 
 maybe_commit(#state{transaction_dirty = false} = S) ->
     S;
-maybe_commit(#state{transaction = Txn, db = DB} = S) ->
+maybe_commit(#state{transaction = Txn, db = DB, write_opts = Opts} = S) ->
     ok = rocksdb:transaction_commit(Txn),
-    {ok, Txn1} = rocksdb:transaction(DB, [{sync, true}]),
+    {ok, Txn1} = rocksdb:transaction(DB, Opts),
     S#state{transaction = Txn1, transaction_dirty = false}.
 
 maybe_dirty(false, S) ->
