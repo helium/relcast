@@ -129,10 +129,10 @@
           active_cf :: rocksdb:cf_handle(),
           defers = #{} :: #{pos_integer() => [binary()]},
           seq_map = #{} :: #{pos_integer() => pos_integer()},
-          transaction :: undefined | reference(),
+          transaction :: undefined | rocksdb:transaction_handle(),
           transaction_dirty = false :: boolean(),
-          new_defers :: undefined | pos_integer(),  % right now this is just a counter for delivers
-          last_defer_check :: undefined | erlang:monotonic_time(),
+          new_defers :: undefined | integer(),  % right now this is just a counter for delivers
+          last_defer_check :: undefined | integer(),
           db_opts = [] :: [any()],
           write_opts = [] :: [any()]
          }).
@@ -158,6 +158,14 @@
         ]).
 
 -define(stored_module_state, <<"stored_module_state">>).
+
+%% TODO: remove these when fix goes in
+-dialyzer({nowarn_function, [transaction/2]}).
+
+-spec transaction(_, _) -> {ok, rocksdb:transaction_handle()}.
+transaction(A, B) ->
+    {ok, Txn} = rocksdb:transaction(A, B),
+    {ok, Txn}.
 
 %% @doc Start a relcast instance. Starts a relcast instance for the actor
 %% `ActorID' in the group of `ActorIDs' using the callback module `Module'
@@ -239,10 +247,10 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
             {ok, Iter} = rocksdb:iterator(State#state.db, InboundCF, [{iterate_upper_bound, max_inbound_key()}]),
             Defers = build_defer_list(rocksdb:iterator_move(Iter, {seek, min_inbound_key()}), Iter, InboundCF, #{}),
             %% try to deliver any old queued inbound messages
-            {ok, Transaction} = rocksdb:transaction(DB, WriteOpts),
+            {ok, Transaction} = transaction(DB, WriteOpts),
             {ok, NewState} = handle_pending_inbound(Transaction, State#state{defers=Defers}),
             ok = rocksdb:transaction_commit(Transaction),
-            {ok, Transaction1} = rocksdb:transaction(DB, WriteOpts),
+            {ok, Transaction1} = transaction(DB, WriteOpts),
             {ok, NewState#state{transaction = Transaction1}};
         _ ->
             error
@@ -734,7 +742,7 @@ handle_actions([new_epoch|Tail], Transaction, State) ->
     ok = rocksdb:destroy_column_family(State#state.active_cf),
     %% when we're done handling actions, we will write the module state (and all subsequent outbound
     %% messages from this point on) into the active CF, which is this new one now
-    {ok, Transaction1} = rocksdb:transaction(State#state.db, State#state.write_opts),
+    {ok, Transaction1} = transaction(State#state.db, State#state.write_opts),
     handle_actions(Tail, Transaction1, State#state{out_key_count=0, active_cf=NewCF,
                                                    transaction = Transaction1,
                                                    transaction_dirty = false,
@@ -1057,7 +1065,7 @@ maybe_commit(#state{transaction_dirty = false} = S) ->
     S;
 maybe_commit(#state{transaction = Txn, db = DB, write_opts = Opts} = S) ->
     ok = rocksdb:transaction_commit(Txn),
-    {ok, Txn1} = rocksdb:transaction(DB, Opts),
+    {ok, Txn1} = transaction(DB, Opts),
     S#state{transaction = Txn1, transaction_dirty = false}.
 
 maybe_dirty(false, S) ->
