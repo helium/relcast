@@ -169,12 +169,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     DBOptions0 = db_options(length(ActorIDs)),
     OpenOpts1 = application:get_env(relcast, db_open_opts, []),
     OpenOpts2 = proplists:get_value(db_opts, RelcastOptions, []),
-    WriteOpts = case proplists:get_value(write_opts, RelcastOptions, []) of
-                    [] ->
-                        [{sync, true}];
-                    WriteOptions ->
-                        WriteOptions
-                end,
+    WriteOpts = proplists:get_value(write_opts, RelcastOptions, [{sync, true}]),
     OpenOpts = OpenOpts1 ++ OpenOpts2,
     DBOptions = DBOptions0 ++ OpenOpts,
     {ColumnFamilies, HasInbound} = case rocksdb:list_column_families(DataDir, DBOptions) of
