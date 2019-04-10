@@ -136,7 +136,6 @@
           new_defers :: undefined | integer(),  % right now this is just a counter for delivers
           last_defer_check :: undefined | integer(),
           key_tree :: [any()],
-          write_key_tree :: boolean(),
           db_opts = [] :: [any()],
           write_opts = [] :: [any()]
          }).
@@ -240,7 +239,6 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
             BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
             %% we only want to write the key tree on the initial switchover or an upgrade.
             %% TODO figure out how to retrigger on upgrade
-            WriteKeyTree = OldSer == undefined,
             State = #state{module = Module,
                            id = ActorID,
                            inbound_cf = InboundCF,
@@ -255,7 +253,6 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                            bitfieldsize = BitFieldSize,
                            db_opts = DBOptions,
                            write_opts = WriteOpts,
-                           write_key_tree = WriteKeyTree,
                            key_tree = KeyTree},
             {ok, Iter} = rocksdb:iterator(State#state.db, InboundCF, [{iterate_upper_bound, max_inbound_key()}]),
             Defers = build_defer_list(rocksdb:iterator_move(Iter, {seek, min_inbound_key()}), Iter, InboundCF, #{}),
@@ -856,8 +853,7 @@ get_mod_state(DB, OldCF, Module, ModuleState0, WriteOpts) ->
                             bin ->
                                 bin;
                             KeyTree ->
-                                _ = maybe_write_key_tree(KeyTree, #state{write_key_tree = true,
-                                                                         transaction = Txn}),
+                                _ = maybe_write_key_tree(KeyTree, #state{transaction = Txn}),
                                 ok = rocksdb:transaction_delete(Txn, ?stored_module_state),
                                 KeyTree
                         end,
@@ -1091,7 +1087,7 @@ maybe_write_key_tree(KeyTree, S) when KeyTree == S#state.key_tree->
 maybe_write_key_tree(KeyTree, S) ->
     ok = rocksdb:transaction_put(S#state.transaction, ?stored_key_tree,
                                  term_to_binary(KeyTree, [compressed])),
-    S#state{write_key_tree = false, key_tree = KeyTree}.
+    S#state{key_tree = KeyTree}.
 
 old_size(M) when is_map(M) ->
     maps:size(M);
