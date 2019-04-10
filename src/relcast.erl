@@ -237,8 +237,6 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
             LastKeyIn = get_last_key_in(DB, InboundCF),
             LastKeyOut = get_last_key_out(DB, ActiveCF),
             BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
-            %% we only want to write the key tree on the initial switchover or an upgrade.
-            %% TODO figure out how to retrigger on upgrade
             State = #state{module = Module,
                            id = ActorID,
                            inbound_cf = InboundCF,
@@ -835,7 +833,6 @@ round_to_nearest_byte(Bits) ->
             Bits + (8 - Extra)
     end.
 
-%% TODO: this whole thing is one way, we might need a downgrade path?
 get_mod_state(DB, OldCF, Module, ModuleState0, WriteOpts) ->
     case rocksdb:get(DB, OldCF, ?stored_module_state, []) of
         {ok, SerializedModuleState} ->
@@ -1147,7 +1144,6 @@ fixup_old_map(never_ever_match_with_anything) ->
 fixup_old_map(M) ->
     M.
 
-%% this needs to return {serstate, restored modstate} I think
 do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
     R = fun Rec(Pfix, [_Top | KT], DB) ->
                 lists:foldl(
