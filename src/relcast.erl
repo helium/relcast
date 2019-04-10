@@ -180,7 +180,6 @@ transaction(A, B) ->
 -spec start(pos_integer(), [pos_integer(),...], atom(), list(), list()) ->
                    error | {ok, relcast_state()} | {stop, pos_integer(), relcast_state()}.
 start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
-    ct:pal("starting"),
     DataDir = proplists:get_value(data_dir, RelcastOptions),
     DBOptions0 = db_options(length(ActorIDs)),
     OpenOpts1 = application:get_env(relcast, db_open_opts, []),
@@ -850,14 +849,13 @@ get_mod_state(DB, OldCF, Module, ModuleState0, WriteOpts) ->
             case rocksdb:get(DB, ?stored_module_state, []) of
                 {ok, SerializedModuleState} ->
                     {SerState, ModState, _} = rehydrate(Module, SerializedModuleState, ModuleState0),
-                    {ok, Txn} = rocksdb:transaction(DB, WriteOpts),
+                    {ok, Txn} = transaction(DB, WriteOpts),
                     New = Module:serialize(ModState),
                     KT =
                         case do_serialize(Module, undefined, New, ?stored_key_prefix, Txn) of
                             bin ->
                                 bin;
                             KeyTree ->
-                                ct:pal("keytree ~p ~p ~p ~p", [KeyTree, New, SerState, ModState]),
                                 _ = maybe_write_key_tree(KeyTree, #state{write_key_tree = true,
                                                                          transaction = Txn}),
                                 ok = rocksdb:transaction_delete(Txn, ?stored_module_state),
@@ -1091,7 +1089,6 @@ maybe_serialize(Mod, _Old, #state{modulestate = New0,
 maybe_write_key_tree(KeyTree, S) when KeyTree == S#state.key_tree->
     S;
 maybe_write_key_tree(KeyTree, S) ->
-    ct:pal("updating key tree ~p ~p", [S#state.key_tree, KeyTree]),
     ok = rocksdb:transaction_put(S#state.transaction, ?stored_key_tree,
                                  term_to_binary(KeyTree, [compressed])),
     S#state{write_key_tree = false, key_tree = KeyTree}.
@@ -1125,7 +1122,6 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                                            end,
                                            Old,
                                            SKeys -- OKeys),
-                        ct:pal("old ~p", [Old1]),
                         maps:to_list(maps:without(OKeys -- SKeys, Old1));
                     _ ->
                         lists:sort(maps:to_list(Old))
