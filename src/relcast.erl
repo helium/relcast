@@ -152,7 +152,7 @@
          reset_actor/2,
          in_flight/2,
          peek/2,
-         ack/3, multi_ack/3,
+         ack/3,
          process_inbound/1,
          stop/2,
          status/1
@@ -357,8 +357,8 @@ take(ID, State) ->
 %% acks state and reissue the oldest unacked message in case all of the unacked
 %% messages were lost in flight.
 -spec take(pos_integer(), relcast_state(), boolean()) ->
-                  {not_found, relcast_state()} |
-                  {pipeline_full, relcast_state()} |
+                  {not_found, Acks :: [non_neg_integer()], relcast_state()} |
+                  {pipeline_full, Acks :: [non_neg_integer()], relcast_state()} |
                   {ok,
                    Seq :: non_neg_integer(),
                    Acks :: [non_neg_integer()],
@@ -374,14 +374,18 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
     PipelineDepth = application:get_env(relcast, pipeline_depth, 50),
     case maps:get(ForActorID, Pending, []) of
         Pends when length(Pends) >= PipelineDepth ->
-            {pipeline_full, State};
+            {Acks, State2} = get_acks(ForActorID, State),
+            {pipeline_full, Acks, State2};
         Pends when Pends /= [] ->
             case lists:last(Pends) of
                 {_Seq, CF, Key, _Multicast} when CF == State#state.active_cf ->
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, Key, State, false) of
                         {not_found, LastKey, CF2} ->
-                            {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
+                            {Acks, State2} = get_acks(ForActorID, State),
+                            {not_found, Acks, State2#state{last_sent = maps:put(ForActorID,
+                                                                                {CF2, LastKey},
+                                                                                State2#state.last_sent)}};
                         {Key2, CF2, Msg, Multicast} ->
                             {Seq2, State2} = make_seq(ForActorID, State),
                             Pends1 = Pends ++ [{Seq2, CF2, Key2, Multicast}],
@@ -391,7 +395,9 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                             {ok, Seq2, Acks, Msg,
                              State4#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}};
                         not_found ->
-                            {not_found, State#state{last_sent=maps:put(ForActorID, none, State#state.last_sent)}}
+                            {Acks, State2} = get_acks(ForActorID, State),
+                            {not_found, Acks, State2#state{last_sent=maps:put(ForActorID, none,
+                                                                              State2#state.last_sent)}}
                     end;
                 %% all our pends are for a stale epoch, clean them out
                 _ ->
@@ -403,7 +409,8 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
             case maps:get(ForActorID, State#state.last_sent, {State#state.active_cf, min_outbound_key()}) of
                 none ->
                     %% we *know* there's nothing pending for this actor
-                    {not_found, State};
+                    {Acks, State2} = get_acks(ForActorID, State),
+                    {not_found, Acks, State2};
                 {CF0, StartKey0} ->
                     %% check if the column family is still valid
                     {CF, StartKey} = case CF0 == State#state.active_cf of
@@ -416,7 +423,9 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
                         {not_found, LastKey, CF2} ->
-                            {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
+                            {Acks, State2} = get_acks(ForActorID, State),
+                            {not_found, Acks, State2#state{last_sent = maps:put(ForActorID, {CF2, LastKey},
+                                                                          State2#state.last_sent)}};
                         {Key, CF2, Msg, Multicast} ->
                             {Seq, State2} = make_seq(ForActorID, State),
                             {Acks, State3} = get_acks(ForActorID, State2),
@@ -424,7 +433,8 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                             {ok, Seq, Acks, Msg,
                              State4#state{pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
                         not_found ->
-                            {not_found, State#state{last_sent = maps:put(ForActorID, none, State#state.last_sent)}}
+                            {Acks, State2} = get_acks(ForActorID, State),
+                            {not_found, Acks, State2#state{last_sent = maps:put(ForActorID, none, State2#state.last_sent)}}
                     end
             end
     end.
@@ -497,83 +507,52 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
             end
     end.
 
-ack(FromActorID, Seq, State) ->
-    ack(FromActorID, Seq, false, State).
-
-multi_ack(FromActorID, Seq, State) ->
-    ack(FromActorID, Seq, true, State).
-
 %% @doc Indicate to relcast that `FromActorID' has acknowledged receipt of the
 %% message associated with `Seq'.
--spec ack(pos_integer(), non_neg_integer(), boolean(), relcast_state()) -> {ok, relcast_state()}.
-ack(FromActorID, Seq, MultiAck, State = #state{transaction = Transaction,
-                                               bitfieldsize = BFS}) ->
+-spec ack(pos_integer(), non_neg_integer() | [non_neg_integer], relcast_state()) ->
+                 {ok, relcast_state()}.
+ack(FromActorID, Seq, State) when not is_list(Seq) ->
+    ack(FromActorID, [Seq], State);
+ack(_FromActorID, [], State) ->
+    {ok, State};
+ack(FromActorID, Seqs, State = #state{transaction = Transaction,
+                                      bitfieldsize = BFS}) ->
     case maps:get(FromActorID, State#state.pending_acks, []) of
         [] ->
             {ok, State};
         Pends ->
+            %% keep the pdict thing because stale deletions don't
+            %% dirty the transaction
             erlang:put(dirty, false),
-            case lists:keyfind(Seq, 1, Pends) of
-                {Seq, CF, AKey, Multicast} when CF == State#state.active_cf ->
-                    NewPends = case MultiAck of
-                                   true ->
-                                       %% in the case that we get an ack that is not the first, we
-                                       %% ack everything up to the acked message.  keyfind is fast
-                                       %% but sadly doesn't return the index, so we get this fold:
-                                       {_, NewPends0} =
-                                       lists:foldl(
-                                         %% this clause iterates through the list until it
-                                         %% finds the entry with Seq, deleting as it goes.
-                                         fun({R, Fam, Key, MCast}, false) ->
-                                                 erlang:put(dirty, true),
-                                                 case MCast of
-                                                     false ->
-                                                         %% unicast message, fine to delete now
-                                                         ok = rocksdb:transaction_delete(Transaction, Fam, Key);
-                                                     true ->
-                                                         %% flip the bit, we can delete it next time we iterate
-                                                         flip_actor_bit(FromActorID, Transaction, Fam, Key, BFS)
-                                                 end,
-                                                 case R of
-                                                     Seq ->
-                                                         %% when we find it we switch over to
-                                                         %% clause #2
-                                                         {true, []};
-                                                     _ ->
-                                                         false
-                                                 end;
-                                            %% once we're here just accumulate the leftovers
-                                            (Elt, {true, Acc}) ->
-                                                 {true, [Elt | Acc]}
-                                         end,
-                                         false,
-                                         Pends),
-                                       %% then reverse them since we've changed the order.
-                                       lists:reverse(NewPends0);
-                                   false ->
-                                       erlang:put(dirty, true),
-                                       case Multicast of
-                                           false ->
-                                               %% unicast message, fine to delete now
-                                               ok = rocksdb:transaction_delete(Transaction, CF, AKey);
-                                           true ->
-                                               %% flip the bit, we can delete it next time we iterate
-                                               flip_actor_bit(FromActorID, Transaction, CF, AKey, BFS)
-                                       end,
-                                       lists:keydelete(Seq, 1, Pends)
-                               end,
-                    Dirty = erlang:get(dirty),
-                    erlang:erase(dirty),
-                    NewPending = (State#state.pending_acks)#{FromActorID => NewPends},
-                    {ok, maybe_dirty(Dirty, State#state{pending_acks=NewPending,
-                                                        last_sent = maps:put(FromActorID, {CF, AKey},
-                                                                             State#state.last_sent)})};
-                _ ->
-                    %% delete this, it's stale
-                    NewPends = lists:keydelete(Seq, 1, Pends),
-                    NewPending = (State#state.pending_acks)#{FromActorID => NewPends},
-                    {ok, State#state{pending_acks=NewPending}}
-            end
+            Pends1 =
+                lists:flatmap(
+                  fun({Seq, CF, AKey, Multicast} = Pend) when CF == State#state.active_cf ->
+                          case lists:member(Seq, Seqs) of
+                              true ->
+                                  erlang:put(dirty, true),
+                                  case Multicast of
+                                      false ->
+                                          %% unicast message, fine to delete now
+                                          ok = rocksdb:transaction_delete(Transaction, CF, AKey);
+                                      true ->
+                                          %% flip the bit, we can delete it next time we iterate
+                                          flip_actor_bit(FromActorID, Transaction, CF, AKey, BFS)
+                                  end,
+                                  [];
+                              _ ->
+                                  [Pend]
+                          end;
+                     (_)  ->
+                          %% delete this, it's stale
+                          []
+                  end,
+                  Pends),
+            Dirty = erlang:get(dirty),
+            erlang:erase(dirty),
+            NewPending = (State#state.pending_acks)#{FromActorID => Pends1},
+            {ok, maybe_dirty(Dirty, State#state{pending_acks=NewPending})} %,
+                                                %% last_sent = maps:put(FromActorID, {CF, AKey},
+                                                %%                      State#state.last_sent)})}
     end.
 
 %% @doc Allow inbound processing to be externally triggered so that we
