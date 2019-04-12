@@ -11,6 +11,7 @@
 
 -export([
          basic/1,
+         basic2/1,
          stop_resume/1,
          upgrade_stop_resume/1,
          defer/1,
@@ -26,6 +27,7 @@
 all() ->
     [
      basic,
+     basic2,
      stop_resume,
      upgrade_stop_resume,
      defer,
@@ -52,27 +54,68 @@ basic(_Config) ->
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data1"}]),
     {not_found, _} = relcast:take(2, RC1),
     {false, _} = relcast:command(is_done, RC1),
-    {ok, RC1_2} = relcast:deliver(<<"hello">>, 2, RC1),
+    {ok, RC1_2} = relcast:deliver(1, <<"hello">>, 2, RC1),
     {true, _} = relcast:command(is_done, RC1_2),
-    {ok, Ref, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
-    %%{ok, Ref1, <<"hai">>, RC1_4} = relcast:take(2, RC1_3),
+    {ok, Seq, [1], <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
     %% ack it
-    {ok, RC1_4} = relcast:ack(2, Ref, RC1_3),
+    {ok, RC1_4} = relcast:ack(2, Seq, RC1_3),
     %% check it's gone
-    {ok, Ref2, <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
+    {ok, Seq2, [], <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
     %% take for actor 3
-    {ok, _Ref3, <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
+    {ok, _Seq3, [], <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
     %% ack with the wrong ref
-    {ok, RC1_7} = relcast:ack(3, Ref, RC1_6),
+    {ok, RC1_7} = relcast:ack(3, Seq, RC1_6),
     %% actor 3 still has pending data, but we need to clear pending to
     %% get at it
-    {ok, Ref3_1, <<"hai">>, RC1_8} = relcast:take(3, RC1_7, true),
+    {ok, Seq3_1, [], <<"hai">>, RC1_8} = relcast:take(3, RC1_7, true),
     %% ack both of the outstanding messages
-    {ok, RC1_9} = relcast:ack(2, Ref2, RC1_8),
+    {ok, RC1_9} = relcast:ack(2, Seq2, RC1_8),
     {not_found, _} = relcast:take(2, RC1_9),
-    {ok, RC1_10} = relcast:ack(3, Ref3_1, RC1_9),
+    {ok, RC1_10} = relcast:ack(3, Seq3_1, RC1_9),
     {not_found, _} = relcast:take(2, RC1_10),
     relcast:stop(normal, RC1_10),
+    ok.
+
+basic2(_Config) ->
+    Actors = lists:seq(1, 3),
+    {ok, RC1a} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data13a"}]),
+    {ok, RC1b} = relcast:start(2, Actors, test_handler, [2], [{data_dir, "data13b"}]),
+    {not_found, _} = relcast:take(2, RC1a),
+    {not_found, _} = relcast:take(1, RC1b),
+    {ok, RC2a} = relcast:command({init, 2}, RC1a),
+    {ok, RC2b} = relcast:command({init, 1}, RC1b),
+
+    {ok, SeqA, [], MsgA, RC3a} = relcast:take(2, RC2a),
+    {ok, SeqB, [], MsgB, RC3b} = relcast:take(1, RC2b),
+
+    ct:pal("seqs a ~p ~p b ~p ~p", [SeqA, MsgA, SeqB, MsgB]),
+
+    {ok, RC3a1} = relcast:deliver(SeqB, MsgB, 2, RC3a),
+    {ok, RC3b1} = relcast:deliver(SeqA, MsgA, 1, RC3b),
+    {ok, RC4a} = relcast:ack(2, SeqA, RC3a1),
+    {ok, RC4b} = relcast:ack(1, SeqB, RC3b1),
+
+    {ok, SeqA1, [SeqB], <<"ehlo">>, RC5a} = relcast:take(2, RC4a),
+    {ok, SeqB1, [SeqA], <<"ehlo">>, RC5b} = relcast:take(1, RC4b),
+
+    {true, _} = relcast:command(is_done, RC5a),
+    {true, _} = relcast:command(is_done, RC5b),
+
+    %% ack it
+    {ok, RC6a} = relcast:ack(2, SeqA1, RC5a),
+    {ok, RC6b} = relcast:ack(1, SeqB1, RC5b),
+    %% check it's gone
+    {ok, SeqA2, [], <<"hai">>, RC7a} = relcast:take(2, RC6a),
+    {ok, SeqB2, [], <<"hai">>, RC7b} = relcast:take(1, RC6b, true),
+
+    {ok, RC8a} = relcast:ack(2, SeqA2, RC7a),
+    {ok, RC8b} = relcast:ack(2, SeqB2, RC7b),
+
+    {not_found, _} = relcast:take(2, RC8a),
+    {not_found, _} = relcast:take(1, RC8b),
+
+    relcast:stop(normal, RC8a),
+    relcast:stop(normal, RC8b),
     ok.
 
 stop_resume(_Config) ->
@@ -80,32 +123,32 @@ stop_resume(_Config) ->
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2"}]),
     {not_found, _} = relcast:take(2, RC1),
     {false, _} = relcast:command(is_done, RC1),
-    {ok, RC1_2} = relcast:deliver(<<"hello">>, 2, RC1),
+    {ok, RC1_2} = relcast:deliver(1, <<"hello">>, 2, RC1),
     {true, _} = relcast:command(is_done, RC1_2),
     {_, [], Outbound} = relcast:status(RC1_2),
     [<<"ehlo">>, <<"hai">>] = maps:get(2, Outbound),
     [<<"hai">>] = maps:get(3, Outbound),
-    {ok, Ref, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
+    {ok, Ref, [1], <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
     %% ack it
     {ok, RC1_3a} = relcast:ack(2, Ref, RC1_3),
     relcast:stop(normal, RC1_3a),
     {ok, RC1_4} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2"}]),
     %% check it's gone
-    {ok, Ref2, <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
+    {ok, Ref2, _, <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
     %% take for actor 3
-    {ok, _Ref3, <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
+    {ok, _Ref3, _, <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
     %% ack with the wrong ref
     {ok, RC1_7} = relcast:ack(3, Ref, RC1_6),
     %% actor 3 still has pending data
-    {ok, Ref3, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7, true),
+    {ok, Ref3, _, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7, true),
     relcast:stop(normal, RC1_7a),
     {ok, RC1_8} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2"}]),
     %% ack both of the outstanding messages
     {ok, RC1_9} = relcast:ack(2, Ref2, RC1_8),
     %% we lost the ack, so the message is still in-queue
-    {ok, Ref4, <<"hai">>, RC1_10} = relcast:take(2, RC1_9),
+    {ok, Ref4, _, <<"hai">>, RC1_10} = relcast:take(2, RC1_9),
     {ok, RC1_11} = relcast:ack(3, Ref3, RC1_10),
-    {ok, Ref5, <<"hai">>, RC1_12} = relcast:take(2, RC1_11, true),
+    {ok, Ref5, _, <<"hai">>, RC1_12} = relcast:take(2, RC1_11, true),
     %% ack both of the outstanding messages again
     {ok, RC1_13} = relcast:ack(2, Ref4, RC1_12),
     {not_found, _} = relcast:take(2, RC1_13),
@@ -121,12 +164,12 @@ upgrade_stop_resume(_Config) ->
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2a"}]),
     {not_found, _} = relcast:take(2, RC1),
     {false, _} = relcast:command(is_done, RC1),
-    {ok, RC1_2} = relcast:deliver(<<"hello">>, 2, RC1),
+    {ok, RC1_2} = relcast:deliver(1, <<"hello">>, 2, RC1),
     {true, _} = relcast:command(is_done, RC1_2),
     {_, [], Outbound} = relcast:status(RC1_2),
     [<<"ehlo">>, <<"hai">>] = maps:get(2, Outbound),
     [<<"hai">>] = maps:get(3, Outbound),
-    {ok, Ref, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
+    {ok, Ref, _, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
     %% ack it
     {ok, RC1_3a} = relcast:ack(2, Ref, RC1_3),
     relcast:stop(normal, RC1_3a),
@@ -150,21 +193,21 @@ upgrade_stop_resume(_Config) ->
 
     {ok, RC1_4} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2a"}]),
     %% check it's gone
-    {ok, Ref2, <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
+    {ok, Ref2, _, <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
     %% take for actor 3
-    {ok, _Ref3, <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
+    {ok, _Ref3, _, <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
     %% ack with the wrong ref
     {ok, RC1_7} = relcast:ack(3, Ref, RC1_6),
     %% actor 3 still has pending data
-    {ok, Ref3, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7, true),
+    {ok, Ref3, _, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7, true),
     relcast:stop(normal, RC1_7a),
     {ok, RC1_8} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2a"}]),
     %% ack both of the outstanding messages
     {ok, RC1_9} = relcast:ack(2, Ref2, RC1_8),
     %% we lost the ack, so the message is still in-queue
-    {ok, Ref4, <<"hai">>, RC1_10} = relcast:take(2, RC1_9),
+    {ok, Ref4, _, <<"hai">>, RC1_10} = relcast:take(2, RC1_9),
     {ok, RC1_11} = relcast:ack(3, Ref3, RC1_10),
-    {ok, Ref5, <<"hai">>, RC1_12} = relcast:take(2, RC1_11, true),
+    {ok, Ref5, _, <<"hai">>, RC1_12} = relcast:take(2, RC1_11, true),
     %% ack both of the outstanding messages again
     {ok, RC1_13} = relcast:ack(2, Ref4, RC1_12),
     {not_found, _} = relcast:take(2, RC1_13),
@@ -178,7 +221,7 @@ defer(_Config) ->
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data3"}]),
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
-    {ok, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1),
+    {ok, RC1_2} = relcast:deliver(1, <<"seq", 1:8/integer>>, 2, RC1),
     {_, [{2, <<"seq", 1:8/integer>>}], Outbound} = relcast:status(RC1_2),
     0 = maps:size(Outbound),
     {0, _} = relcast:command(round, RC1_2),
@@ -188,12 +231,12 @@ defer(_Config) ->
     [{2, 1}] = maps:to_list(Map),
     %% queue up several seq messages. all are valid but only the first can apply
     %% right now
-    {ok, RC1_4} = relcast:deliver(<<"seq", 1:8/integer>>, 3, RC1_3),
-    {ok, RC1_5} = relcast:deliver(<<"seq", 2:8/integer>>, 3, RC1_4),
-    {ok, RC1_5a} = relcast:deliver(<<"seq", 3:8/integer>>, 3, RC1_5),
+    {ok, RC1_4} = relcast:deliver(2, <<"seq", 1:8/integer>>, 3, RC1_3),
+    {ok, RC1_5} = relcast:deliver(3, <<"seq", 2:8/integer>>, 3, RC1_4),
+    {ok, RC1_5a} = relcast:deliver(4 ,<<"seq", 3:8/integer>>, 3, RC1_5),
     %% also attempt to queue a sequence number for 2 with a break, so it's not
     %% valid - this should not be deferred
-    {ok, RC1_6} = relcast:deliver(<<"seq", 3:8/integer>>, 2, RC1_5a),
+    {ok, RC1_6} = relcast:deliver(5, <<"seq", 3:8/integer>>, 2, RC1_5a),
     {Map2, _} = relcast:command(seqmap, RC1_6),
     [{2, 1}, {3, 1}] = lists:sort(maps:to_list(Map2)),
     %% increment the round, the seqmap should increment for 3
@@ -212,7 +255,7 @@ defer_stop_resume(_Config) ->
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data4"}]),
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
-    {ok, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1),
+    {ok, RC1_2} = relcast:deliver(1, <<"seq", 1:8/integer>>, 2, RC1),
     {0, _} = relcast:command(round, RC1_2),
     {#{}, _} = relcast:command(seqmap, RC1_2),
     {ok, RC1_3} = relcast:command(next_round, RC1_2),
@@ -220,16 +263,16 @@ defer_stop_resume(_Config) ->
     [{2, 1}] = maps:to_list(Map),
     %% queue up several seq messages. all are valid but only the first can apply
     %% right now
-    {ok, RC1_4} = relcast:deliver(<<"seq", 1:8/integer>>, 3, RC1_3),
-    {ok, RC1_5} = relcast:deliver(<<"seq", 2:8/integer>>, 3, RC1_4),
-    {ok, RC1_5a} = relcast:deliver(<<"seq", 3:8/integer>>, 3, RC1_5),
+    {ok, RC1_4} = relcast:deliver(2, <<"seq", 1:8/integer>>, 3, RC1_3),
+    {ok, RC1_5} = relcast:deliver(3, <<"seq", 2:8/integer>>, 3, RC1_4),
+    {ok, RC1_5a} = relcast:deliver(4, <<"seq", 3:8/integer>>, 3, RC1_5),
     %% stop and resume the relcast here to make sure we recover all our states
     %% correctly
     relcast:stop(normal, RC1_5a),
     {ok, RC1_5b} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data4"}]),
     %% also attempt to queue a sequence number for 2 with a break, so it's not
     %% valid - this should not be deferred
-    {ok, RC1_6} = relcast:deliver(<<"seq", 3:8/integer>>, 2, RC1_5b),
+    {ok, RC1_6} = relcast:deliver(5, <<"seq", 3:8/integer>>, 2, RC1_5b),
     {Map2, _} = relcast:command(seqmap, RC1_6),
     [{2, 1}, {3, 1}] = lists:sort(maps:to_list(Map2)),
     %% increment the round, the seqmap should increment for 3
@@ -246,15 +289,15 @@ defer_stop_resume(_Config) ->
 epochs(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data5"}]),
-    {ok, RC1_1a} = relcast:deliver(<<"hello">>, 2, RC1),
+    {ok, RC1_1a} = relcast:deliver(1, <<"hello">>, 2, RC1),
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
-    {ok, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1_1a),
+    {ok, RC1_2} = relcast:deliver(2, <<"seq", 1:8/integer>>, 2, RC1_1a),
     {0, _} = relcast:command(round, RC1_2),
     %% go to the next epoch
     {ok, RC1_3} = relcast:command(next_epoch, RC1_2),
     %% queue up another deferred message
-    {ok, RC1_4} = relcast:deliver(<<"seq", 2:8/integer>>, 2, RC1_3),
+    {ok, RC1_4} = relcast:deliver(3, <<"seq", 2:8/integer>>, 2, RC1_3),
     %% go to the next round
     {ok, RC1_5} = relcast:command(next_round, RC1_4),
     %% check the deferred message from the previous epoch gets handled
@@ -283,15 +326,15 @@ epochs_gc(_Config) ->
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
-    {ok, RC1_1a} = relcast:deliver(<<"hello">>, 2, RC1),
-    {ok, RC1_2} = relcast:deliver(<<"seq", 1:8/integer>>, 2, RC1_1a),
+    {ok, RC1_1a} = relcast:deliver(1, <<"hello">>, 2, RC1),
+    {ok, RC1_2} = relcast:deliver(2, <<"seq", 1:8/integer>>, 2, RC1_1a),
     {0, _} = relcast:command(round, RC1_2),
     %% go to the next epoch
     {ok, RC1_3} = relcast:command(next_epoch, RC1_2),
     %% go to the next epoch, this should GC the original epoch
     {ok, RC1_4} = relcast:command(next_epoch, RC1_3),
     %% this is now invalid because we're lacking the previous one
-    {ok, RC1_5} = relcast:deliver(<<"seq", 2:8/integer>>, 2, RC1_4),
+    {ok, RC1_5} = relcast:deliver(3, <<"seq", 2:8/integer>>, 2, RC1_4),
     %% go to the next round
     {ok, RC1_6} = relcast:command(next_round, RC1_5),
     %% check the deferred message from the previous epoch gets handled
@@ -328,9 +371,9 @@ epochs_gc(_Config) ->
 callback_message(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data7"}]),
-    {ok, RC1_2} = relcast:deliver(<<"greet">>, 2, RC1),
-    {ok, Ref, <<"greetings to 2">>, RC1_3} = relcast:take(2, RC1_2),
-    {ok, Ref2, <<"greetings to 3">>, RC1_4} = relcast:take(3, RC1_3),
+    {ok, RC1_2} = relcast:deliver(1, <<"greet">>, 2, RC1),
+    {ok, Ref, _, <<"greetings to 2">>, RC1_3} = relcast:take(2, RC1_2),
+    {ok, Ref2, _, <<"greetings to 3">>, RC1_4} = relcast:take(3, RC1_3),
     {ok, RC1_5} = relcast:ack(2, Ref, RC1_4),
     {ok, RC1_6} = relcast:ack(3, Ref2, RC1_5),
     {not_found, RC1_7} = relcast:take(2, RC1_6),
@@ -342,10 +385,10 @@ self_callback_message(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data8"}]),
     {false, _} = relcast:command(was_saluted, RC1),
-    {ok, RC1_2} = relcast:deliver(<<"salute">>, 2, RC1),
-    {ok, Ref,  <<"salutations to 2">>, RC1_3} = relcast:take(2, RC1_2),
-    %%{ok, Ref,  <<"salutations to 2">>, _} = relcast:take(2, RC1_3),
-    {ok, Ref2, <<"salutations to 3">>, RC1_4} = relcast:take(3, RC1_3),
+    {ok, RC1_2} = relcast:deliver(1, <<"salute">>, 2, RC1),
+    {ok, Ref,  _, <<"salutations to 2">>, RC1_3} = relcast:take(2, RC1_2),
+    %%{ok, Ref, _, <<"salutations to 2">>, _} = relcast:take(2, RC1_3),
+    {ok, Ref2, _, <<"salutations to 3">>, RC1_4} = relcast:take(3, RC1_3),
     {ok, RC1_5} = relcast:ack(2, Ref, RC1_4),
     {ok, RC1_6} = relcast:ack(3, Ref2, RC1_5),
     {not_found, RC1_7} = relcast:take(2, RC1_6),
@@ -360,18 +403,18 @@ pipeline(_Config) ->
     {not_found, _} = relcast:take(2, RC1),
     {ok, RC2} =
         lists:foldl(fun(Idx, {ok, Acc}) ->
-                            relcast:deliver(<<"unicast: hello - ", (integer_to_binary(Idx))/binary>>, 2, Acc)
+                            relcast:deliver(Idx, <<"unicast: hello - ", (integer_to_binary(Idx))/binary>>, 2, Acc)
                     end,
                     {ok, RC1},
                     [N || N <- lists:seq(1, 30)]),
-    {ok, Ref1, <<"hello - 18">>, RC3} =
-        lists:foldl(fun(_Idx, {ok, _R, _Msg, Acc}) ->
+    {ok, Ref1, _, <<"hello - 18">>, RC3} =
+        lists:foldl(fun(_Idx, {ok, _R, _Acks, _Msg, Acc}) ->
                             relcast:take(2, Acc)
                     end,
-                    {ok, ign, ign, RC2},
+                    {ok, ign, ign, ign, RC2},
                     [N || N <- lists:seq(1, 18)]),
-    {ok, Ref2, <<"hello - 19">>, RC4} = relcast:take(2, RC3),
-    {ok, Ref3, <<"hello - 20">>, RC5} = relcast:take(2, RC4),
+    {ok, Ref2, _, <<"hello - 19">>, RC4} = relcast:take(2, RC3),
+    {ok, Ref3, _, <<"hello - 20">>, RC5} = relcast:take(2, RC4),
     {pipeline_full, _RC4} = relcast:take(2, RC5),
     20 = relcast:in_flight(2, RC5),
     %% singly ack the second-to-last message first
@@ -388,7 +431,7 @@ pipeline(_Config) ->
         lists:foldl(fun(Idx, Acc) ->
                             Msg = <<"hello - ", (integer_to_binary(Idx))/binary>>,
                             0 = relcast:in_flight(2, Acc),
-                            {ok, R, Msg, Acc1} = relcast:take(2, Acc),
+                            {ok, R, _, Msg, Acc1} = relcast:take(2, Acc),
                             1 = relcast:in_flight(2, Acc1),
                             {ok, Acc2} = relcast:ack(2, R, Acc1),
                             0 = relcast:in_flight(2, Acc2),

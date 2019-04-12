@@ -147,7 +147,7 @@
 -export([
          start/5,
          command/2,
-         deliver/3,
+         deliver/4,
          take/2, take/3,
          reset_actor/2,
          in_flight/2,
@@ -297,12 +297,13 @@ command(Message, State = #state{module = Module,
 %% result of this, the message is either consumed immediately, deferred for
 %% later, or this function returns `full' to indicate it cannot absorb any more
 %% deferred messages from this Actor.
--spec deliver(binary(), pos_integer(), relcast_state()) -> {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
+-spec deliver(non_neg_integer(), binary(), pos_integer(), relcast_state()) ->
+                     {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
 deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
                                                   defers = Defers}) ->
     case handle_message(undefined, undefined, FromActorID, Message, State#state.transaction, State) of
         {ok, NewState0} ->
-            NewState = store_ack(Seq, From, NewState0),
+            NewState = store_ack(Seq, FromActorID, NewState0),
             %% something happened, evaluate if we can handle any other blocked messages
             case length(maps:keys(Defers)) of
                 0 ->
@@ -318,13 +319,13 @@ deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
                     end
             end;
         {stop, Timeout, NewState0} ->
-            NewState = store_ack(Seq, From, NewState0),
+            NewState = store_ack(Seq, FromActorID, NewState0),
             {stop, Timeout, NewState};
         ignore ->
-            NewState = store_ack(Seq, From, State),
+            NewState = store_ack(Seq, FromActorID, State),
             {ok, NewState};
         defer ->
-            NewState = store_ack(Seq, From, State),
+            NewState = store_ack(Seq, FromActorID, State),
             DefersForThisActor = maps:get(FromActorID, Defers, []),
             MaxDefers = application:get_env(relcast, max_defers, 100),
             case DefersForThisActor of
@@ -360,7 +361,7 @@ take(ID, State) ->
                   {pipeline_full, relcast_state()} |
                   {ok,
                    Seq :: non_neg_integer(),
-                   Acks :: [non_neg_number()],
+                   Acks :: [non_neg_integer()],
                    Msg :: binary(),
                    NewState :: relcast_state()}.
 take(ForActorID, State, true) ->
@@ -385,9 +386,9 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                             {Seq2, State2} = make_seq(ForActorID, State),
                             Pends1 = Pends ++ [{Seq2, CF2, Key2, Multicast}],
                             %% merge these?
-                            {Acks, State3} = get_acks(State2),
+                            {Acks, State3} = get_acks(ForActorID, State2),
                             State4 = maybe_commit(State3),
-                            {ok, Acks, Seq2, Msg,
+                            {ok, Seq2, Acks, Msg,
                              State4#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}};
                         not_found ->
                             {not_found, State#state{last_sent=maps:put(ForActorID, none, State#state.last_sent)}}
@@ -418,7 +419,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                             {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey}, State#state.last_sent)}};
                         {Key, CF2, Msg, Multicast} ->
                             {Seq, State2} = make_seq(ForActorID, State),
-                            {Acks, State3} = get_acks(State2),
+                            {Acks, State3} = get_acks(ForActorID, State2),
                             State4 = maybe_commit(State3),
                             {ok, Seq, Acks, Msg,
                              State4#state{pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
@@ -1088,15 +1089,17 @@ mark_defers(S) ->
             last_defer_check = erlang:monotonic_time(milli_seconds)}.
 
 
-store_ack(Seq, From, S) ->
+store_ack(Seq, From, #state{floated_acks = Acks} = S) ->
     %% should we be able to infer the seq without external tracking?
-    ActorAcks = maps:get(From, S#state.deferred_acks, []),
-    %% at some point we might not need to keep them in order?
-    S#state{deferred_acks = Acks#{FromActorID => ActorAcks ++ [Seq]}}.
-
-get_acks(From, #state{deferred_acks = Acks} = S) ->
     ActorAcks = maps:get(From, Acks, []),
-    {ActorAcks, S#state{deferred_acks = Acks#{From => []}}}.
+    %% at some point we might not need to keep them in order?
+    S#state{floated_acks = Acks#{From => ActorAcks ++ [Seq]}}.
+
+%% TODO: eventually we want to only deliver acks that have actually
+%% been `take`en, and hence have been externally visible.
+get_acks(From, #state{floated_acks = Acks} = S) ->
+    ActorAcks = maps:get(From, Acks, []),
+    {ActorAcks, S#state{floated_acks = Acks#{From => []}}}.
 
 -ifdef(TEST).
 
