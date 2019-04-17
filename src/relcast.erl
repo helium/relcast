@@ -870,16 +870,13 @@ get_mod_state(DB, OldCF, Module, ModuleState0, WriteOpts) ->
                     NewSer = Module:serialize(ModState),
                     case get_key_tree(Module, NewSer) of
                         KeyTree ->
-                            lager:info("state matches ~p", [KeyTree]),
                             {SerState, ModState, KeyTree};
                         bin ->
-                            lager:info("state moved to bin ~p", [KeyTree]),
                             ok = rocksdb:put(DB, ?stored_module_state, NewSer,
                                              [{sync, true}]),
                             _ = rocksdb:delete(DB, ?stored_key_tree, [{sync, true}]),
                             {SerState, ModState, bin};
                         KeyTreeNew ->
-                            lager:info("state didn't match new ~p old ~p", [KeyTree, KeyTreeNew]),
                             ok = rocksdb:put(DB, ?stored_key_tree,
                                              term_to_binary(KeyTreeNew, [compressed]), [{sync, true}]),
                             {SerState, ModState, KeyTree}
@@ -1176,10 +1173,8 @@ do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
                           KeyName = <<Pfix/binary, (atom_to_binary(K, utf8))/binary>>,
                           Term = case rocksdb:get(DB, KeyName, []) of
                                      {ok, Bin} ->
-                                         lager:info("~p -> ~p", [KeyName, Bin]),
                                          Bin;
                                      not_found ->
-                                         lager:info("~p -> not_found", [KeyName]),
                                          undefined
                                  end,
                           Acc#{K => Term};
