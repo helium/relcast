@@ -136,6 +136,7 @@
           new_defers :: undefined | integer(),  % right now this is just a counter for delivers
           last_defer_check :: undefined | integer(),
           key_tree :: [any()],
+          key_tree_checked = false :: boolean(),
           db_opts = [] :: [any()],
           write_opts = [] :: [any()]
          }).
@@ -850,7 +851,8 @@ get_mod_state(DB, OldCF, Module, ModuleState0, WriteOpts) ->
                             bin ->
                                 bin;
                             KeyTree ->
-                                _ = maybe_write_key_tree(KeyTree, #state{transaction = Txn}),
+                                ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
+                                                             term_to_binary(KeyTree, [compressed])),
                                 ok = rocksdb:transaction_delete(Txn, ?stored_module_state),
                                 KeyTree
                         end,
@@ -860,7 +862,26 @@ get_mod_state(DB, OldCF, Module, ModuleState0, WriteOpts) ->
                     case rocksdb:get(DB, ?stored_key_tree, []) of
                         {ok, KeyTreeBin} ->
                             KeyTree = binary_to_term(KeyTreeBin),
-                            do_deserialize(Module, ModuleState0, ?stored_key_prefix, KeyTree, DB);
+                            {SerState, ModState, _KT} =
+                                do_deserialize(Module, ModuleState0, ?stored_key_prefix, KeyTree, DB),
+                            NewSer = Module:serialize(ModState),
+                            case get_key_tree(Module, NewSer) of
+                                KeyTree ->
+                                    lager:info("state matches ~p", [KeyTree]),
+                                    {SerState, ModState, KeyTree};
+                                bin ->
+                                    lager:info("state moved to bin ~p", [KeyTree]),
+                                    ok = rocksdb:put(DB, ?stored_module_state, NewSer,
+                                                     [{sync, true}]),
+                                    ok = rocksdb:delete(DB, ?stored_key_tree, [{sync, true}]),
+                                    {SerState, ModState, bin};
+                                KeyTreeNew ->
+                                    lager:info("state didn't match new ~p old ~p", [KeyTree, KeyTreeNew]),
+                                    ok = rocksdb:put(DB, ?stored_key_tree,
+                                                     term_to_binary(KeyTreeNew, [compressed]), [{sync, true}]),
+                                    {SerState, ModState, KeyTree}
+                            end;
+                            %% try to force full keytree rewrite on startup
                         not_found ->
                             {undefined, ModuleState0, bin}
                     end
@@ -1075,22 +1096,15 @@ maybe_serialize(Mod, _Old, #state{modulestate = New0,
                                   old_serialized = Old,
                                   transaction = Transaction} = S) ->
     New = Mod:serialize(New0),
-    KeyTree = do_serialize(Mod, Old, New, ?stored_key_prefix, Transaction),
-    S1 = maybe_write_key_tree(KeyTree, S),
-    S1#state{old_serialized = New, transaction_dirty = true}.
-
-maybe_write_key_tree(KeyTree, S) when KeyTree == S#state.key_tree->
-    S;
-maybe_write_key_tree(KeyTree, S) ->
-    ok = rocksdb:transaction_put(S#state.transaction, ?stored_key_tree,
-                                 term_to_binary(KeyTree, [compressed])),
-    S#state{key_tree = KeyTree}.
+    _KeyTree = do_serialize(Mod, Old, New, ?stored_key_prefix, Transaction),
+    S#state{old_serialized = New, transaction_dirty = true}.
 
 old_size(M) when is_map(M) ->
     maps:size(M);
 old_size(_) ->
     -1.
 
+%% TODO: remove all keytree accumulation from here?
 do_serialize(Mod, Old, New, Prefix, Transaction) ->
     case New of
         State when is_binary(State) ->
@@ -1139,6 +1153,18 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
             [Mod | KeyTree]
     end.
 
+get_key_tree(_, B) when is_binary(B) ->
+    bin;
+get_key_tree(Mod, Map) ->
+    KT = lists:map(
+           fun({K, V}) when is_map(V)->
+                   get_key_tree(K, V);
+              ({K, _V}) ->
+                   K
+           end,
+           maps:to_list(Map)),
+    [Mod | KT].
+
 fixup_old_map(never_ever_match_with_anything) ->
     undefined;
 fixup_old_map(M) ->
@@ -1151,8 +1177,10 @@ do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
                           KeyName = <<Pfix/binary, (atom_to_binary(K, utf8))/binary>>,
                           Term = case rocksdb:get(DB, KeyName, []) of
                                      {ok, Bin} ->
+                                         lager:info("~p -> ~p", [KeyName, Bin]),
                                          Bin;
                                      not_found ->
+                                         lager:info("~p -> not_found", [KeyName]),
                                          undefined
                                  end,
                           Acc#{K => Term};
