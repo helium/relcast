@@ -859,31 +859,30 @@ get_mod_state(DB, OldCF, Module, ModuleState0, WriteOpts) ->
                     rocksdb:transaction_commit(Txn),
                     {SerState, ModState, KT};
                 not_found ->
-                    case rocksdb:get(DB, ?stored_key_tree, []) of
-                        {ok, KeyTreeBin} ->
-                            KeyTree = binary_to_term(KeyTreeBin),
-                            {SerState, ModState, _KT} =
-                                do_deserialize(Module, ModuleState0, ?stored_key_prefix, KeyTree, DB),
-                            NewSer = Module:serialize(ModState),
-                            case get_key_tree(Module, NewSer) of
-                                KeyTree ->
-                                    lager:info("state matches ~p", [KeyTree]),
-                                    {SerState, ModState, KeyTree};
-                                bin ->
-                                    lager:info("state moved to bin ~p", [KeyTree]),
-                                    ok = rocksdb:put(DB, ?stored_module_state, NewSer,
-                                                     [{sync, true}]),
-                                    ok = rocksdb:delete(DB, ?stored_key_tree, [{sync, true}]),
-                                    {SerState, ModState, bin};
-                                KeyTreeNew ->
-                                    lager:info("state didn't match new ~p old ~p", [KeyTree, KeyTreeNew]),
-                                    ok = rocksdb:put(DB, ?stored_key_tree,
-                                                     term_to_binary(KeyTreeNew, [compressed]), [{sync, true}]),
-                                    {SerState, ModState, KeyTree}
-                            end;
-                            %% try to force full keytree rewrite on startup
-                        not_found ->
-                            {undefined, ModuleState0, bin}
+                    {SerState, ModState, KeyTree} =
+                        case rocksdb:get(DB, ?stored_key_tree, []) of
+                            {ok, KeyTreeBin} ->
+                                KT = binary_to_term(KeyTreeBin),
+                                do_deserialize(Module, ModuleState0, ?stored_key_prefix, KT, DB);
+                            not_found ->
+                                {undefined, ModuleState0, bin}
+                        end,
+                    NewSer = Module:serialize(ModState),
+                    case get_key_tree(Module, NewSer) of
+                        KeyTree ->
+                            lager:info("state matches ~p", [KeyTree]),
+                            {SerState, ModState, KeyTree};
+                        bin ->
+                            lager:info("state moved to bin ~p", [KeyTree]),
+                            ok = rocksdb:put(DB, ?stored_module_state, NewSer,
+                                             [{sync, true}]),
+                            _ = rocksdb:delete(DB, ?stored_key_tree, [{sync, true}]),
+                            {SerState, ModState, bin};
+                        KeyTreeNew ->
+                            lager:info("state didn't match new ~p old ~p", [KeyTree, KeyTreeNew]),
+                            ok = rocksdb:put(DB, ?stored_key_tree,
+                                             term_to_binary(KeyTreeNew, [compressed]), [{sync, true}]),
+                            {SerState, ModState, KeyTree}
                     end
             end
     end.
