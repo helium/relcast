@@ -257,7 +257,9 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
             Defers = build_defer_list(rocksdb:iterator_move(Iter, {seek, min_inbound_key()}), Iter, InboundCF, #{}),
             %% try to deliver any old queued inbound messages
             {ok, Transaction} = transaction(DB, WriteOpts),
-            {ok, NewState} = handle_pending_inbound(Transaction, State#state{defers=Defers}),
+            {ok, NewState} = handle_pending_inbound(Transaction,
+                                                    State#state{transaction = Transaction,
+                                                                defers=Defers}),
             ok = rocksdb:transaction_commit(Transaction),
             {ok, Transaction1} = transaction(DB, WriteOpts),
             {ok, NewState#state{transaction = Transaction1}};
