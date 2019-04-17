@@ -35,6 +35,8 @@
          act_st = #{} :: #{pos_integer() => act()},
          %% TODO should we move in-flight into the actor?
          inflight = #{} :: #{pos_integer() => [{Seq ::  pos_integer(), Epoch :: non_neg_integer(), binary()}]},
+         ackable = #{} :: #{},
+         seqno = 1 :: pos_integer(),
          messages = #{} :: #{{pos_integer(), pos_integer()} => {Epoch :: non_neg_integer(), binary()}},
 
          seq = [] :: [non_neg_integer()],
@@ -70,9 +72,13 @@ initial_state() ->
     Inf = maps:from_list([{A, []}
                              || A <- Actors]),
 
+    Ackable = maps:from_list([{A, []}
+                              || A <- Actors]),
+
     #s{actors = Actors,
        rc = undefined,
        inflight = Inf,
+       ackable = Ackable,
        running = true,
        act_st = States}.
 
@@ -92,13 +98,14 @@ command(S) ->
 
        {10, {call, ?M, message,
              [S#s.rc,
+              S#s.seqno,
               oneof(S#s.actors),
               oneof(lists:seq(S#s.current_counter, S#s.current_counter + 2)),
               nat()]}},
        {4, {call, ?M, next_col, [S#s.rc]}}, %% called for model side effects
 
        {10, {call, ?M, seq_message,
-             [S#s.rc, nat()]}},
+             [S#s.rc, S#s.seqno, nat()]}},
 
        {10, {call, ?M, take, [S#s.rc, oneof(S#s.actors)]}},
        {10, {call, ?M, peek, [S#s.rc, oneof(S#s.actors)]}},
@@ -134,11 +141,11 @@ postcondition(S, {call, _, take, [_, Actor]}, R) ->
                end,
 
     case R of
-        {ok, _Seq, Expected, _RC} ->
+        {ok, _Seq, _Acks, Expected, _RC} ->
             true;
-        {Expected, _RC} ->
+        {Expected, _, _RC} ->
             true;
-        {ok, _Seq, Unexpected, _RC} ->
+        {ok, _Seq, _Acks, Unexpected, _RC} ->
             {unexpected_take1, Actor, {exp, Expected}, {got, Unexpected},
              S#s.messages, S#s.inflight};
         {Unexpected, _RC} ->
@@ -254,16 +261,19 @@ next_state(#s{act_st = States,
         inflight = {call, ?M, deliver_inf, [Actor, Inf]}};
 next_state(S, V, {_, _, take, [_, Actor]}) ->
     S#s{rc = {call, ?M, extract_state, [V]},
-        inflight = {call, ?M, extract_inf, [V, Actor, S#s.inflight, S#s.messages, S#s.act_st]}};
+        inflight = {call, ?M, extract_inf, [V, Actor, S#s.inflight, S#s.messages, S#s.act_st]},
+        ackable = {call, ?M, extract_ack, [V, Actor, S#s.ackable]}};
 next_state(S, _V, {_, _, peek, _}) ->
     S;
 next_state(S, _V, {_, _, in_flight, _}) ->
     S;
 next_state(S, V, {_, _, message, _}) ->
     S#s{rc = {call, erlang, element, [1, V]},
+        seqno = S#s.seqno + 1,
         counters = {call, ?M, update_counters, [V, S#s.counters]}};
-next_state(S, V, {_, _, seq_message, [_, Seq]}) ->
+next_state(S, V, {_, _, seq_message, [_, _, Seq]}) ->
     S#s{rc = {call, erlang, element, [1, V]},
+        seqno = S#s.seqno + 1,
         seq = {call, ?M, update_seq, [Seq, S#s.seq, V]}};
 next_state(S, RC, {_, _, next_col, _}) ->
     S#s{rc = RC,
@@ -360,19 +370,26 @@ filter_old_inflight(InFlight, Epoch) ->
 reset_inf(Actor, Inf) ->
     Inf#{Actor => []}.
 
-extract_state({_, RC}) ->
+extract_state({_, _, RC}) ->
     RC;
-extract_state({ok, _, _, RC}) ->
+extract_state({ok, _, _, _, RC}) ->
     RC.
 
-extract_inf({_, _}, _, Inf, _, _) ->
+extract_inf({_, _, _}, _, Inf, _, _) ->
     Inf;
-extract_inf({ok, Seq, Msg, _RC}, Actor, Inf, Msgs, States) ->
+extract_inf({ok, Seq, _Acks, Msg, _RC}, Actor, Inf, Msgs, States) ->
     %% find which epoch this message was from
     #act{acked = Acked} = maps:get(Actor, States),
     #{Actor := Q} = Inf,
     {Epoch, _Msg} = maps:get({Actor, length(Q)+Acked + 1}, Msgs),
     Inf#{Actor => Q ++ [{Seq, Epoch, Msg}]}.
+
+extract_ack({_, _}, _, Ackable) ->
+    Ackable;
+extract_ack({ok, _Seq, Acks, _Msg, _RC}, Actor, Ackable) ->
+    #{Actor := PriorAcks} = Ackable,
+    NewAcks = PriorAcks ++ Acks,
+    Ackable#{Actor => NewAcks}.
 
 update_counters({_, full}, Cols) ->
     Cols;
@@ -410,7 +427,7 @@ stop_command(RC) ->
     relcast:stop(reason, RC1).
 
 stop_message(RC) ->
-    {stop, 0, RC1} = relcast:deliver(term_to_binary(stop), 1, RC),
+    {stop, 0, RC1} = relcast:deliver(0, term_to_binary(stop), 1, RC),
     relcast:stop(reason, RC1).
 
 command(RC, Actor, Msg) ->
@@ -466,8 +483,8 @@ ack_all(RC, Actor, States, InFlight) ->
                 false ->
                     RC1 = RC;
                 true ->
-                    {Seq, _Epoch, _Msg} = lists:last(OurInFlight),
-                    {ok, RC1} = relcast:multi_ack(Actor, Seq, RC)
+                    Seqs = [Seq || {Seq, _Epoch, _Msg} <- OurInFlight],
+                    {ok, RC1} = relcast:ack(Actor, Seqs, RC)
             end
     end,
     RC1.
@@ -476,9 +493,9 @@ reset(RC, Actor) ->
     {ok, RC1} = relcast:reset_actor(Actor, RC),
     RC1.
 
-message(RC, FromActor, Col, Val) ->
+message(RC, FromActor, SeqNo, Col, Val) ->
     Msg = term_to_binary({add, Col, Val}),
-    case relcast:deliver(Msg, FromActor, RC) of
+    case relcast:deliver(SeqNo, Msg, FromActor, RC) of
         {ok, RC1} ->
             {RC1, Msg};
         full ->
@@ -489,9 +506,9 @@ next_col(RC) ->
     {ok, RC1} = relcast:command(next_col, RC),
     RC1.
 
-seq_message(RC, Seq) ->
+seq_message(RC, SeqNo, Seq) ->
     Msg = term_to_binary({seq, Seq}),
-    case relcast:deliver(Msg, 1, RC) of
+    case relcast:deliver(SeqNo, Msg, 1, RC) of
         {ok, RC1} ->
             {#state{seq=MySeq}, RC2} = relcast:command(state, RC1),
             {_Ms, InboundQueue, _OutboundQueue} = relcast:status(RC2),
