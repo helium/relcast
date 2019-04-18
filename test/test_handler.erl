@@ -26,6 +26,8 @@ init([ID]) ->
 
 handle_command(next_epoch, State) ->
     {reply, ok, [new_epoch], State};
+handle_command({init, To}, State) ->
+    {reply, ok, [{unicast, To, <<"hello">>}], State};
 handle_command(round, State) ->
     {reply, State#state.round, ignore};
 handle_command(next_round, State) ->
