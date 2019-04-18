@@ -1,0 +1,95 @@
+-module(handler1).
+
+%-behavior(relcast).
+
+-export([
+         init/1,
+         handle_command/2,
+         handle_message/3,
+         callback_message/3,
+         serialize/1,
+         deserialize/1,
+         restore/2
+        ]).
+
+-record(state, {
+                a :: atom(),
+                b :: atom(),
+                c :: atom(),
+                d :: atom(),
+                e :: atom(),
+                f :: atom(),
+                g :: atom()
+               }).
+
+init([]) ->
+    {ok, #state{}}.
+
+handle_command(populate3, State) ->
+    {reply, ok, [], State#state{a=a2, b=b2, c=c2, d=d2, e=e2, f=f2, g=g2}};
+handle_command(get, State) ->
+    {reply, State, [], State};
+handle_command(Msg, _State) ->
+    io:format("handle_call, Msg: ~p", [Msg]),
+    {reply, ok, ignore}.
+
+handle_message(Msg, Actor, State) ->
+    cthr:pal("handle_message, Msg: ~p, Actor: ~p~n", [Msg, Actor]),
+    {State, []}.
+
+callback_message(_, _, _) ->
+    ignore.
+
+serialize(#state{a = A,
+                 b = B,
+                 c = C,
+                 d = D,
+                 e = E,
+                 f = F,
+                 g = G} = State) ->
+    cthr:pal("Serialize b: ~p~n", [State]),
+    M = #{a => A,
+          b => B,
+          c => C,
+          d => D,
+          e => E,
+          f => F,
+          g => G},
+    maps:map(fun(_K, V) -> term_to_binary(V) end, M).
+
+deserialize(B) when is_binary(B) ->
+    cthr:pal("Deserialize b bin: ~p~n", [B]),
+    binary_to_term(B);
+deserialize(M) ->
+    cthr:pal("Deserialize b map: ~p~n", [M]),
+    M1 = maps:map(fun(_K, V) -> binary_to_term(V) end, M),
+    case M1 of
+        #{a := A,
+          b := B,
+          c := C,
+          d := D,
+          e := E,
+          f := F,
+          g := G} ->
+            #state{a = A,
+                   b = B,
+                   c = C,
+                   d = D,
+                   e = E,
+                   f = F,
+                   g = G};
+        #{a := A,
+          b := B,
+          c := C,
+          d := D,
+          e := E} ->
+            #state{a = A,
+                   b = B,
+                   c = C,
+                   d = D,
+                   e = E}
+    end.
+
+restore(OldState, NewState) ->
+    cthr:pal("b OldState: ~p, NewState: ~p~n", [OldState, NewState]),
+    {ok, OldState}.
