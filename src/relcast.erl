@@ -113,7 +113,8 @@
          {
           db :: rocksdb:db_handle(),
           module :: atom(),
-          modulestate :: any(),
+          module_state :: any(),
+          old_module_state :: any(),
           old_serialized :: undefined | map() | binary(),
           id :: pos_integer(),
           ids :: [pos_integer()],
@@ -244,7 +245,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                            inbound_cf = InboundCF,
                            active_cf = ActiveCF,
                            ids = ActorIDs,
-                           modulestate = ModuleState,
+                           module_state = ModuleState,
                            old_serialized = OldSer,
                            db = DB,
                            out_key_count = LastKeyOut + 1,
@@ -275,7 +276,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
 %% module's state or send messages via `{reply, Reply, Actions, NewModuleState}'.
 -spec command(any(), relcast_state()) -> {any(), relcast_state()} | {stop, any(), pos_integer(), relcast_state()}.
 command(Message, State = #state{module = Module,
-                                modulestate = ModuleState,
+                                module_state = ModuleState,
                                 transaction = Transaction}) ->
     case Module:handle_command(Message, ModuleState) of
         {reply, Reply, ignore} ->
@@ -286,16 +287,14 @@ command(Message, State = #state{module = Module,
             %% write new output messages & update the state atomically
             case handle_actions(Actions, Transaction, State1) of
                 {ok, NewState} ->
-                    NewState1 = maybe_serialize(Module, ModuleState, NewState),
-                    case handle_pending_inbound(NewState#state.transaction, NewState1) of
+                    case handle_pending_inbound(NewState#state.transaction, NewState) of
                         {ok, NewerState} ->
                             {Reply, NewerState};
                         {stop, Timeout, NewerState} ->
                             {stop, Reply, Timeout, NewerState}
                     end;
                 {stop, Timeout, NewState} ->
-                    NewState1 = maybe_serialize(Module, ModuleState, NewState),
-                    {stop, Reply, Timeout, NewState1}
+                    {stop, Reply, Timeout, NewState}
             end
     end.
 
@@ -398,7 +397,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                             Pends1 = Pends ++ [{Seq2, CF2, Key2, Multicast}],
                             %% merge these?
                             {Acks, State3} = get_acks(ForActorID, State2),
-                            State4 = maybe_commit(State3),
+                            State4 = maybe_commit(maybe_serialize(State3)),
                             {ok, Seq2, Acks, Msg,
                              State4#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}};
                         not_found ->
@@ -436,7 +435,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                         {Key, CF2, Msg, Multicast} ->
                             {Seq, State2} = make_seq(ForActorID, State),
                             {Acks, State3} = get_acks(ForActorID, State2),
-                            State4 = maybe_commit(State3),
+                            State4 = maybe_commit(maybe_serialize(State3)),
                             {ok, Seq, Acks, Msg,
                              State4#state{pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
                         not_found ->
@@ -578,7 +577,7 @@ process_inbound(State) ->
 
 %% @doc Stop the relcast instance.
 -spec stop(any(), relcast_state()) -> ok.
-stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
+stop(Reason, State = #state{module=Module, module_state=ModuleState})->
     case erlang:function_exported(Module, terminate, 2) of
         true ->
             Module:terminate(Reason, ModuleState);
@@ -591,7 +590,7 @@ stop(Reason, State = #state{module=Module, modulestate=ModuleState})->
 %% @doc Get a representation of the relcast's module state, inbound queue and
 %% outbound queue.
 -spec status(relcast_state()) -> status().
-status(State = #state{modulestate = ModuleState, transaction = Transaction}) ->
+status(State = #state{module_state = ModuleState, transaction = Transaction}) ->
     {ok, Iter} = rocksdb:transaction_iterator(State#state.db, Transaction, State#state.active_cf,
                                               [{iterate_upper_bound, max_outbound_key()}]),
     OutboundQueue = build_outbound_status(rocksdb:iterator_move(Iter, {seek, min_outbound_key()}),
@@ -690,7 +689,7 @@ handle_defers(Transaction, [{CF, Key, FromActorID, Msg}|Acc], Out, Changed, Stat
     end.
 
 
-handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module=Module, modulestate=ModuleState}) ->
+handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module=Module, module_state=ModuleState}) ->
     case Module:handle_message(Message, FromActorID, ModuleState) of
         ignore ->
             State1 =
@@ -714,13 +713,11 @@ handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module
                     false ->
                         false
                 end,
-            case handle_actions(Actions, Transaction, State#state{modulestate=NewModuleState}) of
+            case handle_actions(Actions, Transaction, State#state{module_state=NewModuleState}) of
                 {ok, NewState} ->
-                    NewState1 = maybe_serialize(Module, ModuleState, NewState),
-                    {ok, maybe_dirty(Dirty, NewState1)};
+                    {ok, maybe_dirty(Dirty, NewState)};
                 {stop, Timeout, NewState} ->
-                    NewState1 = maybe_serialize(Module, ModuleState, NewState),
-                    {stop, Timeout, maybe_dirty(Dirty, NewState1)}
+                    {stop, Timeout, maybe_dirty(Dirty, NewState)}
             end
     end.
 
@@ -747,38 +744,38 @@ handle_actions([{multicast, Message}|Tail], Transaction, State =
     ok = rocksdb:transaction_put(Transaction, CF, Key, <<0:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
     %% handle our own copy of the message
     %% deferring your own message is an error
-    case Module:handle_message(Message, ID, State#state.modulestate) of
+    case Module:handle_message(Message, ID, State#state.module_state) of
         ignore ->
             handle_actions(Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
         {ModuleState, Actions} ->
-            handle_actions(Actions++Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, out_key_count=KeyCount+1}))
+            handle_actions(Actions++Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{module_state=ModuleState, out_key_count=KeyCount+1}))
     end;
 handle_actions([{callback, Message}|Tail], Transaction, State =
                #state{out_key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
     Key = make_outbound_key(KeyCount),
     ok = rocksdb:transaction_put(Transaction, CF, Key, <<2:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
-    case Module:callback_message(ID, Message, State#state.modulestate) of
+    case Module:callback_message(ID, Message, State#state.module_state) of
         none ->
             handle_actions(Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
         OurMessage when is_binary(OurMessage) ->
             %% handle our own copy of the message
             %% deferring your own message is an error
-            case Module:handle_message(OurMessage, ID, State#state.modulestate) of
+            case Module:handle_message(OurMessage, ID, State#state.module_state) of
                 ignore ->
                     handle_actions(Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
                 {ModuleState, Actions} ->
-                    handle_actions(Actions++Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{modulestate=ModuleState, out_key_count=KeyCount+1}))
+                    handle_actions(Actions++Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{module_state=ModuleState, out_key_count=KeyCount+1}))
             end
     end;
 handle_actions([{unicast, ID, Message}|Tail], Transaction, State = #state{module=Module, id=ID}) ->
     %% handle our own message
     %% deferring your own message is an error
-    case Module:handle_message(Message, ID, State#state.modulestate) of
+    case Module:handle_message(Message, ID, State#state.module_state) of
         ignore ->
             handle_actions(Tail, Transaction, State);
         {ModuleState, Actions} ->
-            handle_actions(Actions++Tail, Transaction, State#state{modulestate=ModuleState})
+            handle_actions(Actions++Tail, Transaction, State#state{module_state=ModuleState})
     end;
 handle_actions([{unicast, ToActorID, Message}|Tail], Transaction, State = #state{out_key_count=KeyCount, active_cf=CF}) ->
     Key = make_outbound_key(KeyCount),
@@ -975,7 +972,7 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tai
         _  when Type == 2 ->
             %% callback message with the high bit set for this actor
             Module = State#state.module,
-            case Module:callback_message(ActorID, Value, State#state.modulestate) of
+            case Module:callback_message(ActorID, Value, State#state.module_state) of
                 none ->
                     %% nothing for this actor
                     flip_actor_bit(ActorID, State#state.transaction, State#state.active_cf, Key, BitfieldSize),
@@ -1078,14 +1075,15 @@ make_seq(ID, #state{seq_map=SeqMap, ids=A}=State) ->
 reset_seq(ID, #state{seq_map=SeqMap}=State) ->
     State#state{seq_map=maps:remove(ID, SeqMap)}.
 
-maybe_serialize(_Mod, Old, #state{modulestate = New} = S) when Old == New ->
+maybe_serialize(#state{module_state = New, old_module_state = Old} = S) when Old == New ->
     S;
-maybe_serialize(Mod, _Old, #state{modulestate = New0,
-                                  old_serialized = Old,
-                                  transaction = Transaction} = S) ->
+maybe_serialize(#state{module_state = New0,
+                       module = Mod,
+                       old_serialized = Old,
+                       transaction = Transaction} = S) ->
     New = Mod:serialize(New0),
     _KeyTree = do_serialize(Mod, Old, New, ?stored_key_prefix, Transaction),
-    S#state{old_serialized = New, transaction_dirty = true}.
+    S#state{old_serialized = New, old_module_state = New0, transaction_dirty = true}.
 
 old_size(M) when is_map(M) ->
     maps:size(M);
@@ -1192,7 +1190,7 @@ do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
 maybe_update_state(State, ignore) ->
     State;
 maybe_update_state(State, NewModuleState) ->
-    State#state{modulestate=NewModuleState}.
+    State#state{module_state = NewModuleState}.
 
 maybe_commit(#state{transaction_dirty = false} = S) ->
     S;
