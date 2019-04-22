@@ -378,7 +378,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
     %% we need to find the first "unacked" message for this actor
     %% we should remember the last acked message for this actor ID and start there
     %% check if there's a pending ACK and use that to find the "last" key, if present
-    PipelineDepth = application:get_env(relcast, pipeline_depth, 50),
+    PipelineDepth = application:get_env(relcast, pipeline_depth, 75),
     case maps:get(ForActorID, Pending, []) of
         Pends when length(Pends) >= PipelineDepth ->
             {pipeline_full, State};
