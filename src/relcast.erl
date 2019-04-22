@@ -285,7 +285,7 @@ command(Message, State = #state{module = Module,
         {reply, Reply, Actions, NewModuleState} ->
             State1 = maybe_update_state(State, NewModuleState),
             %% write new output messages & update the state atomically
-            case handle_actions(Actions, Transaction, State1) of
+            case handle_actions(0, Actions, Transaction, State1) of
                 {ok, NewState} ->
                     case handle_pending_inbound(NewState#state.transaction, NewState) of
                         {ok, NewerState} ->
@@ -307,7 +307,7 @@ command(Message, State = #state{module = Module,
                      {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
 deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
                                                   defers = Defers}) ->
-    case handle_message(undefined, undefined, FromActorID, Message, State#state.transaction, State) of
+    case handle_message(undefined, undefined, FromActorID, Seq, Message, State#state.transaction, State) of
         {ok, NewState0} ->
             NewState = store_ack(Seq, FromActorID, NewState0),
             %% something happened, evaluate if we can handle any other blocked messages
@@ -339,7 +339,8 @@ deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
                     Key = make_inbound_key(KeyCount), %% some kind of predictable, monotonic key
                     ok = rocksdb:transaction_put(NewState#state.transaction, NewState#state.inbound_cf,
                                                  Key,
-                                                 <<FromActorID:16/integer, Message/binary>>),
+                                                 <<FromActorID:16/integer, Seq:32/integer-unsigned-big,
+                                                   Message/binary>>),
                     {ok, NewState#state{in_key_count = KeyCount + 1,
                                         transaction_dirty = true,
                                         defers = maps:put(FromActorID, [Key|N], Defers)}};
@@ -380,30 +381,27 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
     PipelineDepth = application:get_env(relcast, pipeline_depth, 50),
     case maps:get(ForActorID, Pending, []) of
         Pends when length(Pends) >= PipelineDepth ->
-            {Acks, State2} = get_acks(ForActorID, State),
-            {pipeline_full, Acks, State2};
+            {pipeline_full, State};
         Pends when Pends /= [] ->
             case lists:last(Pends) of
                 {_Seq, CF, Key, _Multicast} when CF == State#state.active_cf ->
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, Key, State, false) of
                         {not_found, LastKey, CF2} ->
-                            {Acks, State2} = get_acks(ForActorID, State),
-                            {not_found, Acks, State2#state{last_sent = maps:put(ForActorID,
-                                                                                {CF2, LastKey},
-                                                                                State2#state.last_sent)}};
-                        {Key2, CF2, Msg, Multicast} ->
-                            {Seq2, State2} = make_seq(ForActorID, State),
-                            Pends1 = Pends ++ [{Seq2, CF2, Key2, Multicast}],
+                            {not_found, State#state{last_sent = maps:put(ForActorID,
+                                                                         {CF2, LastKey},
+                                                                         State#state.last_sent)}};
+                        {Key2, CF2, OriginSeq, Msg, Multicast} ->
+                            {OutSeq2, State2} = make_seq(ForActorID, State),
+                            Pends1 = Pends ++ [{OutSeq2, CF2, Key2, Multicast}],
                             %% merge these?
-                            {Acks, State3} = get_acks(ForActorID, State2),
-                            State4 = maybe_commit(maybe_serialize(State3)),
-                            {ok, Seq2, Acks, Msg,
+                            {Acks, State3} = get_acks(OriginSeq, ForActorID, State2),
+                            State4 = maybe_commit(Acks, maybe_serialize(State3)),
+                            {ok, OutSeq2, Acks, Msg,
                              State4#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}};
                         not_found ->
-                            {Acks, State2} = get_acks(ForActorID, State),
-                            {not_found, Acks, State2#state{last_sent=maps:put(ForActorID, none,
-                                                                              State2#state.last_sent)}}
+                            {not_found, State#state{last_sent=maps:put(ForActorID, none,
+                                                                       State#state.last_sent)}}
                     end;
                 %% all our pends are for a stale epoch, clean them out
                 _ ->
@@ -415,8 +413,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
             case maps:get(ForActorID, State#state.last_sent, {State#state.active_cf, min_outbound_key()}) of
                 none ->
                     %% we *know* there's nothing pending for this actor
-                    {Acks, State2} = get_acks(ForActorID, State),
-                    {not_found, Acks, State2};
+                    {not_found, State};
                 {CF0, StartKey0} ->
                     %% check if the column family is still valid
                     {CF, StartKey} = case CF0 == State#state.active_cf of
@@ -429,18 +426,16 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
                         {not_found, LastKey, CF2} ->
-                            {Acks, State2} = get_acks(ForActorID, State),
-                            {not_found, Acks, State2#state{last_sent = maps:put(ForActorID, {CF2, LastKey},
-                                                                          State2#state.last_sent)}};
-                        {Key, CF2, Msg, Multicast} ->
-                            {Seq, State2} = make_seq(ForActorID, State),
-                            {Acks, State3} = get_acks(ForActorID, State2),
-                            State4 = maybe_commit(maybe_serialize(State3)),
-                            {ok, Seq, Acks, Msg,
-                             State4#state{pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
+                            {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey},
+                                                                         State#state.last_sent)}};
+                        {Key, CF2, OriginSeq, Msg, Multicast} ->
+                            {OutSeq, State2} = make_seq(ForActorID, State),
+                            {Acks, State3} = get_acks(OriginSeq, ForActorID, State2),
+                            State4 = maybe_commit(Acks, maybe_serialize(State3)),
+                            {ok, OutSeq, Acks, Msg,
+                             State4#state{pending_acks = maps:put(ForActorID, [{OutSeq, CF2, Key, Multicast}], Pending)}};
                         not_found ->
-                            {Acks, State2} = get_acks(ForActorID, State),
-                            {not_found, Acks, State2#state{last_sent = maps:put(ForActorID, none, State2#state.last_sent)}}
+                            {not_found, State#state{last_sent = maps:put(ForActorID, none, State#state.last_sent)}}
                     end
             end
     end.
@@ -475,7 +470,7 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
                     case find_next_outbound(ForActorID, CF, Key, State, false) of
                         {not_found, _LastKey, _CF2} ->
                             not_found;
-                        {_Key2, _CF2, Msg, _Multicast2} ->
+                        {_Key2, _CF2, _Seq, Msg, _Multicast2} ->
                             {ok, Msg};
                         not_found ->
                             not_found
@@ -505,7 +500,7 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
                     case find_next_outbound(ForActorID, CF, StartKey, State) of
                         {not_found, _LastKey, _CF2} ->
                             not_found;
-                        {_Key, _CF2, Msg, _Multicast} ->
+                        {_Key, _CF2, _Seq, Msg, _Multicast} ->
                             {ok, Msg};
                         not_found ->
                             not_found
@@ -584,7 +579,8 @@ stop(Reason, State = #state{module=Module, module_state=ModuleState})->
         false ->
             ok
     end,
-    catch rocksdb:transaction_commit(State#state.transaction),
+    State1 = maybe_serialize(State),
+    catch rocksdb:transaction_commit(State1#state.transaction),
     rocksdb:close(State#state.db).
 
 %% @doc Get a representation of the relcast's module state, inbound queue and
@@ -649,12 +645,13 @@ handle_pending_inbound_(Transaction, State) ->
 find_next_inbound({error, _}, Iter, _Transaction, Changed, Acc, State) ->
     ok = rocksdb:iterator_close(Iter),
     {ok, Changed, lists:reverse(Acc), State};
-find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Msg/binary>>}, Iter, Transaction, Changed, Acc, State) ->
+find_next_inbound({ok, <<"i", _/binary>> = Key, <<FromActorID:16/integer, Seq:32/integer-unsigned-big, Msg/binary>>}, Iter, Transaction, Changed, Acc, State) ->
     CF = State#state.inbound_cf,
-    case handle_message(Key, CF, FromActorID, Msg, Transaction, State) of
+    case handle_message(Key, CF, FromActorID, Seq, Msg, Transaction, State) of
         defer ->
             %% keep on going
-            find_next_inbound(rocksdb:iterator_move(Iter, next), Iter, Transaction, Changed, [{CF, Key, FromActorID, Msg}|Acc], State);
+            find_next_inbound(rocksdb:iterator_move(Iter, next), Iter, Transaction, Changed,
+                              [{CF, Key, FromActorID, Seq, Msg}|Acc], State);
         ignore ->
             %% keep on going
             find_next_inbound(rocksdb:iterator_move(Iter, next), Iter, Transaction, Changed, Acc, State);
@@ -674,12 +671,12 @@ handle_defers(Transaction, [], Out, true, State) ->
 handle_defers(_Transaction, [], _Out, false, State) ->
     %% no changes this iteration, bail
     {ok, State};
-handle_defers(Transaction, [{CF, Key, FromActorID, Msg}|Acc], Out, Changed, State) ->
-    case handle_message(Key, CF, FromActorID, Msg, Transaction, State) of
+handle_defers(Transaction, [{CF, Key, FromActorID, Seq, Msg}|Acc], Out, Changed, State) ->
+    case handle_message(Key, CF, FromActorID, Seq, Msg, Transaction, State) of
         defer ->
-            handle_defers(Transaction, Acc, [{CF, Key, FromActorID, Msg}|Out], Changed, State);
+            handle_defers(Transaction, Acc, [{CF, Key, FromActorID, Seq, Msg}|Out], Changed, State);
         ignore ->
-            handle_defers(Transaction, Acc, [{CF, Key, FromActorID, Msg}|Out], Changed, State);
+            handle_defers(Transaction, Acc, [{CF, Key, FromActorID, Seq, Msg}|Out], Changed, State);
         {ok, NewState} ->
             OldDefers = maps:get(FromActorID, NewState#state.defers),
             handle_defers(Transaction, Acc, Out, true,
@@ -689,7 +686,7 @@ handle_defers(Transaction, [{CF, Key, FromActorID, Msg}|Acc], Out, Changed, Stat
     end.
 
 
-handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module=Module, module_state=ModuleState}) ->
+handle_message(Key, CF, FromActorID, Seq, Message, Transaction, State = #state{module=Module, module_state=ModuleState}) ->
     case Module:handle_message(Message, FromActorID, ModuleState) of
         ignore ->
             State1 =
@@ -713,7 +710,7 @@ handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module
                     false ->
                         false
                 end,
-            case handle_actions(Actions, Transaction, State#state{module_state=NewModuleState}) of
+            case handle_actions(Seq, Actions, Transaction, State#state{module_state=NewModuleState}) of
                 {ok, NewState} ->
                     {ok, maybe_dirty(Dirty, NewState)};
                 {stop, Timeout, NewState} ->
@@ -722,9 +719,9 @@ handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module
     end.
 
 %% write all resulting messages and keys in an atomic transaction
-handle_actions([], _Transaction, State) ->
+handle_actions(_, [], _Transaction, State) ->
     {ok, State};
-handle_actions([new_epoch|Tail], Transaction, State) ->
+handle_actions(Seq, [new_epoch|Tail], Transaction, State) ->
     ok = rocksdb:transaction_commit(Transaction),
     {ok, NewCF} = rocksdb:create_column_family(State#state.db, make_column_family_name(State#state.epoch + 1),
                                                State#state.db_opts),
@@ -733,55 +730,58 @@ handle_actions([new_epoch|Tail], Transaction, State) ->
     %% when we're done handling actions, we will write the module state (and all subsequent outbound
     %% messages from this point on) into the active CF, which is this new one now
     {ok, Transaction1} = transaction(State#state.db, State#state.write_opts),
-    handle_actions(Tail, Transaction1, State#state{out_key_count=0, active_cf=NewCF,
-                                                   transaction = Transaction1,
-                                                   transaction_dirty = false,
-                                                   epoch=State#state.epoch + 1, pending_acks=#{}});
-handle_actions([{multicast, Message}|Tail], Transaction, State =
+    handle_actions(Seq, Tail, Transaction1, State#state{out_key_count=0, active_cf=NewCF,
+                                                        transaction = Transaction1,
+                                                        transaction_dirty = false,
+                                                        epoch=State#state.epoch + 1, pending_acks=#{}});
+handle_actions(Seq, [{multicast, Message}|Tail], Transaction, State =
                #state{out_key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
     Key = make_outbound_key(KeyCount),
-    ok = rocksdb:transaction_put(Transaction, CF, Key, <<0:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
+    ok = rocksdb:transaction_put(Transaction, CF, Key, <<0:2/integer, Bitfield:BitfieldSize/bits,
+                                                         Seq:32/integer-unsigned-big, Message/binary>>),
     %% handle our own copy of the message
     %% deferring your own message is an error
     case Module:handle_message(Message, ID, State#state.module_state) of
         ignore ->
-            handle_actions(Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
+            handle_actions(Seq, Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
         {ModuleState, Actions} ->
-            handle_actions(Actions++Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{module_state=ModuleState, out_key_count=KeyCount+1}))
+            handle_actions(Seq, Actions++Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{module_state=ModuleState, out_key_count=KeyCount+1}))
     end;
-handle_actions([{callback, Message}|Tail], Transaction, State =
+handle_actions(Seq, [{callback, Message}|Tail], Transaction, State =
                #state{out_key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
     Key = make_outbound_key(KeyCount),
-    ok = rocksdb:transaction_put(Transaction, CF, Key, <<2:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
+    ok = rocksdb:transaction_put(Transaction, CF, Key, <<2:2/integer, Bitfield:BitfieldSize/bits,
+                                                         Seq:32/integer-unsigned-big, Message/binary>>),
     case Module:callback_message(ID, Message, State#state.module_state) of
         none ->
-            handle_actions(Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
+            handle_actions(Seq, Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
         OurMessage when is_binary(OurMessage) ->
             %% handle our own copy of the message
             %% deferring your own message is an error
             case Module:handle_message(OurMessage, ID, State#state.module_state) of
                 ignore ->
-                    handle_actions(Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
+                    handle_actions(Seq, Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{out_key_count=KeyCount+1}));
                 {ModuleState, Actions} ->
-                    handle_actions(Actions++Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{module_state=ModuleState, out_key_count=KeyCount+1}))
+                    handle_actions(Seq, Actions++Tail, Transaction, update_next(IDs -- [ID], CF, Key, State#state{module_state=ModuleState, out_key_count=KeyCount+1}))
             end
     end;
-handle_actions([{unicast, ID, Message}|Tail], Transaction, State = #state{module=Module, id=ID}) ->
+handle_actions(Seq, [{unicast, ID, Message}|Tail], Transaction, State = #state{module=Module, id=ID}) ->
     %% handle our own message
     %% deferring your own message is an error
     case Module:handle_message(Message, ID, State#state.module_state) of
         ignore ->
-            handle_actions(Tail, Transaction, State);
+            handle_actions(Seq, Tail, Transaction, State);
         {ModuleState, Actions} ->
-            handle_actions(Actions++Tail, Transaction, State#state{module_state=ModuleState})
+            handle_actions(Seq, Actions++Tail, Transaction, State#state{module_state=ModuleState})
     end;
-handle_actions([{unicast, ToActorID, Message}|Tail], Transaction, State = #state{out_key_count=KeyCount, active_cf=CF}) ->
+handle_actions(Seq, [{unicast, ToActorID, Message}|Tail], Transaction, State = #state{out_key_count=KeyCount, active_cf=CF}) ->
     Key = make_outbound_key(KeyCount),
-    ok = rocksdb:transaction_put(Transaction, CF, Key, <<1:2/integer, ToActorID:14/integer, Message/binary>>),
-    handle_actions(Tail, Transaction, update_next([ToActorID], CF, Key, State#state{out_key_count=KeyCount+1}));
-handle_actions([{stop, Timeout}|_Tail], _Transaction, State) ->
+    ok = rocksdb:transaction_put(Transaction, CF, Key, <<1:2/integer, ToActorID:14/integer,
+                                                         Seq:32/integer-unsigned-big, Message/binary>>),
+    handle_actions(Seq, Tail, Transaction, update_next([ToActorID], CF, Key, State#state{out_key_count=KeyCount+1}));
+handle_actions(_ , [{stop, Timeout}|_Tail], _Transaction, State) ->
     {stop, Timeout, State}.
 
 update_next(Actors, CF, Key, State) ->
@@ -944,16 +944,17 @@ find_next_outbound_(_ActorId, {error, _}, Iter, State) ->
     end,
     rocksdb:iterator_close(Iter),
     Res;
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, State) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:2/integer, ActorID:14/integer,
+                                                             Seq:32/integer-unsigned-big, Value/binary>>}, Iter, State) ->
     %% unicast message for this actor
     rocksdb:iterator_close(Iter),
-    {Key, State#state.active_cf, Value, false};
+    {Key, State#state.active_cf, Seq, Value, false};
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:2/integer, _/bits>>}, Iter, State) ->
     %% unicast message for someone else
     find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, State);
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tail/bits>>}, Iter,
                     State = #state{bitfieldsize=BitfieldSize}) when Type == 0; Type == 2 ->
-    <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
+    <<ActorMask:BitfieldSize/integer-unsigned-big, Seq:32/integer-unsigned-big, Value/binary>> = Tail,
     case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
         0 ->
             %% not for us, keep looking
@@ -968,7 +969,7 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tai
         _  when Type == 0 ->
             %% multicast message with the high bit set for this actor
             rocksdb:iterator_close(Iter),
-            {Key, State#state.active_cf, Value, true};
+            {Key, State#state.active_cf, Seq, Value, true};
         _  when Type == 2 ->
             %% callback message with the high bit set for this actor
             Module = State#state.module,
@@ -979,7 +980,7 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tai
                     find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, State);
                 Message ->
                     rocksdb:iterator_close(Iter),
-                    {Key, State#state.active_cf, Message, true}
+                    {Key, State#state.active_cf, Seq, Message, true}
             end
 
     end.
@@ -1011,11 +1012,12 @@ cf_to_epoch([$e, $p, $o, $c, $h|EpochString]) ->
 build_outbound_status({error, _}, Iter, _BFS, OutboundQueue) ->
     rocksdb:iterator_close(Iter),
     maps:map(fun(_K, V) -> lists:reverse(V) end, OutboundQueue);
-build_outbound_status({ok, <<"o", _/binary>>, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, BFS, OutboundQueue) ->
+build_outbound_status({ok, <<"o", _/binary>>, <<1:2/integer, ActorID:14/integer, _:32/bits, Value/binary>>},
+                      Iter, BFS, OutboundQueue) ->
     %% unicast message
     build_outbound_status(rocksdb:iterator_move(Iter, next), Iter, BFS, prepend_message([ActorID], Value, OutboundQueue));
 build_outbound_status({ok, <<"o", _/binary>>, <<0:2/integer, Tail/bits>>}, Iter, BFS, OutboundQueue) ->
-    <<ActorMask:BFS/bits, Value/binary>> = Tail,
+    <<ActorMask:BFS/bits, _:32/bits, Value/binary>> = Tail,
     ActorIDs = actor_list(ActorMask, 1, []),
     build_outbound_status(rocksdb:iterator_move(Iter, next), Iter, BFS, prepend_message(ActorIDs, Value, OutboundQueue));
 build_outbound_status({ok, _Key, _Value}, Iter, BFS,  OutboundQueue) ->
@@ -1024,7 +1026,7 @@ build_outbound_status({ok, _Key, _Value}, Iter, BFS,  OutboundQueue) ->
 build_inbound_status({error, _}, Iter, InboundQueue) ->
     rocksdb:iterator_close(Iter),
     lists:reverse(InboundQueue);
-build_inbound_status({ok, <<"i", _/binary>>, <<FromActorID:16/integer, Msg/binary>>}, Iter, InboundQueue) ->
+build_inbound_status({ok, <<"i", _/binary>>, <<FromActorID:16/integer, _:32/bits, Msg/binary>>}, Iter, InboundQueue) ->
     build_inbound_status(rocksdb:iterator_move(Iter, next), Iter, [{FromActorID, Msg}|InboundQueue]);
 build_inbound_status({ok, _Key, _Value}, Iter, InboundQueue) ->
     build_inbound_status(rocksdb:iterator_move(Iter, next), Iter, InboundQueue).
@@ -1032,7 +1034,8 @@ build_inbound_status({ok, _Key, _Value}, Iter, InboundQueue) ->
 build_defer_list({error, _}, Iter, _CF, Acc) ->
     rocksdb:iterator_close(Iter),
     Acc;
-build_defer_list({ok, <<"i", _/binary>>=Key, <<FromActorID:16/integer, _Msg/binary>>}, Iter, CF, Acc) ->
+build_defer_list({ok, <<"i", _/binary>>=Key, <<FromActorID:16/integer, _Seq:32/bits, _Msg/binary>>},
+                 Iter, CF, Acc) ->
     DefersForThisActor = maps:get(FromActorID, Acc, []),
     build_defer_list(rocksdb:iterator_move(Iter, next), Iter, CF, maps:put(FromActorID, [Key|DefersForThisActor], Acc)).
 
@@ -1192,9 +1195,11 @@ maybe_update_state(State, ignore) ->
 maybe_update_state(State, NewModuleState) ->
     State#state{module_state = NewModuleState}.
 
-maybe_commit(#state{transaction_dirty = false} = S) ->
+maybe_commit([], S) ->
     S;
-maybe_commit(#state{transaction = Txn, db = DB, write_opts = Opts} = S) ->
+maybe_commit(_, #state{transaction_dirty = false} = S) ->
+    S;
+maybe_commit(_, #state{transaction = Txn, db = DB, write_opts = Opts} = S) ->
     ok = rocksdb:transaction_commit(Txn),
     {ok, Txn1} = transaction(DB, Opts),
     S#state{transaction = Txn1, transaction_dirty = false}.
@@ -1215,11 +1220,20 @@ store_ack(Seq, From, #state{floated_acks = Acks} = S) ->
     %% at some point we might not need to keep them in order?
     S#state{floated_acks = Acks#{From => ActorAcks ++ [Seq]}}.
 
-%% TODO: eventually we want to only deliver acks that have actually
-%% been `take`en, and hence have been externally visible.
-get_acks(From, #state{floated_acks = Acks} = S) ->
+get_acks(Seq, From, #state{floated_acks = Acks} = S) ->
     ActorAcks = maps:get(From, Acks, []),
-    {ActorAcks, S#state{floated_acks = Acks#{From => []}}}.
+    OutAcks =
+        case lists:member(Seq, ActorAcks) of
+            %% we've been floated but not acked
+            true ->
+                ActorAcks1 = lists:delete(Seq, ActorAcks),
+                [Seq];
+            %% we've already synced to disc for this message
+            false ->
+                ActorAcks1 = ActorAcks,
+                []
+        end,
+    {OutAcks, S#state{floated_acks = Acks#{From => ActorAcks1}}}.
 
 -ifdef(TEST).
 

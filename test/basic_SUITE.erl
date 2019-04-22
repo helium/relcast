@@ -54,7 +54,7 @@ end_per_suite(Config) ->
 basic(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data1"}]),
-    {not_found, _, _} = relcast:take(2, RC1),
+    {not_found, _} = relcast:take(2, RC1),
     {false, _} = relcast:command(is_done, RC1),
     {ok, RC1_2} = relcast:deliver(1, <<"hello">>, 2, RC1),
     {true, _} = relcast:command(is_done, RC1_2),
@@ -72,9 +72,9 @@ basic(_Config) ->
     {ok, Seq3_1, [], <<"hai">>, RC1_8} = relcast:take(3, RC1_7, true),
     %% ack both of the outstanding messages
     {ok, RC1_9} = relcast:ack(2, Seq2, RC1_8),
-    {not_found, _, _} = relcast:take(2, RC1_9),
+    {not_found, _} = relcast:take(2, RC1_9),
     {ok, RC1_10} = relcast:ack(3, Seq3_1, RC1_9),
-    {not_found, _, _} = relcast:take(2, RC1_10),
+    {not_found, _} = relcast:take(2, RC1_10),
     relcast:stop(normal, RC1_10),
     ok.
 
@@ -82,8 +82,8 @@ basic2(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1a} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data13a"}]),
     {ok, RC1b} = relcast:start(2, Actors, test_handler, [2], [{data_dir, "data13b"}]),
-    {not_found, _, _} = relcast:take(2, RC1a),
-    {not_found, _, _} = relcast:take(1, RC1b),
+    {not_found, _} = relcast:take(2, RC1a),
+    {not_found, _} = relcast:take(1, RC1b),
     {ok, RC2a} = relcast:command({init, 2}, RC1a),
     {ok, RC2b} = relcast:command({init, 1}, RC1b),
 
@@ -113,8 +113,8 @@ basic2(_Config) ->
     {ok, RC8a} = relcast:ack(2, SeqA2, RC7a),
     {ok, RC8b} = relcast:ack(2, SeqB2, RC7b),
 
-    {not_found, _, _} = relcast:take(2, RC8a),
-    {not_found, _, _} = relcast:take(1, RC8b),
+    {not_found, _} = relcast:take(2, RC8a),
+    {not_found, _} = relcast:take(1, RC8b),
 
     relcast:stop(normal, RC8a),
     relcast:stop(normal, RC8b),
@@ -123,14 +123,14 @@ basic2(_Config) ->
 stop_resume(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2"}]),
-    {not_found, _, _} = relcast:take(2, RC1),
+    {not_found, _} = relcast:take(2, RC1),
     {false, _} = relcast:command(is_done, RC1),
-    {ok, RC1_2} = relcast:deliver(1, <<"hello">>, 2, RC1),
+    {ok, RC1_2} = relcast:deliver(5, <<"hello">>, 2, RC1),
     {true, _} = relcast:command(is_done, RC1_2),
     {_, [], Outbound} = relcast:status(RC1_2),
     [<<"ehlo">>, <<"hai">>] = maps:get(2, Outbound),
     [<<"hai">>] = maps:get(3, Outbound),
-    {ok, Ref, [1], <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
+    {ok, Ref, [5], <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
     %% ack it
     {ok, RC1_3a} = relcast:ack(2, Ref, RC1_3),
     relcast:stop(normal, RC1_3a),
@@ -153,9 +153,9 @@ stop_resume(_Config) ->
     {ok, Ref5, _, <<"hai">>, RC1_12} = relcast:take(2, RC1_11, true),
     %% ack both of the outstanding messages again
     {ok, RC1_13} = relcast:ack(2, Ref4, RC1_12),
-    {not_found, _, _} = relcast:take(2, RC1_13),
+    {not_found, _} = relcast:take(2, RC1_13),
     {ok, RC1_14} = relcast:ack(3, Ref5, RC1_13),
-    {not_found, _, _} = relcast:take(2, RC1_14),
+    {not_found, _} = relcast:take(2, RC1_14),
     relcast:stop(normal, RC1_14),
     ok.
 
@@ -164,7 +164,7 @@ stop_resume(_Config) ->
 upgrade_stop_resume(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2a"}]),
-    {not_found, _, _} = relcast:take(2, RC1),
+    {not_found, _} = relcast:take(2, RC1),
     {false, _} = relcast:command(is_done, RC1),
     {ok, RC1_2} = relcast:deliver(1, <<"hello">>, 2, RC1),
     {true, _} = relcast:command(is_done, RC1_2),
@@ -212,9 +212,9 @@ upgrade_stop_resume(_Config) ->
     {ok, Ref5, _, <<"hai">>, RC1_12} = relcast:take(2, RC1_11, true),
     %% ack both of the outstanding messages again
     {ok, RC1_13} = relcast:ack(2, Ref4, RC1_12),
-    {not_found, _, _} = relcast:take(2, RC1_13),
+    {not_found, _} = relcast:take(2, RC1_13),
     {ok, RC1_14} = relcast:ack(3, Ref5, RC1_13),
-    {not_found, _, _} = relcast:take(2, RC1_14),
+    {not_found, _} = relcast:take(2, RC1_14),
     relcast:stop(normal, RC1_14),
     ok.
 
@@ -312,7 +312,7 @@ epochs(_Config) ->
     {Map2, _} = relcast:command(seqmap, RC1_6),
     [{2, 2}] = maps:to_list(Map2),
     %% GC'd outbound data queued from the first epoch
-    {not_found, _, RC1_7} = relcast:take(2, RC1_6),
+    {not_found, RC1_7} = relcast:take(2, RC1_6),
     relcast:stop(normal, RC1_7),
     {ok, CFs} = rocksdb:list_column_families("data5", []),
     ["default", "Inbound", "epoch0000000001"] = CFs,
@@ -349,7 +349,7 @@ epochs_gc(_Config) ->
     {Map2, _} = relcast:command(seqmap, RC1_7),
     [{2, 2}] = maps:to_list(Map2),
     %% the data from the original epoch has been GC'd
-    {not_found, _, _} = relcast:take(2, RC1_7),
+    {not_found, _} = relcast:take(2, RC1_7),
     relcast:stop(normal, RC1_7),
     {ok, CFs} = rocksdb:list_column_families("data6", []),
     ["default", "Inbound", "epoch0000000002"] = CFs,
@@ -378,8 +378,8 @@ callback_message(_Config) ->
     {ok, Ref2, _, <<"greetings to 3">>, RC1_4} = relcast:take(3, RC1_3),
     {ok, RC1_5} = relcast:ack(2, Ref, RC1_4),
     {ok, RC1_6} = relcast:ack(3, Ref2, RC1_5),
-    {not_found, _, RC1_7} = relcast:take(2, RC1_6),
-    {not_found, _, RC1_8} = relcast:take(3, RC1_7),
+    {not_found, RC1_7} = relcast:take(2, RC1_6),
+    {not_found, RC1_8} = relcast:take(3, RC1_7),
     relcast:stop(normal, RC1_8),
     ok.
 
@@ -393,8 +393,8 @@ self_callback_message(_Config) ->
     {ok, Ref2, _, <<"salutations to 3">>, RC1_4} = relcast:take(3, RC1_3),
     {ok, RC1_5} = relcast:ack(2, Ref, RC1_4),
     {ok, RC1_6} = relcast:ack(3, Ref2, RC1_5),
-    {not_found, _, RC1_7} = relcast:take(2, RC1_6),
-    {not_found, _, RC1_8} = relcast:take(3, RC1_7),
+    {not_found, RC1_7} = relcast:take(2, RC1_6),
+    {not_found, RC1_8} = relcast:take(3, RC1_7),
     {true, _} = relcast:command(was_saluted, RC1_8),
     relcast:stop(normal, RC1_8),
     ok.
@@ -402,7 +402,7 @@ self_callback_message(_Config) ->
 pipeline(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data11"}]),
-    {not_found, _, _} = relcast:take(2, RC1),
+    {not_found, _} = relcast:take(2, RC1),
     {ok, RC2} =
         lists:foldl(fun(Idx, {ok, Acc}) ->
                             relcast:deliver(Idx, <<"unicast: hello - ", (integer_to_binary(Idx))/binary>>, 2, Acc)
@@ -417,7 +417,7 @@ pipeline(_Config) ->
                     [N || N <- lists:seq(1, 18)]),
     {ok, Ref2, _, <<"hello - 19">>, RC4} = relcast:take(2, RC3),
     {ok, Ref3, _, <<"hello - 20">>, RC5} = relcast:take(2, RC4),
-    {pipeline_full, _, _RC4} = relcast:take(2, RC5),
+    {pipeline_full, _RC4} = relcast:take(2, RC5),
     20 = relcast:in_flight(2, RC5),
     %% singly ack the second-to-last message first
     {ok, RC6} = relcast:ack(2, Ref2, RC5),
@@ -441,15 +441,15 @@ pipeline(_Config) ->
                     end,
                     RC8,
                     [N || N <- lists:seq(21, 30)]),
-    {not_found, _, _} = relcast:take(2, RC9),
+    {not_found, _} = relcast:take(2, RC9),
     ok.
 
 state_split(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
-    {ok, _} = relcast:command(populate, RC1),
+    {ok, RC1a} = relcast:command(populate, RC1),
     %% normal stop and start
-    relcast:stop(normal, RC1),
+    relcast:stop(normal, RC1a),
     {ok, RC2} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
     {State, _} = relcast:command(get, RC2),
     ?assertEqual({state, a, b, c, d, e}, State),

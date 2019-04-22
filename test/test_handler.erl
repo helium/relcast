@@ -27,6 +27,7 @@ init([ID]) ->
 handle_command(next_epoch, State) ->
     {reply, ok, [new_epoch], State};
 handle_command({init, To}, State) ->
+    ct:pal("init ~p", [To]),
     {reply, ok, [{unicast, To, <<"hello">>}], State};
 handle_command(round, State) ->
     {reply, State#state.round, ignore};
@@ -39,7 +40,7 @@ handle_command(is_done, State) ->
 handle_command(was_saluted, State) ->
     {reply, State#state.got_salutation, ignore};
 handle_command(Msg, _State) ->
-    io:format("handle_call, Msg: ~p", [Msg]),
+    ct:pal("catchall handle_command, Msg: ~p", [Msg]),
     {reply, ok, ignore}.
 
 handle_message(<<"seq", Int:8/integer>>, Actor, State = #state{seqmap=Seqmap}) ->

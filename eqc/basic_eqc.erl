@@ -143,7 +143,7 @@ postcondition(S, {call, _, take, [_, Actor]}, R) ->
     case R of
         {ok, _Seq, _Acks, Expected, _RC} ->
             true;
-        {Expected, _, _RC} ->
+        {Expected, _RC} ->
             true;
         {ok, _Seq, _Acks, Unexpected, _RC} ->
             {unexpected_take1, Actor, {exp, Expected}, {got, Unexpected},
@@ -370,12 +370,12 @@ filter_old_inflight(InFlight, Epoch) ->
 reset_inf(Actor, Inf) ->
     Inf#{Actor => []}.
 
-extract_state({_, _, RC}) ->
+extract_state({_, RC}) ->
     RC;
 extract_state({ok, _, _, _, RC}) ->
     RC.
 
-extract_inf({_, _, _}, _, Inf, _, _) ->
+extract_inf({_, _}, _, Inf, _, _) ->
     Inf;
 extract_inf({ok, Seq, _Acks, Msg, _RC}, Actor, Inf, Msgs, States) ->
     %% find which epoch this message was from
