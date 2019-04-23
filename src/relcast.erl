@@ -1232,11 +1232,13 @@ get_acks(Seq, From, #state{floated_acks = Acks} = S) ->
     case lists:keymember(Seq, 1, ActorAcks) of
         %% we've been floated but not acked
         true ->
-            ActorAcks1 = lists:keydelete(Seq, 1, ActorAcks),
-            {[Seq], S#state{floated_acks = Acks#{From => ActorAcks1}}};
+            {maps:map(fun(_, V) ->
+                              [Sq || {Sq, _Epoch} <- V]
+                      end, Acks),
+             S#state{floated_acks = #{}}};
         %% we've already synced to disc for this message
         false ->
-            {[], S}
+            {none, S}
     end.
 
 -ifdef(TEST).
