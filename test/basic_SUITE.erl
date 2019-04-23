@@ -400,6 +400,7 @@ self_callback_message(_Config) ->
     ok.
 
 pipeline(_Config) ->
+    Old = application:set_env(relcast, pipeline_depth, 20),
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data11"}]),
     {not_found, _} = relcast:take(2, RC1),
@@ -442,6 +443,7 @@ pipeline(_Config) ->
                     RC8,
                     [N || N <- lists:seq(21, 30)]),
     {not_found, _} = relcast:take(2, RC9),
+    _ = application:set_env(relcast, pipeline_depth, Old),
     ok.
 
 state_split(_Config) ->

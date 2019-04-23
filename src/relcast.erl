@@ -727,12 +727,19 @@ handle_actions(Seq, [new_epoch|Tail], Transaction, State) ->
                                                State#state.db_opts),
     ok = rocksdb:drop_column_family(State#state.active_cf),
     ok = rocksdb:destroy_column_family(State#state.active_cf),
+    %% filter old floating acks
+    Floats = maps:map(fun(_K, Acks) ->
+                              lists:filter(fun({_Seq, Epoch}) ->
+                                                   Epoch /= State#state.epoch
+                                           end, Acks)
+                      end, State#state.floated_acks),
     %% when we're done handling actions, we will write the module state (and all subsequent outbound
     %% messages from this point on) into the active CF, which is this new one now
     {ok, Transaction1} = transaction(State#state.db, State#state.write_opts),
     handle_actions(Seq, Tail, Transaction1, State#state{out_key_count=0, active_cf=NewCF,
                                                         transaction = Transaction1,
                                                         transaction_dirty = false,
+                                                        floated_acks = Floats,
                                                         epoch=State#state.epoch + 1, pending_acks=#{}});
 handle_actions(Seq, [{multicast, Message}|Tail], Transaction, State =
                #state{out_key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
@@ -1214,26 +1221,23 @@ mark_defers(S) ->
             last_defer_check = erlang:monotonic_time(milli_seconds)}.
 
 
-store_ack(Seq, From, #state{floated_acks = Acks} = S) ->
+store_ack(Seq, From, #state{epoch = Epoch, floated_acks = Acks} = S) ->
     %% should we be able to infer the seq without external tracking?
     ActorAcks = maps:get(From, Acks, []),
     %% at some point we might not need to keep them in order?
-    S#state{floated_acks = Acks#{From => ActorAcks ++ [Seq]}}.
+    S#state{floated_acks = Acks#{From => ActorAcks ++ [{Seq, Epoch}]}}.
 
 get_acks(Seq, From, #state{floated_acks = Acks} = S) ->
     ActorAcks = maps:get(From, Acks, []),
-    OutAcks =
-        case lists:member(Seq, ActorAcks) of
-            %% we've been floated but not acked
-            true ->
-                ActorAcks1 = lists:delete(Seq, ActorAcks),
-                [Seq];
-            %% we've already synced to disc for this message
-            false ->
-                ActorAcks1 = ActorAcks,
-                []
-        end,
-    {OutAcks, S#state{floated_acks = Acks#{From => ActorAcks1}}}.
+    case lists:keymember(Seq, 1, ActorAcks) of
+        %% we've been floated but not acked
+        true ->
+            ActorAcks1 = lists:keydelete(Seq, 1, ActorAcks),
+            {[Seq], S#state{floated_acks = Acks#{From => ActorAcks1}}};
+        %% we've already synced to disc for this message
+        false ->
+            {[], S}
+    end.
 
 -ifdef(TEST).
 
