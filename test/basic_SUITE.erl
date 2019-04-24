@@ -58,18 +58,18 @@ basic(_Config) ->
     {false, _} = relcast:command(is_done, RC1),
     {ok, RC1_2} = relcast:deliver(1, <<"hello">>, 2, RC1),
     {true, _} = relcast:command(is_done, RC1_2),
-    {ok, Seq, [1], <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
+    {ok, Seq, #{2 := [1]}, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
     %% ack it
     {ok, RC1_4} = relcast:ack(2, Seq, RC1_3),
     %% check it's gone
-    {ok, Seq2, [], <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
+    {ok, Seq2, none, <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
     %% take for actor 3
-    {ok, _Seq3, [], <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
+    {ok, _Seq3, none, <<"hai">>, RC1_6} = relcast:take(3, RC1_5),
     %% ack with the wrong ref
     {ok, RC1_7} = relcast:ack(3, Seq, RC1_6),
     %% actor 3 still has pending data, but we need to clear pending to
     %% get at it
-    {ok, Seq3_1, [], <<"hai">>, RC1_8} = relcast:take(3, RC1_7, true),
+    {ok, Seq3_1, none, <<"hai">>, RC1_8} = relcast:take(3, RC1_7, true),
     %% ack both of the outstanding messages
     {ok, RC1_9} = relcast:ack(2, Seq2, RC1_8),
     {not_found, _} = relcast:take(2, RC1_9),
@@ -87,8 +87,8 @@ basic2(_Config) ->
     {ok, RC2a} = relcast:command({init, 2}, RC1a),
     {ok, RC2b} = relcast:command({init, 1}, RC1b),
 
-    {ok, SeqA, [], MsgA, RC3a} = relcast:take(2, RC2a),
-    {ok, SeqB, [], MsgB, RC3b} = relcast:take(1, RC2b),
+    {ok, SeqA, none, MsgA, RC3a} = relcast:take(2, RC2a),
+    {ok, SeqB, none, MsgB, RC3b} = relcast:take(1, RC2b),
 
     ct:pal("seqs a ~p ~p b ~p ~p", [SeqA, MsgA, SeqB, MsgB]),
 
@@ -97,8 +97,8 @@ basic2(_Config) ->
     {ok, RC4a} = relcast:ack(2, SeqA, RC3a1),
     {ok, RC4b} = relcast:ack(1, SeqB, RC3b1),
 
-    {ok, SeqA1, [SeqB], <<"ehlo">>, RC5a} = relcast:take(2, RC4a),
-    {ok, SeqB1, [SeqA], <<"ehlo">>, RC5b} = relcast:take(1, RC4b),
+    {ok, SeqA1, #{2 := [SeqB]}, <<"ehlo">>, RC5a} = relcast:take(2, RC4a),
+    {ok, SeqB1, #{1 := [SeqA]}, <<"ehlo">>, RC5b} = relcast:take(1, RC4b),
 
     {true, _} = relcast:command(is_done, RC5a),
     {true, _} = relcast:command(is_done, RC5b),
@@ -107,8 +107,8 @@ basic2(_Config) ->
     {ok, RC6a} = relcast:ack(2, SeqA1, RC5a),
     {ok, RC6b} = relcast:ack(1, SeqB1, RC5b),
     %% check it's gone
-    {ok, SeqA2, [], <<"hai">>, RC7a} = relcast:take(2, RC6a),
-    {ok, SeqB2, [], <<"hai">>, RC7b} = relcast:take(1, RC6b, true),
+    {ok, SeqA2, none, <<"hai">>, RC7a} = relcast:take(2, RC6a),
+    {ok, SeqB2, none, <<"hai">>, RC7b} = relcast:take(1, RC6b, true),
 
     {ok, RC8a} = relcast:ack(2, SeqA2, RC7a),
     {ok, RC8b} = relcast:ack(2, SeqB2, RC7b),
@@ -130,7 +130,7 @@ stop_resume(_Config) ->
     {_, [], Outbound} = relcast:status(RC1_2),
     [<<"ehlo">>, <<"hai">>] = maps:get(2, Outbound),
     [<<"hai">>] = maps:get(3, Outbound),
-    {ok, Ref, [5], <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
+    {ok, Ref, #{2 := [5]}, <<"ehlo">>, RC1_3} = relcast:take(2, RC1_2),
     %% ack it
     {ok, RC1_3a} = relcast:ack(2, Ref, RC1_3),
     relcast:stop(normal, RC1_3a),

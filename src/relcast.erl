@@ -364,8 +364,8 @@ take(ID, State) ->
 %% acks state and reissue the oldest unacked message in case all of the unacked
 %% messages were lost in flight.
 -spec take(pos_integer(), relcast_state(), boolean()) ->
-                  {not_found, Acks :: [non_neg_integer()], relcast_state()} |
-                  {pipeline_full, Acks :: [non_neg_integer()], relcast_state()} |
+                  {not_found, relcast_state()} |
+                  {pipeline_full, relcast_state()} |
                   {ok,
                    Seq :: non_neg_integer(),
                    Acks :: none | #{non_neg_integer() => [non_neg_integer()]},
