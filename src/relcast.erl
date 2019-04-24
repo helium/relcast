@@ -368,7 +368,7 @@ take(ID, State) ->
                   {pipeline_full, Acks :: [non_neg_integer()], relcast_state()} |
                   {ok,
                    Seq :: non_neg_integer(),
-                   Acks :: [non_neg_integer()],
+                   Acks :: none | #{non_neg_integer() => [non_neg_integer()]},
                    Msg :: binary(),
                    NewState :: relcast_state()}.
 take(ForActorID, State, true) ->
@@ -1202,7 +1202,7 @@ maybe_update_state(State, ignore) ->
 maybe_update_state(State, NewModuleState) ->
     State#state{module_state = NewModuleState}.
 
-maybe_commit([], S) ->
+maybe_commit(none, S) ->
     S;
 maybe_commit(_, #state{transaction_dirty = false} = S) ->
     S;
