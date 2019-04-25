@@ -350,9 +350,15 @@ deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
             end
     end.
 
-%% default to false for ergonomics
 take(ID, State) ->
-    take(ID, State, false).
+    case take(ID, State, 1) of
+        {ok, [{Seq, Msg}], Acks, State1} ->
+            %% use the old API for backwards compatibility
+            {ok, Seq, Acks, Msg, State1};
+        Else ->
+            Else
+    end.
+
 
 %% @doc Get the next message this relcast has queued outbound for `ForActorID'.
 %% Once this message has been delivered to its destination, and acknowledged,
@@ -360,21 +366,18 @@ take(ID, State) ->
 %% Subsequent calls to `take()' without any intervening acks will return more
 %% messages up to the pipeline depth, thereafter it will return the
 %% `pipeline_full' tuple.  In the case where the client code has lost its
-%% connection, it should call `take/3' with `true', which will reset the pending
+%% connection, it should call `reset_actor/2', which will reset the pending
 %% acks state and reissue the oldest unacked message in case all of the unacked
 %% messages were lost in flight.
--spec take(pos_integer(), relcast_state(), boolean()) ->
+-spec take(pos_integer(), relcast_state(), pos_integer()) ->
                   {not_found, relcast_state()} |
                   {pipeline_full, relcast_state()} |
                   {ok,
-                   Seq :: non_neg_integer(),
+                   [{Seq :: non_neg_integer(),
+                     Msg :: binary()}],
                    Acks :: none | #{non_neg_integer() => [non_neg_integer()]},
-                   Msg :: binary(),
                    NewState :: relcast_state()}.
-take(ForActorID, State, true) ->
-    {ok, NewState} = reset_actor(ForActorID, State),
-    take(ForActorID, NewState, false);
-take(ForActorID, State = #state{pending_acks = Pending}, _) ->
+take(ForActorID, State = #state{pending_acks = Pending}, Count) ->
     %% we need to find the first "unacked" message for this actor
     %% we should remember the last acked message for this actor ID and start there
     %% check if there's a pending ACK and use that to find the "last" key, if present
@@ -385,28 +388,38 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
         Pends when Pends /= [] ->
             case hd(Pends) of
                 {_Seq, CF, Key, _Multicast} when CF == State#state.active_cf ->
-                    %% iterate until we find a key for this actor
-                    case find_next_outbound(ForActorID, CF, Key, State, false) of
+                    Count1 = min(Count, PipelineDepth - length(Pends)),
+                    case find_next_outbound(ForActorID, CF, Key, State, Count1, false) of
                         {not_found, LastKey, CF2} ->
                             {not_found, State#state{last_sent = maps:put(ForActorID,
                                                                          {CF2, LastKey},
                                                                          State#state.last_sent)}};
-                        {Key2, CF2, Msg, Multicast} ->
-                            {Seq2, State2} = make_seq(ForActorID, State),
-                            Pends1 = [{Seq2, CF2, Key2, Multicast}|Pends],
-                            %% merge these?
-                            {Acks, State3} = get_acks(Key2, State2),
-                            State4 = maybe_commit(Acks, State3),
-                            {ok, Seq2, Acks, Msg,
-                             State4#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}};
                         not_found ->
                             {not_found, State#state{last_sent=maps:put(ForActorID, none,
-                                                                       State#state.last_sent)}}
+                                                                       State#state.last_sent)}};
+                        Messages ->
+                            {Pend, Keys, Msgs, State1} =
+                                lists:foldl(
+                                  fun({Key2, CF2, Msg, Multicast}, {P, K, M, S}) ->
+                                          {Seq2, S1} = make_seq(ForActorID, S),
+                                          P1 = [{Seq2, CF2, Key2, Multicast} | P],
+                                          K1 = [Key2 | K],
+                                          M1 = [{Seq2, Msg} | M],
+                                          {P1, K1, M1, S1}
+                                  end,
+                                  {[], [], [], State},
+                                  Messages),
+                            Pends1 = lists:append(Pend, Pends),
+                            {Acks, State2} = get_acks(Keys, State1),
+                            State3 = maybe_commit(Acks, State2),
+                            {ok, Msgs, Acks,
+                             State3#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}}
                     end;
                 %% all our pends are for a stale epoch, clean them out
                 _ ->
                     %% adding true here resets all the pending acks before retrying
-                    take(ForActorID, State, true)
+                    {ok, State1} = reset_actor(ForActorID, State),
+                    take(ForActorID, State1, Count)
             end;
         _ ->
             %% default to the "first" key"
@@ -424,18 +437,29 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                                              {State#state.active_cf, min_outbound_key()}
                                      end,
                     %% iterate until we find a key for this actor
-                    case find_next_outbound(ForActorID, CF, StartKey, State) of
+                    case find_next_outbound(ForActorID, CF, StartKey, State, Count) of
                         {not_found, LastKey, CF2} ->
                             {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey},
                                                                          State#state.last_sent)}};
-                        {Key, CF2, Msg, Multicast} ->
-                            {Seq, State2} = make_seq(ForActorID, State),
-                            {Acks, State3} = get_acks(Key, State2),
-                            State4 = maybe_commit(Acks, State3),
-                            {ok, Seq, Acks, Msg,
-                             State4#state{pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
                         not_found ->
-                            {not_found, State#state{last_sent = maps:put(ForActorID, none, State#state.last_sent)}}
+                            {not_found, State#state{last_sent = maps:put(ForActorID, none, State#state.last_sent)}};
+                        Messages ->
+                            {Pend, Keys, Msgs, State1} =
+                                lists:foldl(
+                                  fun({Key2, CF2, Msg, Multicast}, {P, K, M, S}) ->
+                                          {Seq2, S1} = make_seq(ForActorID, S),
+                                          P1 = [{Seq2, CF2, Key2, Multicast} | P],
+                                          K1 = [Key2 | K],
+                                          M1 = [{Seq2, Msg} | M],
+                                          {P1, K1, M1, S1}
+                                  end,
+                                  {[], [], [], State},
+                                  Messages),
+                            Pends1 = lists:reverse(Pend),
+                            {Acks, State2} = get_acks(Keys, State1),
+                            State3 = maybe_commit(Acks, State2),
+                            {ok, Msgs, Acks,
+                             State3#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}}
                     end
             end
     end.
@@ -467,10 +491,10 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
             case hd(Pends) of
                 {_Ref, CF, Key, _Multicast} when CF == State#state.active_cf ->
                     %% iterate until we find a key for this actor
-                    case find_next_outbound(ForActorID, CF, Key, State, false) of
+                    case find_next_outbound(ForActorID, CF, Key, State, 1, false) of
                         {not_found, _LastKey, _CF2} ->
                             not_found;
-                        {_Key2, _CF2, Msg, _Multicast2} ->
+                        [{_Key2, _CF2, Msg, _Multicast2}] ->
                             {ok, Msg};
                         not_found ->
                             not_found
@@ -497,10 +521,10 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
                                              {State#state.active_cf, min_outbound_key()}
                                      end,
                     %% iterate until we find a key for this actor
-                    case find_next_outbound(ForActorID, CF, StartKey, State) of
+                    case find_next_outbound(ForActorID, CF, StartKey, State, 1) of
                         {not_found, _LastKey, _CF2} ->
                             not_found;
-                        {_Key, _CF2, Msg, _Multicast} ->
+                        [{_Key, _CF2, Msg, _Multicast}] ->
                             {ok, Msg};
                         not_found ->
                             not_found
@@ -922,10 +946,10 @@ get_last_key_out(DB, CF) ->
     MaxOutbound.
 
 %% iterate the outbound messages until we find one for this ActorID
-find_next_outbound(ActorID, CF, StartKey, State) ->
-    find_next_outbound(ActorID, CF, StartKey, State, true).
+find_next_outbound(ActorID, CF, StartKey, State, Count) ->
+    find_next_outbound(ActorID, CF, StartKey, State, Count, true).
 
-find_next_outbound(ActorID, CF, StartKey, State, AcceptStart) ->
+find_next_outbound(ActorID, CF, StartKey, State, Count, AcceptStart) ->
     {ok, Iter} = rocksdb:transaction_iterator(State#state.db, State#state.transaction,
                                               CF, [{iterate_upper_bound, max_outbound_key()}]),
     Res =
@@ -939,27 +963,39 @@ find_next_outbound(ActorID, CF, StartKey, State, AcceptStart) ->
                 rocksdb:iterator_move(Iter, StartKey),
                 rocksdb:iterator_move(Iter, next)
         end,
-    find_next_outbound_(ActorID, Res, Iter, State).
+    find_next_outbound_(ActorID, Res, Iter, State, Count, []).
 
-find_next_outbound_(_ActorId, {error, _}, Iter, State) ->
+find_next_outbound_(_ActorId, _, Iter, _State, 0, Acc) when Acc /= [] ->
+    rocksdb:iterator_close(Iter),
+    lists:reverse(Acc);
+find_next_outbound_(_ActorId, {error, _}, Iter, State, _, Acc) ->
     %% try to return the *highest* key we saw, so we can try starting here next time
-    Res = case rocksdb:iterator_move(Iter, prev) of
-        {ok, Key, _} ->
-            {not_found, Key, State#state.active_cf};
+    case Acc of
+        [] ->
+            Res = case rocksdb:iterator_move(Iter, prev) of
+                      {ok, Key, _} ->
+                          {not_found, Key, State#state.active_cf};
+                      _ ->
+                          not_found
+                  end;
         _ ->
-            not_found
+            Res = lists:reverse(Acc)
     end,
     rocksdb:iterator_close(Iter),
     Res;
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, State) ->
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, State,
+                   Count, Acc) ->
     %% unicast message for this actor
-    rocksdb:iterator_close(Iter),
-    {Key, State#state.active_cf, Value, false};
-find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:2/integer, _/bits>>}, Iter, State) ->
+    find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next),
+                        Iter, State, Count - 1,
+                        [{Key, State#state.active_cf, Value, false}|Acc]);
+find_next_outbound_(ActorID, {ok, <<"o", _/binary>>, <<1:2/integer, _/bits>>}, Iter, State,
+                   Count, Acc) ->
     %% unicast message for someone else
-    find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, State);
+    find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, State, Count, Acc);
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tail/bits>>}, Iter,
-                    State = #state{bitfieldsize=BitfieldSize}) when Type == 0; Type == 2 ->
+                    State = #state{bitfieldsize=BitfieldSize},
+                    Count, Acc) when Type == 0; Type == 2 ->
     <<ActorMask:BitfieldSize/integer-unsigned-big, Value/binary>> = Tail,
     case ActorMask band (1 bsl (BitfieldSize - ActorID)) of
         0 ->
@@ -971,11 +1007,12 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tai
                 false ->
                     ok
             end,
-            find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, maybe_dirty(ActorMask == 0, State));
+            find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, maybe_dirty(ActorMask == 0, State), Count, Acc);
         _  when Type == 0 ->
             %% multicast message with the high bit set for this actor
-            rocksdb:iterator_close(Iter),
-            {Key, State#state.active_cf, Value, true};
+            find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, State,
+                                Count - 1,
+                                [{Key, State#state.active_cf, Value, true}|Acc]);
         _  when Type == 2 ->
             %% callback message with the high bit set for this actor
             Module = State#state.module,
@@ -983,10 +1020,12 @@ find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<Type:2/integer, Tai
                 none ->
                     %% nothing for this actor
                     flip_actor_bit(ActorID, State#state.transaction, State#state.active_cf, Key, BitfieldSize),
-                    find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, State);
+                    find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, State,
+                                        Count, Acc);
                 Message ->
-                    rocksdb:iterator_close(Iter),
-                    {Key, State#state.active_cf, Message, true}
+                    find_next_outbound_(ActorID, rocksdb:iterator_move(Iter, next), Iter, State,
+                                        Count - 1,
+                                        [{Key, State#state.active_cf, Message, true}|Acc])
             end
 
     end.
@@ -1225,8 +1264,9 @@ store_ack(Seq, From, #state{epoch = Epoch, floated_acks = Acks} = S) ->
     %% at some point we might not need to keep them in order?
     S#state{floated_acks = Acks#{From => ActorAcks ++ [{Seq, Epoch}]}}.
 
-get_acks(Key, #state{floated_acks = Acks, outbound_keys = Keys} = S) ->
-    case lists:member(Key, Keys) andalso maps:size(Acks) > 0 of
+get_acks(Keys, #state{floated_acks = Acks, outbound_keys = OutKeys} = S) ->
+    case lists:any(fun(Key) -> lists:keymember(Key, OutKeys) end,
+                   Keys) of
         %% we've been floated but not acked
         true ->
             {maps:map(fun(_, V) ->
