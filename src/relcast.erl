@@ -396,7 +396,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                             Pends1 = Pends ++ [{Seq2, CF2, Key2, Multicast}],
                             %% merge these?
                             {Acks, State3} = get_acks(Key2, State2),
-                            State4 = maybe_commit(Acks, maybe_serialize(State3)),
+                            State4 = maybe_commit(Acks, State3),
                             {ok, Seq2, Acks, Msg,
                              State4#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}};
                         not_found ->
@@ -431,7 +431,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                         {Key, CF2, Msg, Multicast} ->
                             {Seq, State2} = make_seq(ForActorID, State),
                             {Acks, State3} = get_acks(Key, State2),
-                            State4 = maybe_commit(Acks, maybe_serialize(State3)),
+                            State4 = maybe_commit(Acks, State3),
                             {ok, Seq, Acks, Msg,
                              State4#state{pending_acks = maps:put(ForActorID, [{Seq, CF2, Key, Multicast}], Pending)}};
                         not_found ->
@@ -1203,9 +1203,8 @@ maybe_update_state(State, NewModuleState) ->
 
 maybe_commit(none, S) ->
     S;
-maybe_commit(_, #state{transaction_dirty = false} = S) ->
-    S;
-maybe_commit(_, #state{transaction = Txn, db = DB, write_opts = Opts} = S) ->
+maybe_commit(_, #state{transaction = Txn, db = DB, write_opts = Opts} = S0) ->
+    S = maybe_serialize(S0),
     ok = rocksdb:transaction_commit(Txn),
     {ok, Txn1} = transaction(DB, Opts),
     S#state{transaction = Txn1, transaction_dirty = false}.
