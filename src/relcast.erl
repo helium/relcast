@@ -141,7 +141,8 @@
           floated_acks = #{} :: #{pos_integer() => [non_neg_integer()]},
           outbound_keys = [] :: [binary()],
           db_opts = [] :: [any()],
-          write_opts = [] :: [any()]
+          write_opts = [] :: [any()],
+          new_messages = #{} :: #{pos_integer() => boolean()}
          }).
 
 -type relcast_state() :: #state{}.
@@ -343,6 +344,7 @@ deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
                                                  <<FromActorID:16/integer, Message/binary>>),
                     {ok, NewState#state{in_key_count = KeyCount + 1,
                                         transaction_dirty = true,
+                                        %% new_messages = true,
                                         defers = maps:put(FromActorID, [Key|N], Defers)}};
                 _ ->
                     %% sorry buddy, no room on the couch
@@ -377,14 +379,17 @@ take(ID, State) ->
                      Msg :: binary()}],
                    Acks :: none | #{non_neg_integer() => [non_neg_integer()]},
                    NewState :: relcast_state()}.
-take(ForActorID, State = #state{pending_acks = Pending}, Count) ->
+take(ForActorID, State = #state{pending_acks = Pending, new_messages = NewMsgs}, Count) ->
     %% we need to find the first "unacked" message for this actor
     %% we should remember the last acked message for this actor ID and start there
     %% check if there's a pending ACK and use that to find the "last" key, if present
+    ActorNewMsgs = maps:get(ForActorID, NewMsgs, true),
     PipelineDepth = application:get_env(relcast, pipeline_depth, 75),
     case maps:get(ForActorID, Pending, []) of
         Pends when length(Pends) >= PipelineDepth ->
             {pipeline_full, State};
+        _Pends when ActorNewMsgs == false ->
+            {not_found, State};
         Pends when Pends /= [] ->
             case hd(Pends) of
                 {_Seq, CF, Key, _Multicast} when CF == State#state.active_cf ->
@@ -393,10 +398,12 @@ take(ForActorID, State = #state{pending_acks = Pending}, Count) ->
                         {not_found, LastKey, CF2} ->
                             {not_found, State#state{last_sent = maps:put(ForActorID,
                                                                          {CF2, LastKey},
-                                                                         State#state.last_sent)}};
+                                                                         State#state.last_sent),
+                                                    new_messages = NewMsgs#{ForActorID => false}}};
                         not_found ->
                             {not_found, State#state{last_sent=maps:put(ForActorID, none,
-                                                                       State#state.last_sent)}};
+                                                                       State#state.last_sent),
+                                                    new_messages = NewMsgs#{ForActorID => false}}};
                         Messages ->
                             {Pend, Keys, Msgs, State1} =
                                 lists:foldl(
@@ -440,9 +447,11 @@ take(ForActorID, State = #state{pending_acks = Pending}, Count) ->
                     case find_next_outbound(ForActorID, CF, StartKey, State, Count) of
                         {not_found, LastKey, CF2} ->
                             {not_found, State#state{last_sent = maps:put(ForActorID, {CF2, LastKey},
-                                                                         State#state.last_sent)}};
+                                                                         State#state.last_sent),
+                                                    new_messages = NewMsgs#{ForActorID => false}}};
                         not_found ->
-                            {not_found, State#state{last_sent = maps:put(ForActorID, none, State#state.last_sent)}};
+                            {not_found, State#state{last_sent = maps:put(ForActorID, none, State#state.last_sent),
+                                                    new_messages = NewMsgs#{ForActorID => false}}};
                         Messages ->
                             {Pend, Keys, Msgs, State1} =
                                 lists:foldl(
@@ -467,6 +476,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, Count) ->
 -spec reset_actor(pos_integer(), relcast_state()) -> {ok, relcast_state()}.
 reset_actor(ForActorID, State = #state{pending_acks = Pending, last_sent = LastSent}) ->
     {ok, reset_seq(ForActorID, State#state{pending_acks = Pending#{ForActorID => []},
+                                           new_messages = #{},
                                            last_sent = maps:remove(ForActorID, LastSent)})}.
 
 -spec in_flight(pos_integer(), relcast_state()) -> non_neg_integer().
@@ -761,10 +771,11 @@ handle_actions([new_epoch|Tail], Transaction, State) ->
     %% messages from this point on) into the active CF, which is this new one now
     {ok, Transaction1} = transaction(State#state.db, State#state.write_opts),
     handle_actions(Tail, Transaction1, State#state{out_key_count=0, active_cf=NewCF,
-                                                        transaction = Transaction1,
-                                                        transaction_dirty = false,
-                                                        floated_acks = Floats,
-                                                        epoch=State#state.epoch + 1, pending_acks=#{}});
+                                                   transaction = Transaction1,
+                                                   transaction_dirty = false,
+                                                   new_messages = #{},
+                                                   floated_acks = Floats,
+                                                   epoch=State#state.epoch + 1, pending_acks=#{}});
 handle_actions([{multicast, Message}|Tail], Transaction, State =
                #state{out_key_count=KeyCount, bitfieldsize=BitfieldSize, id=ID, ids=IDs, active_cf=CF, module=Module}) ->
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
@@ -772,7 +783,7 @@ handle_actions([{multicast, Message}|Tail], Transaction, State =
     ok = rocksdb:transaction_put(Transaction, CF, Key, <<0:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
     %% handle our own copy of the message
     %% deferring your own message is an error
-    State1 = State#state{outbound_keys = [Key|State#state.outbound_keys]},
+    State1 = State#state{outbound_keys = [Key|State#state.outbound_keys], new_messages = #{}},
     case Module:handle_message(Message, ID, State#state.module_state) of
         ignore ->
             handle_actions(Tail, Transaction, update_next(IDs -- [ID], CF, Key, State1#state{out_key_count=KeyCount+1}));
@@ -784,7 +795,7 @@ handle_actions([{callback, Message}|Tail], Transaction, State =
     Bitfield = make_bitfield(BitfieldSize, IDs, ID),
     Key = make_outbound_key(KeyCount),
     ok = rocksdb:transaction_put(Transaction, CF, Key, <<2:2/integer, Bitfield:BitfieldSize/bits, Message/binary>>),
-    State1 = State#state{outbound_keys = [Key|State#state.outbound_keys]},
+    State1 = State#state{outbound_keys = [Key|State#state.outbound_keys], new_messages = #{}},
     case Module:callback_message(ID, Message, State#state.module_state) of
         none ->
             handle_actions(Tail, Transaction, update_next(IDs -- [ID], CF, Key, State1#state{out_key_count=KeyCount+1}));
@@ -807,9 +818,11 @@ handle_actions([{unicast, ID, Message}|Tail], Transaction, State = #state{module
         {ModuleState, Actions} ->
             handle_actions(Actions++Tail, Transaction, State#state{module_state=ModuleState})
     end;
-handle_actions([{unicast, ToActorID, Message}|Tail], Transaction, State = #state{out_key_count=KeyCount, active_cf=CF}) ->
+handle_actions([{unicast, ToActorID, Message}|Tail], Transaction, State = #state{out_key_count=KeyCount,
+                                                                                 new_messages = NewMsgs,
+                                                                                 active_cf=CF}) ->
     Key = make_outbound_key(KeyCount),
-    State1 = State#state{outbound_keys = [Key|State#state.outbound_keys]},
+    State1 = State#state{outbound_keys = [Key|State#state.outbound_keys], new_messages = NewMsgs#{ToActorID => true}},
     ok = rocksdb:transaction_put(Transaction, CF, Key, <<1:2/integer, ToActorID:14/integer, Message/binary>>),
     handle_actions(Tail, Transaction, update_next([ToActorID], CF, Key, State1#state{out_key_count=KeyCount+1}));
 handle_actions([{stop, Timeout}|_Tail], _Transaction, State) ->
@@ -1265,8 +1278,9 @@ store_ack(Seq, From, #state{epoch = Epoch, floated_acks = Acks} = S) ->
     S#state{floated_acks = Acks#{From => ActorAcks ++ [{Seq, Epoch}]}}.
 
 get_acks(Keys, #state{floated_acks = Acks, outbound_keys = OutKeys} = S) ->
-    case lists:any(fun(Key) -> lists:keymember(Key, OutKeys) end,
-                   Keys) of
+    case maps:size(Acks) /= 0 andalso
+        lists:any(fun(Key) -> lists:member(Key, OutKeys) end,
+                  Keys) of
         %% we've been floated but not acked
         true ->
             {maps:map(fun(_, V) ->
