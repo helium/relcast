@@ -386,9 +386,10 @@ extract_inf({ok, Seq, _Acks, Msg, _RC}, Actor, Inf, Msgs, States) ->
 
 extract_ack({_, _}, _, Ackable) ->
     Ackable;
+extract_ack({ok, _Seq, none, _Msg, _RC}, _Actor, Ackable) ->
+    Ackable;
 extract_ack({ok, _Seq, Acks, _Msg, _RC}, Actor, Ackable) ->
-    #{Actor := PriorAcks} = Ackable,
-    NewAcks = PriorAcks ++ Acks,
+    NewAcks = maps:merge(Ackable, Acks),
     Ackable#{Actor => NewAcks}.
 
 update_counters({_, full}, Cols) ->
@@ -405,7 +406,7 @@ open(Actors, Dir0) ->
     application:set_env(relcast, max_defers, ?MAX_DEFERS),
     application:set_env(relcast, pipeline_depth, ?PIPELINE_DEPTH),
     %% this is not great, but I'm not sure how to get the model right otherwise
-    application:set_env(relcast, defer_count_threshold, 0),
+    application:set_env(relcast, defer_count_threshold, -1),
 
     Dir = case Dir0 of
               undefined ->

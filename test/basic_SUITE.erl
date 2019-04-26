@@ -69,7 +69,8 @@ basic(_Config) ->
     {ok, RC1_7} = relcast:ack(3, Seq, RC1_6),
     %% actor 3 still has pending data, but we need to clear pending to
     %% get at it
-    {ok, Seq3_1, none, <<"hai">>, RC1_8} = relcast:take(3, RC1_7, true),
+    {ok, RC1_7a} = relcast:reset_actor(3, RC1_7),
+    {ok, Seq3_1, none, <<"hai">>, RC1_8} = relcast:take(3, RC1_7a),
     %% ack both of the outstanding messages
     {ok, RC1_9} = relcast:ack(2, Seq2, RC1_8),
     {not_found, _} = relcast:take(2, RC1_9),
@@ -108,7 +109,8 @@ basic2(_Config) ->
     {ok, RC6b} = relcast:ack(1, SeqB1, RC5b),
     %% check it's gone
     {ok, SeqA2, none, <<"hai">>, RC7a} = relcast:take(2, RC6a),
-    {ok, SeqB2, none, <<"hai">>, RC7b} = relcast:take(1, RC6b, true),
+    {ok, RC6b1} = relcast:reset_actor(1, RC6b),
+    {ok, SeqB2, none, <<"hai">>, RC7b} = relcast:take(1, RC6b1),
 
     {ok, RC8a} = relcast:ack(2, SeqA2, RC7a),
     {ok, RC8b} = relcast:ack(2, SeqB2, RC7b),
@@ -142,7 +144,8 @@ stop_resume(_Config) ->
     %% ack with the wrong ref
     {ok, RC1_7} = relcast:ack(3, Ref, RC1_6),
     %% actor 3 still has pending data
-    {ok, Ref3, _, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7, true),
+    {ok, RC1_7a1} = relcast:reset_actor(3, RC1_7),
+    {ok, Ref3, _, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7a1),
     relcast:stop(normal, RC1_7a),
     {ok, RC1_8} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2"}]),
     %% ack both of the outstanding messages
@@ -150,7 +153,8 @@ stop_resume(_Config) ->
     %% we lost the ack, so the message is still in-queue
     {ok, Ref4, _, <<"hai">>, RC1_10} = relcast:take(2, RC1_9),
     {ok, RC1_11} = relcast:ack(3, Ref3, RC1_10),
-    {ok, Ref5, _, <<"hai">>, RC1_12} = relcast:take(2, RC1_11, true),
+    {ok, RC1_11a} = relcast:reset_actor(2, RC1_11),
+    {ok, Ref5, _, <<"hai">>, RC1_12} = relcast:take(2, RC1_11a),
     %% ack both of the outstanding messages again
     {ok, RC1_13} = relcast:ack(2, Ref4, RC1_12),
     {not_found, _} = relcast:take(2, RC1_13),
@@ -201,7 +205,8 @@ upgrade_stop_resume(_Config) ->
     %% ack with the wrong ref
     {ok, RC1_7} = relcast:ack(3, Ref, RC1_6),
     %% actor 3 still has pending data
-    {ok, Ref3, _, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7, true),
+    {ok, RC1_7a1} = relcast:reset_actor(3, RC1_7),
+    {ok, Ref3, _, <<"hai">>, RC1_7a} = relcast:take(3, RC1_7a1),
     relcast:stop(normal, RC1_7a),
     {ok, RC1_8} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2a"}]),
     %% ack both of the outstanding messages
@@ -209,7 +214,8 @@ upgrade_stop_resume(_Config) ->
     %% we lost the ack, so the message is still in-queue
     {ok, Ref4, _, <<"hai">>, RC1_10} = relcast:take(2, RC1_9),
     {ok, RC1_11} = relcast:ack(3, Ref3, RC1_10),
-    {ok, Ref5, _, <<"hai">>, RC1_12} = relcast:take(2, RC1_11, true),
+    {ok, RC1_11a} = relcast:reset_actor(2, RC1_11),
+    {ok, Ref5, _, <<"hai">>, RC1_12} = relcast:take(2, RC1_11a),
     %% ack both of the outstanding messages again
     {ok, RC1_13} = relcast:ack(2, Ref4, RC1_12),
     {not_found, _} = relcast:take(2, RC1_13),
