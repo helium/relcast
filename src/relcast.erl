@@ -383,7 +383,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
         Pends when length(Pends) >= PipelineDepth ->
             {pipeline_full, State};
         Pends when Pends /= [] ->
-            case lists:last(Pends) of
+            case hd(Pends) of
                 {_Seq, CF, Key, _Multicast} when CF == State#state.active_cf ->
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, Key, State, false) of
@@ -393,7 +393,7 @@ take(ForActorID, State = #state{pending_acks = Pending}, _) ->
                                                                          State#state.last_sent)}};
                         {Key2, CF2, Msg, Multicast} ->
                             {Seq2, State2} = make_seq(ForActorID, State),
-                            Pends1 = Pends ++ [{Seq2, CF2, Key2, Multicast}],
+                            Pends1 = [{Seq2, CF2, Key2, Multicast}|Pends],
                             %% merge these?
                             {Acks, State3} = get_acks(Key2, State2),
                             State4 = maybe_commit(Acks, State3),
@@ -464,7 +464,7 @@ peek(ForActorID, State = #state{pending_acks = Pending}) ->
     %% check if there's a pending ACK and use that to find the "last" key, if present
     case maps:get(ForActorID, Pending, []) of
         Pends when Pends /= [] ->
-            case lists:last(Pends) of
+            case hd(Pends) of
                 {_Ref, CF, Key, _Multicast} when CF == State#state.active_cf ->
                     %% iterate until we find a key for this actor
                     case find_next_outbound(ForActorID, CF, Key, State, false) of
