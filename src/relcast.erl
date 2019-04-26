@@ -352,6 +352,7 @@ deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
             end
     end.
 
+%% TODO: remove (or change to count default to 1) this when tests and EQC are updated.
 take(ID, State) ->
     case take(ID, State, 1) of
         {ok, [{Seq, Msg}], Acks, State1} ->
@@ -405,26 +406,10 @@ take(ForActorID, State = #state{pending_acks = Pending, new_messages = NewMsgs},
                                                                        State#state.last_sent),
                                                     new_messages = NewMsgs#{ForActorID => false}}};
                         Messages ->
-                            {Pend, Keys, Msgs, State1} =
-                                lists:foldl(
-                                  fun({Key2, CF2, Msg, Multicast}, {P, K, M, S}) ->
-                                          {Seq2, S1} = make_seq(ForActorID, S),
-                                          P1 = [{Seq2, CF2, Key2, Multicast} | P],
-                                          K1 = [Key2 | K],
-                                          M1 = [{Seq2, Msg} | M],
-                                          {P1, K1, M1, S1}
-                                  end,
-                                  {[], [], [], State},
-                                  Messages),
-                            Pends1 = lists:append(Pend, Pends),
-                            {Acks, State2} = get_acks(Keys, State1),
-                            State3 = maybe_commit(Acks, State2),
-                            {ok, Msgs, Acks,
-                             State3#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}}
+                            process_messages(Messages, Pends, Pending, ForActorID, State)
                     end;
                 %% all our pends are for a stale epoch, clean them out
                 _ ->
-                    %% adding true here resets all the pending acks before retrying
                     {ok, State1} = reset_actor(ForActorID, State),
                     take(ForActorID, State1, Count)
             end;
@@ -453,25 +438,29 @@ take(ForActorID, State = #state{pending_acks = Pending, new_messages = NewMsgs},
                             {not_found, State#state{last_sent = maps:put(ForActorID, none, State#state.last_sent),
                                                     new_messages = NewMsgs#{ForActorID => false}}};
                         Messages ->
-                            {Pend, Keys, Msgs, State1} =
-                                lists:foldl(
-                                  fun({Key2, CF2, Msg, Multicast}, {P, K, M, S}) ->
-                                          {Seq2, S1} = make_seq(ForActorID, S),
-                                          P1 = [{Seq2, CF2, Key2, Multicast} | P],
-                                          K1 = [Key2 | K],
-                                          M1 = [{Seq2, Msg} | M],
-                                          {P1, K1, M1, S1}
-                                  end,
-                                  {[], [], [], State},
-                                  Messages),
-                            Pends1 = lists:reverse(Pend),
-                            {Acks, State2} = get_acks(Keys, State1),
-                            State3 = maybe_commit(Acks, State2),
-                            {ok, Msgs, Acks,
-                             State3#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}}
+                            process_messages(Messages, [], Pending, ForActorID, State)
                     end
             end
     end.
+
+process_messages(Messages, Pends, Pending, ForActorID, State) ->
+    {Pend, Keys, Msgs, State1} =
+        lists:foldl(
+          fun({Key2, CF2, Msg, Multicast}, {P, K, M, S}) ->
+                  {Seq2, S1} = make_seq(ForActorID, S),
+                  P1 = [{Seq2, CF2, Key2, Multicast} | P],
+                  K1 = [Key2 | K],
+                  M1 = [{Seq2, Msg} | M],
+                  {P1, K1, M1, S1}
+          end,
+          {[], [], [], State},
+          Messages),
+    Pends1 = lists:append(Pend, Pends),
+    {Acks, State2} = get_acks(Keys, State1),
+    State3 = maybe_commit(Acks, State2),
+    {ok, Msgs, Acks,
+     State3#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}}.
+
 
 -spec reset_actor(pos_integer(), relcast_state()) -> {ok, relcast_state()}.
 reset_actor(ForActorID, State = #state{pending_acks = Pending, last_sent = LastSent}) ->
