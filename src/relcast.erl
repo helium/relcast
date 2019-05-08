@@ -190,7 +190,10 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     OpenOpts2 = proplists:get_value(db_opts, RelcastOptions, []),
     WriteOpts = proplists:get_value(write_opts, RelcastOptions, [{sync, true}]),
     OpenOpts = OpenOpts1 ++ OpenOpts2,
-    DBOptions = DBOptions0 ++ OpenOpts,
+
+    GlobalOpts = application:get_env(rocksdb, global_opts, []),
+    DBOptions = DBOptions0 ++ OpenOpts ++ GlobalOpts ++
+        [{block_based_table_options, [{no_block_cache, true}]}],
     {ColumnFamilies, HasInbound} = case rocksdb:list_column_families(DataDir, DBOptions) of
                                        {ok, CFs0} ->
                                            CFs = lists:sort(CFs0) -- ["default"],
