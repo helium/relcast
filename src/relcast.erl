@@ -192,8 +192,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     OpenOpts = OpenOpts1 ++ OpenOpts2,
 
     GlobalOpts = application:get_env(rocksdb, global_opts, []),
-    DBOptions = DBOptions0 ++ OpenOpts ++ GlobalOpts ++
-        [{block_based_table_options, [{no_block_cache, true}]}],
+    DBOptions = DBOptions0 ++ OpenOpts ++ GlobalOpts,
     {ColumnFamilies, HasInbound} = case rocksdb:list_column_families(DataDir, DBOptions) of
                                        {ok, CFs0} ->
                                            CFs = lists:sort(CFs0) -- ["default"],
