@@ -585,7 +585,8 @@ ack(FromActorID, Seqs, State = #state{transaction = Transaction,
 %% don't get "stuck" with delayed defers blocking the forward progress
 %% of the state machine defined by the behavior.
 -spec process_inbound(relcast_state()) ->
-                             {ok, relcast_state()} |
+                             {ok, [{Seq :: non_neg_integer(),
+                                    Msg :: binary()}], relcast_state()} |
                              {stop, pos_integer(), relcast_state()}.
 process_inbound(State) ->
     case handle_pending_inbound(State#state.transaction, State) of
