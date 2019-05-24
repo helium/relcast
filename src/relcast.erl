@@ -590,13 +590,23 @@ ack(FromActorID, Seqs, State = #state{transaction = Transaction,
 process_inbound(State) ->
     case handle_pending_inbound(State#state.transaction, State) of
         {ok, NewState} ->
-            {ok, NewState};
+            {Acks, NewState1} = get_acks(NewState),
+            NewState2 = maybe_commit(force, NewState1),
+            {ok, Acks, NewState2};
         {stop, Timeout, NewState} ->
             {stop, Timeout, NewState}
     end.
 
 %% @doc Stop the relcast instance.
 -spec stop(any(), relcast_state()) -> ok.
+stop(lite, State = #state{module=Module, module_state=ModuleState})->
+    case erlang:function_exported(Module, terminate, 2) of
+        true ->
+            Module:terminate(normal, ModuleState);
+        false ->
+            ok
+    end,
+    rocksdb:close(State#state.db);
 stop(Reason, State = #state{module=Module, module_state=ModuleState})->
     case erlang:function_exported(Module, terminate, 2) of
         true ->
@@ -1246,6 +1256,8 @@ maybe_update_state(State, NewModuleState) ->
 
 maybe_commit(none, S) ->
     S;
+maybe_commit(_, #state{transaction_dirty = false} = S) ->
+    S;
 maybe_commit(_, #state{transaction = Txn, db = DB, write_opts = Opts} = S0) ->
     S = maybe_serialize(S0),
     ok = rocksdb:transaction_commit(Txn),
@@ -1267,6 +1279,19 @@ store_ack(Seq, From, #state{epoch = Epoch, floated_acks = Acks} = S) ->
     ActorAcks = maps:get(From, Acks, []),
     %% at some point we might not need to keep them in order?
     S#state{floated_acks = Acks#{From => ActorAcks ++ [{Seq, Epoch}]}}.
+
+%% unconditional version
+get_acks(#state{floated_acks = Acks} = S) ->
+    case maps:size(Acks) /= 0 of
+        true ->
+            {maps:map(fun(_, V) ->
+                              [Sq || {Sq, _Epoch} <- V]
+                      end, Acks),
+             S#state{floated_acks = #{}, outbound_keys = []}};
+        %% we've already synced to disc for this message
+        false ->
+            {none, S}
+    end.
 
 get_acks(Keys, #state{floated_acks = Acks, outbound_keys = OutKeys} = S) ->
     case maps:size(Acks) /= 0 andalso
