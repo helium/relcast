@@ -627,7 +627,7 @@ status(State = #state{module_state = ModuleState, transaction = Transaction}) ->
     {ok, Iter} = rocksdb:transaction_iterator(State#state.db, Transaction, State#state.active_cf,
                                               [{iterate_upper_bound, max_outbound_key()}]),
     OutboundQueue = build_outbound_status(rocksdb:iterator_move(Iter, {seek, min_outbound_key()}),
-                                          Iter, State#state.bitfieldsize, #{}),
+                                          Iter, State#state.bitfieldsize, maps:from_list([{ID, []} || ID <- State#state.ids, ID /= State#state.id])),
     {ok, InIter} = rocksdb:transaction_iterator(State#state.db, Transaction, State#state.inbound_cf,
                                                 [{iterate_upper_bound, max_inbound_key()}]),
     InboundQueue = build_inbound_status(rocksdb:iterator_move(InIter, {seek, min_inbound_key()}), InIter, []),
