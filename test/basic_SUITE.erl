@@ -231,7 +231,7 @@ defer(_Config) ->
     %% relcast is in round 0
     {ok, RC1_2} = relcast:deliver(1, <<"seq", 1:8/integer>>, 2, RC1),
     {_, [{2, <<"seq", 1:8/integer>>}], Outbound} = relcast:status(RC1_2),
-    0 = maps:size(Outbound),
+    0 = maps:size(maps:filter(fun(_K, V) -> length(V) > 0 end, Outbound)),
     {0, _} = relcast:command(round, RC1_2),
     {#{}, _} = relcast:command(seqmap, RC1_2),
     {ok, RC1_3} = relcast:command(next_round, RC1_2),
