@@ -240,7 +240,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                          end,
     case Module:init(Arguments) of
         {ok, ModuleState0} ->
-            {OldSer, ModuleState, KeyTree} = get_mod_state(DB, InboundCF, Module, ModuleState0, WriteOpts),
+            {OldSer, ModuleState, KeyTree} = get_mod_state(DB, Module, ModuleState0, WriteOpts),
             LastKeyIn = get_last_key_in(DB, InboundCF),
             LastKeyOut = get_last_key_out(DB, ActiveCF),
             BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
@@ -870,53 +870,53 @@ round_to_nearest_byte(Bits) ->
             Bits + (8 - Extra)
     end.
 
-get_mod_state(DB, OldCF, Module, ModuleState0, WriteOpts) ->
-    case rocksdb:get(DB, OldCF, ?stored_module_state, []) of
+get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
+    case rocksdb:get(DB, ?stored_module_state, []) of
         {ok, SerializedModuleState} ->
-            ok = rocksdb:put(DB, ?stored_module_state, SerializedModuleState, []),
-            ok = rocksdb:delete(DB, OldCF, ?stored_module_state, []),
-            rehydrate(Module, SerializedModuleState, ModuleState0);
+            {SerState, ModState, _} = rehydrate(Module, SerializedModuleState, ModuleState0),
+            {ok, Txn} = transaction(DB, WriteOpts),
+            New = Module:serialize(ModState),
+            KT =
+                case do_serialize(Module, undefined, New, ?stored_key_prefix, Txn) of
+                    bin ->
+                        bin;
+                    KeyTree ->
+                        ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
+                                                     term_to_binary(KeyTree, [compressed])),
+                        ok = rocksdb:transaction_delete(Txn, ?stored_module_state),
+                        KeyTree
+                end,
+            rocksdb:transaction_commit(Txn),
+            {SerState, ModState, KT};
         not_found ->
-            case rocksdb:get(DB, ?stored_module_state, []) of
-                {ok, SerializedModuleState} ->
-                    {SerState, ModState, _} = rehydrate(Module, SerializedModuleState, ModuleState0),
+            {SerState, ModState, KeyTree} =
+                case rocksdb:get(DB, ?stored_key_tree, []) of
+                    {ok, KeyTreeBin} ->
+                        KT = binary_to_term(KeyTreeBin),
+                        do_deserialize(Module, ModuleState0, ?stored_key_prefix, KT, DB);
+                    not_found ->
+                        {undefined, ModuleState0, bin}
+                end,
+            NewSer = Module:serialize(ModState),
+            case get_key_tree(Module, NewSer) of
+                %% matches the existing tree on disk
+                KeyTree ->
+                    {SerState, ModState, KeyTree};
+                %% monolithic state
+                bin ->
+                    ok = rocksdb:put(DB, ?stored_module_state, NewSer,
+                                     [{sync, true}]),
+                    _ = rocksdb:delete(DB, ?stored_key_tree, [{sync, true}]),
+                    {SerState, ModState, bin};
+                %% new tree, write the structure to disk
+                KeyTreeNew ->
+                    ok = rocksdb:put(DB, ?stored_key_tree,
+                                     term_to_binary(KeyTreeNew, [compressed]), [{sync, true}]),
+                    %% force disk sync on first startup, don't wait for messages
                     {ok, Txn} = transaction(DB, WriteOpts),
-                    New = Module:serialize(ModState),
-                    KT =
-                        case do_serialize(Module, undefined, New, ?stored_key_prefix, Txn) of
-                            bin ->
-                                bin;
-                            KeyTree ->
-                                ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
-                                                             term_to_binary(KeyTree, [compressed])),
-                                ok = rocksdb:transaction_delete(Txn, ?stored_module_state),
-                                KeyTree
-                        end,
+                    _KeyTree = do_serialize(Module, undefined, NewSer, ?stored_key_prefix, Txn),
                     rocksdb:transaction_commit(Txn),
-                    {SerState, ModState, KT};
-                not_found ->
-                    {SerState, ModState, KeyTree} =
-                        case rocksdb:get(DB, ?stored_key_tree, []) of
-                            {ok, KeyTreeBin} ->
-                                KT = binary_to_term(KeyTreeBin),
-                                do_deserialize(Module, ModuleState0, ?stored_key_prefix, KT, DB);
-                            not_found ->
-                                {undefined, ModuleState0, bin}
-                        end,
-                    NewSer = Module:serialize(ModState),
-                    case get_key_tree(Module, NewSer) of
-                        KeyTree ->
-                            {SerState, ModState, KeyTree};
-                        bin ->
-                            ok = rocksdb:put(DB, ?stored_module_state, NewSer,
-                                             [{sync, true}]),
-                            _ = rocksdb:delete(DB, ?stored_key_tree, [{sync, true}]),
-                            {SerState, ModState, bin};
-                        KeyTreeNew ->
-                            ok = rocksdb:put(DB, ?stored_key_tree,
-                                             term_to_binary(KeyTreeNew, [compressed]), [{sync, true}]),
-                            {SerState, ModState, KeyTree}
-                    end
+                    {NewSer, ModState, KeyTreeNew}
             end
     end.
 
