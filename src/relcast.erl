@@ -81,7 +81,7 @@
 %%====================================================================
 -callback init(Arguments :: any()) -> {ok, State :: term()}.
 -callback restore(OldState :: term(), NewState :: term()) -> {ok, State :: term()}.
--callback serialize(State :: term()) -> Binary :: binary().
+-callback serialize(State :: term()) -> Binary :: binary() | #{atom() => #{} | binary()}.
 -callback deserialize(Binary :: binary()) -> State :: term().
 -callback handle_message(Message :: binary(), ActorId :: pos_integer(), State :: term()) ->
     {NewState :: term(), Actions :: actions()} | defer | ignore.
