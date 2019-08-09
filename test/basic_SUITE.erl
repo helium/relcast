@@ -53,7 +53,11 @@ end_per_suite(Config) ->
 
 basic(_Config) ->
     Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data1"}]),
+
+    {error, {invalid_or_no_existing_store, _}} =
+        relcast:start(1, Actors, test_handler, [1], [{data_dir, "data1"}]),
+
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data1"}]),
     {not_found, _} = relcast:take(2, RC1),
     {false, _} = relcast:command(is_done, RC1),
     {ok, RC1_2} = relcast:deliver(1, <<"hello">>, 2, RC1),
@@ -81,8 +85,8 @@ basic(_Config) ->
 
 basic2(_Config) ->
     Actors = lists:seq(1, 3),
-    {ok, RC1a} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data13a"}]),
-    {ok, RC1b} = relcast:start(2, Actors, test_handler, [2], [{data_dir, "data13b"}]),
+    {ok, RC1a} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data13a"}]),
+    {ok, RC1b} = relcast:start(2, Actors, test_handler, [2], [{create, true}, {data_dir, "data13b"}]),
     {not_found, _} = relcast:take(2, RC1a),
     {not_found, _} = relcast:take(1, RC1b),
     {ok, RC2a} = relcast:command({init, 2}, RC1a),
@@ -124,7 +128,7 @@ basic2(_Config) ->
 
 stop_resume(_Config) ->
     Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2"}]),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data2"}]),
     {not_found, _} = relcast:take(2, RC1),
     {false, _} = relcast:command(is_done, RC1),
     {ok, RC1_2} = relcast:deliver(5, <<"hello">>, 2, RC1),
@@ -167,7 +171,7 @@ stop_resume(_Config) ->
 
 upgrade_stop_resume(_Config) ->
     Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2a"}]),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data2a"}]),
     {not_found, _} = relcast:take(2, RC1),
     {false, _} = relcast:command(is_done, RC1),
     {ok, RC1_2} = relcast:deliver(1, <<"hello">>, 2, RC1),
@@ -197,7 +201,7 @@ upgrade_stop_resume(_Config) ->
 
     %%proceed as planned
 
-    {ok, RC1_4} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data2a"}]),
+    {ok, RC1_4} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data2a"}]),
     %% check it's gone
     {ok, Ref2, _, <<"hai">>, RC1_5} = relcast:take(2, RC1_4),
     %% take for actor 3
@@ -226,7 +230,7 @@ upgrade_stop_resume(_Config) ->
 
 defer(_Config) ->
     Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data3"}]),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data3"}]),
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
     {ok, RC1_2} = relcast:deliver(1, <<"seq", 1:8/integer>>, 2, RC1),
@@ -260,7 +264,7 @@ defer(_Config) ->
 
 defer_stop_resume(_Config) ->
     Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data4"}]),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data4"}]),
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
     {ok, RC1_2} = relcast:deliver(1, <<"seq", 1:8/integer>>, 2, RC1),
@@ -296,7 +300,7 @@ defer_stop_resume(_Config) ->
 
 epochs(_Config) ->
     Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data5"}]),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data5"}]),
     {ok, RC1_1a} = relcast:deliver(1, <<"hello">>, 2, RC1),
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
@@ -324,14 +328,14 @@ epochs(_Config) ->
     ["default", "Inbound", "epoch0000000001"] = CFs,
     %% reopen the relcast and make sure it didn't delete any wrong column
     %% families
-    {ok, RC1_10} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
+    {ok, RC1_10} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data5"}]),
     relcast:stop(normal, RC1_10),
     {ok, CFs} = rocksdb:list_column_families("data5", []),
     ok.
 
 epochs_gc(_Config) ->
     Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data6"}]),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data6"}]),
     %% try to put an entry in the seq map, it will be deferred because the
     %% relcast is in round 0
     {ok, RC1_1a} = relcast:deliver(1, <<"hello">>, 2, RC1),
@@ -378,7 +382,7 @@ epochs_gc(_Config) ->
 
 callback_message(_Config) ->
     Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data7"}]),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data7"}]),
     {ok, RC1_2} = relcast:deliver(1, <<"greet">>, 2, RC1),
     {ok, Ref, _, <<"greetings to 2">>, RC1_3} = relcast:take(2, RC1_2),
     {ok, Ref2, _, <<"greetings to 3">>, RC1_4} = relcast:take(3, RC1_3),
@@ -391,7 +395,7 @@ callback_message(_Config) ->
 
 self_callback_message(_Config) ->
     Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data8"}]),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data8"}]),
     {false, _} = relcast:command(was_saluted, RC1),
     {ok, RC1_2} = relcast:deliver(1, <<"salute">>, 2, RC1),
     {ok, Ref,  _, <<"salutations to 2">>, RC1_3} = relcast:take(2, RC1_2),
@@ -408,7 +412,7 @@ self_callback_message(_Config) ->
 pipeline(_Config) ->
     Old = application:set_env(relcast, pipeline_depth, 20),
     Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data11"}]),
+    {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{create, true}, {data_dir, "data11"}]),
     {not_found, _} = relcast:take(2, RC1),
     {ok, RC2} =
         lists:foldl(fun(Idx, {ok, Acc}) ->
@@ -454,7 +458,7 @@ pipeline(_Config) ->
 
 state_split(_Config) ->
     Actors = lists:seq(1, 3),
-    {ok, RC1} = relcast:start(1, Actors, handler1, [], [{data_dir, "data12"}]),
+    {ok, RC1} = relcast:start(1, Actors, handler1, [], [{create, true}, {data_dir, "data12"}]),
     {ok, RC1a} = relcast:command(populate, RC1),
     %% normal stop and start
     relcast:stop(normal, RC1a),

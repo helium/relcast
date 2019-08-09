@@ -184,6 +184,7 @@ transaction(A, B) ->
 -spec start(pos_integer(), [pos_integer(),...], atom(), list(), list()) ->
                    error | {ok, relcast_state()} | {stop, pos_integer(), relcast_state()}.
 start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
+    Create = proplists:get_value(create, RelcastOptions, false),
     DataDir = proplists:get_value(data_dir, RelcastOptions),
     DBOptions0 = db_options(length(ActorIDs)),
     OpenOpts1 = application:get_env(relcast, db_open_opts, []),
@@ -209,68 +210,73 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                            %% Assume the database doesn't exist yet, if we can't open it we will fail later
                                            {[], false}
                                    end,
-    {ok, DB, [_DefaultCF|CFHs0]} =
-        rocksdb:open_optimistic_transaction_db(DataDir,
-                                               [{create_if_missing, true}] ++ OpenOpts,
-                                               [ {CF, DBOptions}
-                                                 || CF <- ["default"|ColumnFamilies] ]),
-    {InboundCF, CFHs} = case HasInbound of
-                            false ->
-                                {ok, ICF} = rocksdb:create_column_family(DB, "Inbound", DBOptions),
-                                {ICF, CFHs0};
-                            true ->
-                                {hd(CFHs0), tl(CFHs0)}
-                        end,
-    %% check if we have some to prune
-    %% delete all but the two newest *contiguous* column families
-    {Epoch, ActiveCF} = case lists:reverse(ColumnFamilies -- ["Inbound"]) of
-                             [] ->
-                                 %% no column families, create epoch 0
-                                 {ok, FirstCF} = rocksdb:create_column_family(DB, make_column_family_name(0), DBOptions),
-                                 {0, FirstCF};
-                             [JustOne] ->
-                                 %% only a single column family, no need to prune
-                                 {cf_to_epoch(JustOne), hd(CFHs)};
-                             [Last | _Tail] ->
-                                %% Prune all but the latest epoch
-                                CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 1),
-                                [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
-                                [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
-                                {cf_to_epoch(Last), hd(lists:sublist(CFHs, length(CFHs) + 1 - 1, 1))}
-                         end,
-    case Module:init(Arguments) of
-        {ok, ModuleState0} ->
-            {OldSer, ModuleState, KeyTree} = get_mod_state(DB, Module, ModuleState0, WriteOpts),
-            LastKeyIn = get_last_key_in(DB, InboundCF),
-            LastKeyOut = get_last_key_out(DB, ActiveCF),
-            BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
-            State = #state{module = Module,
-                           id = ActorID,
-                           inbound_cf = InboundCF,
-                           active_cf = ActiveCF,
-                           ids = ActorIDs,
-                           module_state = ModuleState,
-                           old_serialized = OldSer,
-                           db = DB,
-                           out_key_count = LastKeyOut + 1,
-                           in_key_count = LastKeyIn + 1,
-                           epoch = Epoch,
-                           bitfieldsize = BitFieldSize,
-                           db_opts = DBOptions,
-                           write_opts = WriteOpts,
-                           key_tree = KeyTree},
-            {ok, Iter} = rocksdb:iterator(State#state.db, InboundCF, [{iterate_upper_bound, max_inbound_key()}]),
-            Defers = build_defer_list(rocksdb:iterator_move(Iter, {seek, min_inbound_key()}), Iter, InboundCF, #{}),
-            %% try to deliver any old queued inbound messages
-            {ok, Transaction} = transaction(DB, WriteOpts),
-            {ok, NewState} = handle_pending_inbound(Transaction,
-                                                    State#state{transaction = Transaction,
-                                                                defers=Defers}),
-            ok = rocksdb:transaction_commit(Transaction),
-            {ok, Transaction1} = transaction(DB, WriteOpts),
-            {ok, NewState#state{transaction = Transaction1}};
-        _ ->
-            error
+    case rocksdb:open_optimistic_transaction_db(DataDir,
+                                                [{create_if_missing, Create}] ++ OpenOpts,
+                                                [ {CF, DBOptions}
+                                                  || CF <- ["default"|ColumnFamilies] ]) of
+        {ok, DB, [_DefaultCF|CFHs0]} ->
+            {InboundCF, CFHs} = case HasInbound of
+                                    false ->
+                                        {ok, ICF} = rocksdb:create_column_family(DB, "Inbound", DBOptions),
+                                        {ICF, CFHs0};
+                                    true ->
+                                        {hd(CFHs0), tl(CFHs0)}
+                                end,
+            %% check if we have some to prune
+            %% delete all but the two newest *contiguous* column families
+            {Epoch, ActiveCF} = case lists:reverse(ColumnFamilies -- ["Inbound"]) of
+                                    [] ->
+                                        %% no column families, create epoch 0
+                                        {ok, FirstCF} = rocksdb:create_column_family(DB, make_column_family_name(0), DBOptions),
+                                        {0, FirstCF};
+                                    [JustOne] ->
+                                        %% only a single column family, no need to prune
+                                        {cf_to_epoch(JustOne), hd(CFHs)};
+                                    [Last | _Tail] ->
+                                        %% Prune all but the latest epoch
+                                        CFsToDelete = lists:sublist(CFHs, 1, length(CFHs) - 1),
+                                        [ ok = rocksdb:drop_column_family(CFH) || CFH <- CFsToDelete ],
+                                        [ ok = rocksdb:destroy_column_family(CFH) || CFH <- CFsToDelete ],
+                                        {cf_to_epoch(Last), hd(lists:sublist(CFHs, length(CFHs) + 1 - 1, 1))}
+                                end,
+            case Module:init(Arguments) of
+                {ok, ModuleState0} ->
+                    {OldSer, ModuleState, KeyTree} = get_mod_state(DB, Module, ModuleState0, WriteOpts),
+                    LastKeyIn = get_last_key_in(DB, InboundCF),
+                    LastKeyOut = get_last_key_out(DB, ActiveCF),
+                    BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
+                    State = #state{module = Module,
+                                   id = ActorID,
+                                   inbound_cf = InboundCF,
+                                   active_cf = ActiveCF,
+                                   ids = ActorIDs,
+                                   module_state = ModuleState,
+                                   old_serialized = OldSer,
+                                   db = DB,
+                                   out_key_count = LastKeyOut + 1,
+                                   in_key_count = LastKeyIn + 1,
+                                   epoch = Epoch,
+                                   bitfieldsize = BitFieldSize,
+                                   db_opts = DBOptions,
+                                   write_opts = WriteOpts,
+                                   key_tree = KeyTree},
+                    {ok, Iter} = rocksdb:iterator(State#state.db, InboundCF, [{iterate_upper_bound, max_inbound_key()}]),
+                    Defers = build_defer_list(rocksdb:iterator_move(Iter, {seek, min_inbound_key()}), Iter, InboundCF, #{}),
+                    %% try to deliver any old queued inbound messages
+                    {ok, Transaction} = transaction(DB, WriteOpts),
+                    {ok, NewState} = handle_pending_inbound(Transaction,
+                                                            State#state{transaction = Transaction,
+                                                                        defers=Defers}),
+                    ok = rocksdb:transaction_commit(Transaction),
+                    {ok, Transaction1} = transaction(DB, WriteOpts),
+                    {ok, NewState#state{transaction = Transaction1}};
+                _ ->
+                    error
+            end;
+        {error, {db_open, Msg}} ->
+            {error, {invalid_or_no_existing_store, Msg}};
+        {error, _} = E->
+            E
     end.
 
 %% @doc Send a command to the relcast callback module. Commands are distinct
@@ -293,12 +299,12 @@ command(Message, State = #state{module = Module,
                 {ok, NewState} ->
                     case handle_pending_inbound(NewState#state.transaction, NewState) of
                         {ok, NewerState} ->
-                            {Reply, NewerState};
+                            {Reply, maybe_serialize(NewerState)};
                         {stop, Timeout, NewerState} ->
-                            {stop, Reply, Timeout, NewerState}
+                            {stop, Reply, Timeout, maybe_serialize(NewerState)}
                     end;
                 {stop, Timeout, NewState} ->
-                    {stop, Reply, Timeout, NewState}
+                    {stop, Reply, Timeout, maybe_serialize(NewState)}
             end
     end.
 
@@ -910,6 +916,7 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
                     {SerState, ModState, bin};
                 %% new tree, write the structure to disk
                 KeyTreeNew ->
+                    %% lager:info("writing initial struct to disk"),
                     ok = rocksdb:put(DB, ?stored_key_tree,
                                      term_to_binary(KeyTreeNew, [compressed]), [{sync, true}]),
                     %% force disk sync on first startup, don't wait for messages
@@ -1195,6 +1202,7 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                               true ->
                                   do_serialize(K, fixup_old_map(OV), V, <<KeyName/binary, "_">>, Transaction);
                               false ->
+                                  %% lager:info("writing ~p to disk", [K]),
                                   ok = rocksdb:transaction_put(Transaction, KeyName, V),
                                   K
                           end
