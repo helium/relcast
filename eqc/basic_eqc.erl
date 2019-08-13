@@ -417,7 +417,8 @@ open(Actors, Dir0) ->
               Dir0 ->
                   Dir0
           end,
-    {ok, RC} = relcast:start(1, [1 | Actors], ?M, #state{}, [{data_dir, Dir}]),
+    %% TODO: add difference between open and reopen
+    {ok, RC} = relcast:start(1, [1 | Actors], ?M, #state{}, [{create, true}, {data_dir, Dir}]),
     {RC, Dir}.
 
 close(RC) ->

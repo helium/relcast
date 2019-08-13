@@ -139,6 +139,7 @@
           key_tree :: [any()],
           key_tree_checked = false :: boolean(),
           floated_acks = #{} :: #{pos_integer() => [non_neg_integer()]},
+          buffered_acks = #{} :: #{pos_integer() => [non_neg_integer()]},
           outbound_keys = [] :: [binary()],
           db_opts = [] :: [any()],
           write_opts = [] :: [any()],
@@ -309,8 +310,12 @@ command(Message, State = #state{module = Module,
 %% deferred messages from this Actor.
 -spec deliver(non_neg_integer(), binary(), pos_integer(), relcast_state()) ->
                      {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
-deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
-                                                  defers = Defers}) ->
+deliver(Seq, Message, FromActorID, State0 = #state{in_key_count = KeyCount,
+                                                   buffered_acks = Buffered,
+                                                   defers = Defers}) ->
+    %% assume that if we're getting new messages from an actor that it
+    %% has received our earlier acks.  there may be safer ways to do this.
+    State = State0#state{buffered_acks = Buffered#{FromActorID => []}},
     case handle_message(undefined, undefined, FromActorID, Message, State#state.transaction, State) of
         {ok, NewState0} ->
             NewState = store_ack(Seq, FromActorID, NewState0),
@@ -465,8 +470,13 @@ process_messages(Messages, Pends, Pending, ForActorID, State) ->
 
 
 -spec reset_actor(pos_integer(), relcast_state()) -> {ok, relcast_state()}.
-reset_actor(ForActorID, State = #state{pending_acks = Pending, last_sent = LastSent}) ->
+reset_actor(ForActorID, State = #state{pending_acks = Pending,
+                                       floated_acks = Floated,
+                                       buffered_acks = Buffered,
+                                       last_sent = LastSent}) ->
+    Buf = maps:get(ForActorID, Buffered, []),
     {ok, reset_seq(ForActorID, State#state{pending_acks = Pending#{ForActorID => []},
+                                           floated_acks = Floated#{ForActorID => Buf},
                                            new_messages = #{},
                                            last_sent = maps:remove(ForActorID, LastSent)})}.
 
@@ -1304,7 +1314,8 @@ get_acks(Keys, #state{floated_acks = Acks, outbound_keys = OutKeys} = S) ->
             {maps:map(fun(_, V) ->
                               [Sq || {Sq, _Epoch} <- V]
                       end, Acks),
-             S#state{floated_acks = #{}, outbound_keys = []}};
+             S#state{floated_acks = #{}, outbound_keys = [],
+                     buffered_acks = Acks}};
         %% we've already synced to disc for this message
         false ->
             {none, S}
