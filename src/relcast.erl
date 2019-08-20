@@ -182,7 +182,7 @@ transaction(A, B) ->
 %% initialized with `Arguments'. `RelcastOptions' contains configuration options
 %% around the relcast itself, for example the data directory.
 -spec start(pos_integer(), [pos_integer(),...], atom(), list(), list()) ->
-                   error | {ok, relcast_state()} | {stop, pos_integer(), relcast_state()}.
+    {error, any()} | {ok, relcast_state()} | {stop, pos_integer(), relcast_state()}.
 start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     Create = proplists:get_value(create, RelcastOptions, false),
     DataDir = proplists:get_value(data_dir, RelcastOptions),
@@ -271,7 +271,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                     {ok, Transaction1} = transaction(DB, WriteOpts),
                     {ok, NewState#state{transaction = Transaction1}};
                 _ ->
-                    error
+                    {error, module_init_failed}
             end;
         {error, {db_open, Msg}} ->
             {error, {invalid_or_no_existing_store, Msg}};
