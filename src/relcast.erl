@@ -79,7 +79,7 @@
 %%====================================================================
 %% Callback functions
 %%====================================================================
--callback init(Arguments :: any()) -> {ok, State :: term()}.
+-callback init(Arguments :: [any()]) -> {ok, State :: term()}.
 -callback restore(OldState :: term(), NewState :: term()) -> {ok, State :: term()}.
 -callback serialize(State :: term()) -> Binary :: binary() | #{atom() => #{} | binary()}.
 -callback deserialize(Binary :: binary()) -> State :: term().
@@ -169,20 +169,12 @@
 -define(stored_key_prefix, <<"stored_key_">>).
 -define(stored_key_tree, <<"stored_key_tree">>).
 
-%% TODO: remove these when fix goes in
--dialyzer({nowarn_function, [transaction/2]}).
-
--spec transaction(_, _) -> {ok, rocksdb:transaction_handle()}.
-transaction(A, B) ->
-    {ok, Txn} = rocksdb:transaction(A, B),
-    {ok, Txn}.
-
 %% @doc Start a relcast instance. Starts a relcast instance for the actor
 %% `ActorID' in the group of `ActorIDs' using the callback module `Module'
 %% initialized with `Arguments'. `RelcastOptions' contains configuration options
 %% around the relcast itself, for example the data directory.
--spec start(pos_integer(), [pos_integer(),...], atom(), list(), list()) ->
-    {error, any()} | {ok, relcast_state()} | {stop, pos_integer(), relcast_state()}.
+-spec start(pos_integer(), [pos_integer(),...], atom(), [any()], [any()]) ->
+                   {error, any()} | {ok, relcast_state()} | {stop, pos_integer(), relcast_state()}.
 start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     Create = proplists:get_value(create, RelcastOptions, false),
     DataDir = proplists:get_value(data_dir, RelcastOptions),
@@ -263,13 +255,18 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                     {ok, Iter} = rocksdb:iterator(State#state.db, InboundCF, [{iterate_upper_bound, max_inbound_key()}]),
                     Defers = build_defer_list(rocksdb:iterator_move(Iter, {seek, min_inbound_key()}), Iter, InboundCF, #{}),
                     %% try to deliver any old queued inbound messages
-                    {ok, Transaction} = transaction(DB, WriteOpts),
-                    {ok, NewState} = handle_pending_inbound(Transaction,
-                                                            State#state{transaction = Transaction,
-                                                                        defers=Defers}),
-                    ok = rocksdb:transaction_commit(Transaction),
-                    {ok, Transaction1} = transaction(DB, WriteOpts),
-                    {ok, NewState#state{transaction = Transaction1}};
+                    {ok, Transaction} = rocksdb:transaction(DB, WriteOpts),
+                    case handle_pending_inbound(Transaction, State#state{transaction = Transaction,
+                                                                         defers=Defers}) of
+                        {ok, NewState} ->
+                            ok = rocksdb:transaction_commit(Transaction),
+                            {ok, Transaction1} = rocksdb:transaction(DB, WriteOpts),
+                            {ok, NewState#state{transaction = Transaction1}};
+                        {stop, Timeout, NewState} ->
+                            ok = rocksdb:transaction_commit(Transaction),
+                            {ok, Transaction1} = rocksdb:transaction(DB, WriteOpts),
+                            {stop, Timeout, NewState#state{transaction = Transaction1}}
+                    end;
                 _ ->
                     {error, module_init_failed}
             end;
@@ -778,7 +775,7 @@ handle_actions([new_epoch|Tail], Transaction, State) ->
                       end, State#state.floated_acks),
     %% when we're done handling actions, we will write the module state (and all subsequent outbound
     %% messages from this point on) into the active CF, which is this new one now
-    {ok, Transaction1} = transaction(State#state.db, State#state.write_opts),
+    {ok, Transaction1} = rocksdb:transaction(State#state.db, State#state.write_opts),
     handle_actions(Tail, Transaction1, State#state{out_key_count=0, active_cf=NewCF,
                                                    transaction = Transaction1,
                                                    transaction_dirty = false,
@@ -880,7 +877,7 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
     case rocksdb:get(DB, ?stored_module_state, []) of
         {ok, SerializedModuleState} ->
             {SerState, ModState, _} = rehydrate(Module, SerializedModuleState, ModuleState0),
-            {ok, Txn} = transaction(DB, WriteOpts),
+            {ok, Txn} = rocksdb:transaction(DB, WriteOpts),
             New = Module:serialize(ModState),
             KT =
                 case do_serialize(Module, undefined, New, ?stored_key_prefix, Txn) of
@@ -920,7 +917,7 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
                     ok = rocksdb:put(DB, ?stored_key_tree,
                                      term_to_binary(KeyTreeNew, [compressed]), [{sync, true}]),
                     %% force disk sync on first startup, don't wait for messages
-                    {ok, Txn} = transaction(DB, WriteOpts),
+                    {ok, Txn} = rocksdb:transaction(DB, WriteOpts),
                     _KeyTree = do_serialize(Module, undefined, NewSer, ?stored_key_prefix, Txn),
                     rocksdb:transaction_commit(Txn),
                     {NewSer, ModState, KeyTreeNew}
@@ -1271,7 +1268,7 @@ maybe_commit(_, #state{transaction_dirty = false} = S) ->
 maybe_commit(_, #state{transaction = Txn, db = DB, write_opts = Opts} = S0) ->
     S = maybe_serialize(S0),
     ok = rocksdb:transaction_commit(Txn),
-    {ok, Txn1} = transaction(DB, Opts),
+    {ok, Txn1} = rocksdb:transaction(DB, Opts),
     S#state{transaction = Txn1, transaction_dirty = false}.
 
 maybe_dirty(false, S) ->
