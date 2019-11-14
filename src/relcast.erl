@@ -764,8 +764,7 @@ handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module
 %% write all resulting messages and keys in an atomic transaction
 handle_actions([], _Transaction, State) ->
     {ok, State};
-handle_actions([commit|Tail], Transaction, State) ->
-    ok = rocksdb:transaction_commit(Transaction),
+handle_actions([commit|Tail], _Transaction, State) ->
     State1 = maybe_commit(force, State),
     {ok, Transaction1} = transaction(State#state.db, State#state.write_opts),
     handle_actions(Tail, Transaction1, State1);
