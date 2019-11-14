@@ -622,8 +622,8 @@ stop(Reason, State = #state{module=Module, module_state=ModuleState})->
         false ->
             ok
     end,
-    State1 = maybe_serialize(State),
-    catch rocksdb:transaction_commit(State1#state.transaction),
+    %% State1 = maybe_serialize(State),
+    %% catch rocksdb:transaction_commit(State1#state.transaction),
     rocksdb:close(State#state.db).
 
 %% @doc Get a representation of the relcast's module state, inbound queue and
