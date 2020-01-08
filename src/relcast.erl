@@ -169,9 +169,6 @@
 -define(stored_key_prefix, <<"stored_key_">>).
 -define(stored_key_tree, <<"stored_key_tree">>).
 
-%% TODO: remove these when fix goes in
--dialyzer({nowarn_function, [transaction/2]}).
-
 -spec transaction(_, _) -> {ok, rocksdb:transaction_handle()}.
 transaction(A, B) ->
     {ok, Txn} = rocksdb:transaction(A, B),
@@ -211,7 +208,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                            {[], false}
                                    end,
     case rocksdb:open_optimistic_transaction_db(DataDir,
-                                                [{create_if_missing, Create}] ++ OpenOpts,
+                                                [{create_if_missing, Create}, {atomic_flush, true}] ++ OpenOpts,
                                                 [ {CF, DBOptions}
                                                   || CF <- ["default"|ColumnFamilies] ]) of
         {ok, DB, [_DefaultCF|CFHs0]} ->
