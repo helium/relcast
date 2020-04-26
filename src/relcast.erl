@@ -105,6 +105,12 @@
         {message_key_prefix(), binary()} |
         binary().
 
+-define(TRACE(Fmt, Args, State),
+        case State#state.trace of
+            undefined -> ok;
+            Fun -> Fun(Fmt, Args)
+        end).
+
 %%====================================================================
 %% State record
 %%====================================================================
@@ -142,7 +148,8 @@
           outbound_keys = [] :: [binary()],
           db_opts = [] :: [any()],
           write_opts = [] :: [any()],
-          new_messages = #{} :: #{pos_integer() => boolean()}
+          new_messages = #{} :: #{pos_integer() => boolean()},
+          trace :: undefined | fun((string(), [any()]) -> ok)
          }).
 
 -type relcast_state() :: #state{}.
@@ -188,6 +195,8 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
     OpenOpts2 = proplists:get_value(db_opts, RelcastOptions, []),
     WriteOpts = proplists:get_value(write_opts, RelcastOptions, [{sync, true}]),
     OpenOpts = OpenOpts1 ++ OpenOpts2,
+
+    Trace = proplists:get_value(trace, RelcastOptions, undefined),
 
     GlobalOpts = application:get_env(rocksdb, global_opts, []),
     DBOptions = DBOptions0 ++ OpenOpts ++ GlobalOpts,
@@ -256,7 +265,8 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                    bitfieldsize = BitFieldSize,
                                    db_opts = DBOptions,
                                    write_opts = WriteOpts,
-                                   key_tree = KeyTree},
+                                   key_tree = KeyTree,
+                                   trace = Trace},
                     {ok, Iter} = rocksdb:iterator(State#state.db, InboundCF, [{iterate_upper_bound, max_inbound_key()}]),
                     Defers = build_defer_list(rocksdb:iterator_move(Iter, {seek, min_inbound_key()}), Iter, InboundCF, #{}),
                     %% try to deliver any old queued inbound messages
@@ -314,7 +324,7 @@ command(Message, State = #state{module = Module,
                      {ok, relcast_state()} | {stop, pos_integer(), relcast_state()} | full.
 deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
                                                   defers = Defers}) ->
-    case handle_message(undefined, undefined, FromActorID, Message, State#state.transaction, State) of
+    Res = case handle_message(undefined, undefined, FromActorID, Message, State#state.transaction, State) of
         {ok, NewState0} ->
             NewState = store_ack(Seq, FromActorID, NewState0),
             %% something happened, evaluate if we can handle any other blocked messages
@@ -355,7 +365,9 @@ deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
                     %% sorry buddy, no room on the couch
                     full
             end
-    end.
+    end,
+    ?TRACE("Delivered ~p ~p from ~p => ~p", [Seq, Message, FromActorID, Res], State),
+    Res.
 
 %% TODO: remove (or change to count default to 1) this when tests and EQC are updated.
 take(ID, State) ->
@@ -391,7 +403,7 @@ take(ForActorID, State = #state{pending_acks = Pending, new_messages = NewMsgs},
     %% check if there's a pending ACK and use that to find the "last" key, if present
     ActorNewMsgs = maps:get(ForActorID, NewMsgs, true),
     PipelineDepth = application:get_env(relcast, pipeline_depth, 75),
-    case maps:get(ForActorID, Pending, []) of
+    Res = case maps:get(ForActorID, Pending, []) of
         Pends when length(Pends) >= PipelineDepth ->
             {pipeline_full, State};
         _Pends when ActorNewMsgs == false ->
@@ -446,7 +458,9 @@ take(ForActorID, State = #state{pending_acks = Pending, new_messages = NewMsgs},
                             process_messages(Messages, [], Pending, ForActorID, State)
                     end
             end
-    end.
+    end,
+    ?TRACE("take ~p messages for ~p => ~p", [Count, ForActorID, Res], State),
+    Res.
 
 process_messages(Messages, Pends, Pending, ForActorID, State) ->
     {Pend, Keys, Msgs, State1} =
@@ -561,9 +575,11 @@ ack(FromActorID, Seqs, State = #state{transaction = Transaction,
                                   erlang:put(dirty, true),
                                   case Multicast of
                                       false ->
+                                          ?TRACE("Acked unicast message ~p from ~p", [Seq, FromActorID], State),
                                           %% unicast message, fine to delete now
                                           ok = rocksdb:transaction_delete(Transaction, CF, AKey);
                                       true ->
+                                          ?TRACE("Acked multicast message ~p from ~p", [Seq, FromActorID], State),
                                           %% flip the bit, we can delete it next time we iterate
                                           flip_actor_bit(FromActorID, Transaction, CF, AKey, BFS)
                                   end,
