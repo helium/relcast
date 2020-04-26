@@ -368,11 +368,11 @@ deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
     end,
     case Res of
         {ok, _} ->
-            ?TRACE("Delivered ~p ~p from ~p => ok", [Seq, Message, FromActorID], State);
+            ?TRACE("Delivered ~p ~p from ~p => ok", [Seq, binary_to_term(Message), FromActorID], State);
         {stop, _, _} ->
-            ?TRACE("Delivered ~p ~p from ~p => stopping", [Seq, Message, FromActorID], State);
+            ?TRACE("Delivered ~p ~p from ~p => stopping", [Seq, binary_to_term(Message), FromActorID], State);
         full ->
-            ?TRACE("Delivered ~p ~p from ~p => full", [Seq, Message, FromActorID], State)
+            ?TRACE("Delivered ~p ~p from ~p => full", [Seq, binary_to_term(Message), FromActorID], State)
     end,
     Res.
 
@@ -479,7 +479,7 @@ take(ForActorID, State = #state{pending_acks = Pending, new_messages = NewMsgs},
                 _ ->
                     [[?TRACE("Acked message ~p for ~p", [Ack, For], State) || Ack <- Aks] || {For, Aks} <- maps:to_list(Acks)]
             end,
-            [?TRACE("took Msg ~p with sequence ~p", [Msg, Seq], State) || {Seq, Msg} <- Msgs]
+            [?TRACE("took Msg ~p with sequence ~p", [binary_to_term(Msg), Seq], State) || {Seq, Msg} <- Msgs]
     end,
     Res.
 
