@@ -468,9 +468,9 @@ take(ForActorID, State = #state{pending_acks = Pending, new_messages = NewMsgs},
     end,
     case Res of
         {not_found, _} ->
-            ?TRACE("take ~p messages for ~p => not_found", [Count, ForActorID], State);
+            ok;
         {pipeline_full, _} ->
-            ?TRACE("take ~p messages for ~p => pipeline_full", [Count, ForActorID], State);
+            ok;
         {ok, Msgs, Acks, _} ->
             ?TRACE("take ~p messages for ~p => ok", [Count, ForActorID], State),
             case Acks of
