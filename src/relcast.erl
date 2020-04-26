@@ -473,7 +473,12 @@ take(ForActorID, State = #state{pending_acks = Pending, new_messages = NewMsgs},
             ?TRACE("take ~p messages for ~p => pipeline_full", [Count, ForActorID], State);
         {ok, Msgs, Acks, _} ->
             ?TRACE("take ~p messages for ~p => ok", [Count, ForActorID], State),
-            [[?TRACE("Acked message ~p for ~p", [Ack, For], State) || Ack <- Aks] || {For, Aks} <- maps:to_list(Acks)],
+            case Acks of
+                none ->
+                    ok;
+                _ ->
+                    [[?TRACE("Acked message ~p for ~p", [Ack, For], State) || Ack <- Aks] || {For, Aks} <- maps:to_list(Acks)]
+            end,
             [?TRACE("took Msg ~p with sequence ~p", [Msg, Seq], State) || {Seq, Msg} <- Msgs]
     end,
     Res.
