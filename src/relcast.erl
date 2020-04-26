@@ -108,7 +108,7 @@
 -define(TRACE(Fmt, Args, State),
         case State#state.trace of
             undefined -> ok;
-            Fun -> Fun(Fmt, Args)
+            _ -> (State#state.trace)(Fmt, Args)
         end).
 
 %%====================================================================
@@ -366,7 +366,14 @@ deliver(Seq, Message, FromActorID, State = #state{in_key_count = KeyCount,
                     full
             end
     end,
-    ?TRACE("Delivered ~p ~p from ~p => ~p", [Seq, Message, FromActorID, Res], State),
+    case Res of
+        {ok, _} ->
+            ?TRACE("Delivered ~p ~p from ~p => ok", [Seq, Message, FromActorID], State);
+        {stop, _, _} ->
+            ?TRACE("Delivered ~p ~p from ~p => stopping", [Seq, Message, FromActorID], State);
+        full ->
+            ?TRACE("Delivered ~p ~p from ~p => full", [Seq, Message, FromActorID], State)
+    end,
     Res.
 
 %% TODO: remove (or change to count default to 1) this when tests and EQC are updated.
@@ -459,7 +466,16 @@ take(ForActorID, State = #state{pending_acks = Pending, new_messages = NewMsgs},
                     end
             end
     end,
-    ?TRACE("take ~p messages for ~p => ~p", [Count, ForActorID, Res], State),
+    case Res of
+        {not_found, _} ->
+            ?TRACE("take ~p messages for ~p => not_found", [Count, ForActorID], State);
+        {pipeline_full, _} ->
+            ?TRACE("take ~p messages for ~p => pipeline_full", [Count, ForActorID], State);
+        {ok, Msgs, Acks, _} ->
+            ?TRACE("take ~p messages for ~p => ok", [Count, ForActorID], State),
+            [?TRACE("Acked message ~p", [Ack], State) || Ack <- Acks],
+            [?TRACE("took Msg ~p with sequence ~p", [Msg, Seq], State) || {Seq, Msg} <- Msgs]
+    end,
     Res.
 
 process_messages(Messages, Pends, Pending, ForActorID, State) ->
