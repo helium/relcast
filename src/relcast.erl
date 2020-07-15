@@ -623,7 +623,7 @@ stop(Reason, State = #state{module=Module, module_state=ModuleState})->
             ok
     end,
     State1 = maybe_serialize(State),
-    catch rocksdb:transaction_commit(State1#state.transaction),
+    %% catch rocksdb:transaction_commit(State1#state.transaction),
     rocksdb:flush(State#state.db, [{wait, true}, {allow_write_stall, true}]),
     ok = rocksdb:close(State#state.db),
     check_stop(State#state.dir).
