@@ -624,6 +624,7 @@ stop(Reason, State = #state{module=Module, module_state=ModuleState})->
     end,
     State1 = maybe_serialize(State),
     catch rocksdb:transaction_commit(State1#state.transaction),
+    lager:info("ZZZZ stopping for ~p", [Reason]),
     rocksdb:flush(State#state.db, [{wait, true}, {allow_write_stall, true}]),
     rocksdb:close(State#state.db).
 %%     check_stop(State#state.dir).
