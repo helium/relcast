@@ -281,7 +281,7 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
 %% group. Commands are dispatched to `Module':handle_command and can simply
 %% return information via `{reply, Reply, ignore}' or update the callback
 %% module's state or send messages via `{reply, Reply, Actions, NewModuleState}'.
--spec command(any(), relcast_state()) -> {any(), relcast_state()} | {stop, any(), pos_integer(), relcast_state()}.
+-spec command(any(), relcast_state()) -> {any(), relcast_state()} | {stop, any(), integer(), relcast_state()}.
 command(Message, State = #state{module = Module,
                                 module_state = ModuleState,
                                 transaction = Transaction}) ->
@@ -449,6 +449,11 @@ take(ForActorID, State = #state{pending_acks = Pending, new_messages = NewMsgs},
     end.
 
 process_messages(Messages, Pends, Pending, ForActorID, State) ->
+    process_messages(Messages, Pends, Pending, ForActorID, State, 2).
+
+process_messages(_Messages, _Pends, _Pending, _ForActorID, _State, Tries) when Tries < 1 ->
+    erlang:error(too_many_retries);
+process_messages(Messages, Pends, Pending, ForActorID, State, Tries) ->
     {Pend, Keys, Msgs, State1} =
         lists:foldl(
           fun({Key2, CF2, Msg, Multicast}, {P, K, M, S}) ->
@@ -462,10 +467,15 @@ process_messages(Messages, Pends, Pending, ForActorID, State) ->
           Messages),
     Pends1 = lists:append(Pend, Pends),
     {Acks, State2} = get_acks(Keys, State1),
-    State3 = maybe_commit(Acks, State2),
-    {ok, Msgs, Acks,
-     State3#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}}.
-
+    case maybe_commit(Acks, State2) of
+        {ok, State3} ->
+            {ok, Msgs, Acks,
+             State3#state{pending_acks = maps:put(ForActorID, Pends1, Pending)}};
+        retry ->
+            process_messages(Messages, Pends, Pending, ForActorID, State, Tries - 1);
+        Error ->
+            erlang:error(Error)
+    end.
 
 -spec reset_actor(pos_integer(), relcast_state()) -> {ok, relcast_state()}.
 reset_actor(ForActorID, State = #state{pending_acks = Pending, last_sent = LastSent}) ->
@@ -593,11 +603,22 @@ ack(FromActorID, Seqs, State = #state{transaction = Transaction,
                               relcast_state()} |
                              {stop, pos_integer(), relcast_state()}.
 process_inbound(State) ->
+    process_inbound(State, 2).
+
+process_inbound(_State, Tries) when Tries < 1 ->
+    erlang:error(too_many_retries);
+process_inbound(State, Tries) ->
     case handle_pending_inbound(State#state.transaction, State) of
         {ok, NewState} ->
             {Acks, NewState1} = get_acks(NewState),
-            NewState2 = maybe_commit(force, NewState1),
-            {ok, Acks, NewState2};
+            case maybe_commit(force, NewState1) of
+                {ok, NewState2} ->
+                    {ok, Acks, NewState2};
+                retry ->
+                    process_inbound(State, Tries - 1);
+                Error ->
+                    erlang:error(Error)
+            end;
         {stop, Timeout, NewState} ->
             {stop, Timeout, NewState}
     end.
@@ -1261,15 +1282,23 @@ maybe_update_state(State, ignore) ->
 maybe_update_state(State, NewModuleState) ->
     State#state{module_state = NewModuleState}.
 
+-spec maybe_commit(none | force | #{non_neg_integer() => [non_neg_integer()]}, #state{}) -> {ok, #state{}} | retry | {error, any()}.
 maybe_commit(none, S) ->
-    S;
+    {ok, S};
 maybe_commit(_, #state{transaction_dirty = false} = S) ->
-    S;
+    {ok, S};
 maybe_commit(_, #state{transaction = Txn, db = DB, write_opts = Opts} = S0) ->
     S = maybe_serialize(S0),
-    ok = rocksdb:transaction_commit(Txn),
-    {ok, Txn1} = transaction(DB, Opts),
-    S#state{transaction = Txn1, transaction_dirty = false}.
+    case rocksdb:transaction_commit(Txn) of
+        ok ->
+            {ok, Txn1} = transaction(DB, Opts),
+            {ok, S#state{transaction = Txn1, transaction_dirty = false}};
+        {error,{error,"Operation failed. Try again"++_}} ->
+            %% Memtable is missing sequences, we're supposed to be able to try again.
+            retry;
+        {error, _}=Error ->
+            Error
+    end.
 
 maybe_dirty(false, S) ->
     S;
