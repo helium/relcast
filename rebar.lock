@@ -2,8 +2,8 @@
 [{<<"goldrush">>,{pkg,<<"goldrush">>,<<"0.1.9">>},1},
  {<<"lager">>,{pkg,<<"lager">>,<<"3.6.7">>},0},
  {<<"rocksdb">>,
-  {git,"https://gitlab.com/Vagabond1/erlang-rocksdb",
-       {ref,"12be329266b9fe24371dadef091921bfefa23c30"}},
+  {git,"https://gitlab.com/vagabond1/erlang-rocksdb",
+       {ref,"008fc60c4b481a7ed54350515f576df50e44f475"}},
   0}]}.
 [
 {pkg_hash,[
