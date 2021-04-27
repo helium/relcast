@@ -1,10 +1,10 @@
-[![Build Status](https://badge.buildkite.com/97d8e203b28ebf6a2c8b11035bfe5aac6dc6a617daa436f848.svg?branch=master)](https://buildkite.com/helium/relcast)
+[![CI](https://github.com/helium/relcast/actions/workflows/ci.yml/badge.svg)](https://github.com/helium/relcast/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/helium/relcast/branch/master/graph/badge.svg)](https://codecov.io/gh/helium/relcast)
 
 relcast
 =====
 
-An OTP library
+An OTP library that implements reliable ordered network broadcast
 
 Build
 -----
