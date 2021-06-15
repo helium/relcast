@@ -987,6 +987,11 @@ get_last_key_out(DB, CF) ->
     MaxOutbound.
 
 %% iterate the outbound messages until we find one for this ActorID
+-spec find_next_outbound(pos_integer(), CF, binary(), #state{}, non_neg_integer()) ->
+    [{Key, CF, Val :: binary(), boolean()}] | {not_found, Key, CF} | not_found
+    when
+        CF :: rocksdb:cf_handle(),
+        Key :: binary().
 find_next_outbound(ActorID, CF, StartKey, State, Count) ->
     find_next_outbound(ActorID, CF, StartKey, State, Count, true).
 
@@ -1006,22 +1011,31 @@ find_next_outbound(ActorID, CF, StartKey, State, Count, AcceptStart) ->
         end,
     find_next_outbound_(ActorID, Res, Iter, State, Count, []).
 
-find_next_outbound_(_ActorId, _, Iter, _State, 0, Acc) when Acc /= [] ->
+-spec find_next_outbound_(pos_integer(), Res, rocksdb:itr_handle(), #state{}, non_neg_integer(), Acc) ->
+    Acc | {not_found, Key, CF} | not_found
+    when
+        Res :: {ok, binary()} | {ok, binary(), binary()} | {error, _},
+        Acc :: [{Key, CF, Val, boolean()}],
+        CF :: rocksdb:cf_handle(),
+        Key :: binary(),
+        Val :: binary().
+find_next_outbound_(_ActorId, _, Iter, _State, 0, [_|_]=Acc) ->
     rocksdb:iterator_close(Iter),
     lists:reverse(Acc);
 find_next_outbound_(_ActorId, {error, _}, Iter, State, _, Acc) ->
     %% try to return the *highest* key we saw, so we can try starting here next time
-    case Acc of
-        [] ->
-            Res = case rocksdb:iterator_move(Iter, prev) of
-                      {ok, Key, _} ->
-                          {not_found, Key, State#state.active_cf};
-                      _ ->
-                          not_found
-                  end;
-        _ ->
-            Res = lists:reverse(Acc)
-    end,
+    Res =
+        case Acc of
+            [] ->
+                case rocksdb:iterator_move(Iter, prev) of
+                    {ok, Key, _} ->
+                        {not_found, Key, State#state.active_cf};
+                    _ ->
+                        not_found
+                end;
+            [_|_] ->
+                lists:reverse(Acc)
+        end,
     rocksdb:iterator_close(Iter),
     Res;
 find_next_outbound_(ActorID, {ok, <<"o", _/binary>> = Key, <<1:2/integer, ActorID:14/integer, Value/binary>>}, Iter, State,
@@ -1146,7 +1160,7 @@ actor_list(<<0:1/integer, Tail/bits>>, I, List) ->
 flip_actor_bit(ActorID, Transaction, CF, Key, BFS) ->
     %% with transactions, we can't actually do a merge at this point,
     %% so we need to read, edit, and write the bitfield inside the transaction
-    {ok, Bits} = rocksdb:transaction_get(Transaction, CF, Key, []),
+    {ok, Bits} = rocksdb:transaction_get(Transaction, CF, Key),
     <<Type:2/bits, ActorMask:BFS/integer-unsigned-big, Post/bits>> = Bits,
     Mask2 = ActorMask band (bnot (1 bsl (BFS - ActorID))),
     ok = rocksdb:transaction_put(Transaction, CF, Key, <<Type/bits, Mask2:BFS/integer-unsigned-big, Post/bits>>).
