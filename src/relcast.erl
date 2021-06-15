@@ -1146,7 +1146,7 @@ actor_list(<<0:1/integer, Tail/bits>>, I, List) ->
 flip_actor_bit(ActorID, Transaction, CF, Key, BFS) ->
     %% with transactions, we can't actually do a merge at this point,
     %% so we need to read, edit, and write the bitfield inside the transaction
-    {ok, Bits} = rocksdb:transaction_get(Transaction, CF, Key, []),
+    {ok, Bits} = rocksdb:transaction_get(Transaction, CF, Key),
     <<Type:2/bits, ActorMask:BFS/integer-unsigned-big, Post/bits>> = Bits,
     Mask2 = ActorMask band (bnot (1 bsl (BFS - ActorID))),
     ok = rocksdb:transaction_put(Transaction, CF, Key, <<Type/bits, Mask2:BFS/integer-unsigned-big, Post/bits>>).
