@@ -987,6 +987,11 @@ get_last_key_out(DB, CF) ->
     MaxOutbound.
 
 %% iterate the outbound messages until we find one for this ActorID
+-spec find_next_outbound(pos_integer(), CF, binary(), #state{}, non_neg_integer()) ->
+    [{Key, CF, Val :: binary(), boolean()}] | {not_found, Key, CF} | not_found
+    when
+        CF :: rocksdb:cf_handle(),
+        Key :: binary().
 find_next_outbound(ActorID, CF, StartKey, State, Count) ->
     find_next_outbound(ActorID, CF, StartKey, State, Count, true).
 
@@ -1006,6 +1011,14 @@ find_next_outbound(ActorID, CF, StartKey, State, Count, AcceptStart) ->
         end,
     find_next_outbound_(ActorID, Res, Iter, State, Count, []).
 
+-spec find_next_outbound_(pos_integer(), Res, rocksdb:itr_handle(), #state{}, non_neg_integer(), Acc) ->
+    Acc | {not_found, Key, CF} | not_found
+    when
+        Res :: {ok, binary()} | {ok, binary(), binary()} | {error, _},
+        Acc :: [{Key, CF, Val, boolean()}],
+        CF :: rocksdb:cf_handle(),
+        Key :: binary(),
+        Val :: binary().
 find_next_outbound_(_ActorId, _, Iter, _State, 0, [_|_]=Acc) ->
     rocksdb:iterator_close(Iter),
     lists:reverse(Acc);
