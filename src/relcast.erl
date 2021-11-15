@@ -1215,14 +1215,7 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                           %% should be a binary
                           K;
                      ({{K, V}, {_, OV}}) ->
-                          KeyName = case K of
-                                        _ when is_atom(K) ->
-                                            <<Prefix/binary, (atom_to_binary(K, utf8))/binary>>;
-                                        _ when is_integer(K) ->
-                                            <<Prefix/binary, K:64/integer>>;
-                                        _ when is_binary(K) ->
-                                            <<Prefix/binary, K/binary>>
-                                    end,
+                          KeyName = get_key_name(Prefix, K),
                           case is_map(V) of
                               true ->
                                   do_serialize(K, fixup_old_map(OV), V, <<KeyName/binary, "_">>, Transaction);
@@ -1235,6 +1228,13 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                   L),
             [Mod | KeyTree]
     end.
+
+get_key_name(Prefix, K) when is_atom(K) ->
+    <<Prefix/binary, (atom_to_binary(K, utf8))/binary>>;
+get_key_name(Prefix, K) when is_integer(K) ->
+    <<Prefix/binary, K:64/integer>>;
+get_key_name(Prefix, K) when is_binary(K) ->
+    <<Prefix/binary, K/binary>>.
 
 get_key_tree(_, B) when is_binary(B) ->
     bin;
@@ -1256,8 +1256,8 @@ fixup_old_map(M) ->
 do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
     R = fun Rec(Pfix, [_Top | KT], DB) ->
                 lists:foldl(
-                  fun(K, Acc) when is_atom(K) ->
-                          KeyName = <<Pfix/binary, (atom_to_binary(K, utf8))/binary>>,
+                  fun(K, Acc) when is_atom(K); is_binary(K); is_integer(K) ->
+                          KeyName = get_key_name(Pfix, K),
                           Term = case rocksdb:get(DB, KeyName, []) of
                                      {ok, Bin} ->
                                          Bin;
@@ -1267,7 +1267,7 @@ do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
                           Acc#{K => Term};
                      (L, Acc) when is_list(L) ->
                           K = hd(L),
-                          KeyName = <<Pfix/binary, (atom_to_binary(K, utf8))/binary, "_">>,
+                          KeyName = get_key_name(Pfix, K),
                           Acc#{K => Rec(KeyName, L, DB)}
                   end,
                   #{},
