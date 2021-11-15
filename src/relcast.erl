@@ -925,6 +925,7 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
             case get_key_tree(Module, NewSer) of
                 %% matches the existing tree on disk
                 KeyTree ->
+                    lager:info("matching keytree ~p", [KeyTree]),
                     {SerState, ModState, KeyTree};
                 %% monolithic state
                 bin ->
