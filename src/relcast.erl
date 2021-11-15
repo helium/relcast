@@ -1215,7 +1215,14 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                           %% should be a binary
                           K;
                      ({{K, V}, {_, OV}}) ->
-                          KeyName = <<Prefix/binary, (atom_to_binary(K, utf8))/binary>>,
+                          KeyName = case K of
+                                        _ when is_atom(K) ->
+                                            <<Prefix/binary, (atom_to_binary(K, utf8))/binary>>;
+                                        _ when is_integer(K) ->
+                                            <<Prefix/binary, K:64/integer>>;
+                                        _ when is_binary(K) ->
+                                            <<Prefix/binary, K/binary>>
+                                    end,
                           case is_map(V) of
                               true ->
                                   do_serialize(K, fixup_old_map(OV), V, <<KeyName/binary, "_">>, Transaction);
