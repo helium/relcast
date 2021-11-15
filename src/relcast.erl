@@ -934,7 +934,7 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
                     {SerState, ModState, bin};
                 %% new tree, write the structure to disk
                 KeyTreeNew ->
-                    %% lager:info("writing initial struct to disk"),
+                    lager:info("upgrading old kt ~p to ~p", [KeyTree, KeyTreeNew]),
                     ok = rocksdb:put(DB, ?stored_key_tree,
                                      term_to_binary(KeyTreeNew, [compressed]), [{sync, true}]),
                     %% force disk sync on first startup, don't wait for messages
