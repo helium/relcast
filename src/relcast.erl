@@ -900,11 +900,12 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
             {SerState, ModState, _} = rehydrate(Module, SerializedModuleState, ModuleState0),
             {ok, Txn} = transaction(DB, WriteOpts),
             New = Module:serialize(ModState),
+            KeyTree = get_key_tree(Module, New),
             KT =
                 case do_serialize(Module, undefined, New, ?stored_key_prefix, Txn) of
                     bin ->
                         bin;
-                    KeyTree ->
+                    _KeyTree ->
                         ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
                                                      term_to_binary(KeyTree, [compressed])),
                         ok = rocksdb:transaction_delete(Txn, ?stored_module_state),
@@ -1172,6 +1173,13 @@ maybe_serialize(#state{module_state = New0,
                        transaction = Transaction} = S) ->
     New = Mod:serialize(New0),
     _KeyTree = do_serialize(Mod, Old, New, ?stored_key_prefix, Transaction),
+    KeyTree = get_key_tree(Mod, New),
+    case KeyTree of
+        bin -> ok;
+        _ ->
+            ok = rocksdb:transaction_put(Transaction, ?stored_key_tree,
+                                         term_to_binary(KeyTree, [compressed]))
+    end,
     S#state{old_serialized = New, old_module_state = New0, transaction_dirty = true}.
 
 old_size(M) when is_map(M) ->
@@ -1215,7 +1223,7 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                           %% should be a binary
                           K;
                      ({{K, V}, {_, OV}}) ->
-                          KeyName = <<Prefix/binary, (atom_to_binary(K, utf8))/binary>>,
+                          KeyName = get_key_name(Prefix, K),
                           case is_map(V) of
                               true ->
                                   do_serialize(K, fixup_old_map(OV), V, <<KeyName/binary, "_">>, Transaction);
@@ -1228,6 +1236,13 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                   L),
             [Mod | KeyTree]
     end.
+
+get_key_name(Prefix, K) when is_atom(K) ->
+    <<Prefix/binary, (atom_to_binary(K, utf8))/binary>>;
+get_key_name(Prefix, K) when is_integer(K) ->
+    <<Prefix/binary, K:64/integer>>;
+get_key_name(Prefix, K) when is_binary(K) ->
+    <<Prefix/binary, K/binary>>.
 
 get_key_tree(_, B) when is_binary(B) ->
     bin;
@@ -1249,8 +1264,8 @@ fixup_old_map(M) ->
 do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
     R = fun Rec(Pfix, [_Top | KT], DB) ->
                 lists:foldl(
-                  fun(K, Acc) when is_atom(K) ->
-                          KeyName = <<Pfix/binary, (atom_to_binary(K, utf8))/binary>>,
+                  fun(K, Acc) when is_atom(K); is_binary(K); is_integer(K) ->
+                          KeyName = get_key_name(Pfix, K),
                           Term = case rocksdb:get(DB, KeyName, []) of
                                      {ok, Bin} ->
                                          Bin;
@@ -1260,7 +1275,7 @@ do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
                           Acc#{K => Term};
                      (L, Acc) when is_list(L) ->
                           K = hd(L),
-                          KeyName = <<Pfix/binary, (atom_to_binary(K, utf8))/binary, "_">>,
+                          KeyName = <<(get_key_name(Pfix, K))/binary, "_">>,
                           Acc#{K => Rec(KeyName, L, DB)}
                   end,
                   #{},
