@@ -1260,7 +1260,7 @@ do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
     R = fun Rec(Pfix, [_Top | KT], DB) ->
                 lists:foldl(
                   fun(K, Acc) when is_atom(K); is_binary(K); is_integer(K) ->
-                          KeyName = <<(get_key_name(Pfix, K))/binary, "_">>,
+                          KeyName = get_key_name(Pfix, K),
                           Term = case rocksdb:get(DB, KeyName, []) of
                                      {ok, Bin} ->
                                          lager:info("k ~s found sz ~p", [KeyName, byte_size(Bin)]),
@@ -1272,7 +1272,7 @@ do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
                           Acc#{K => Term};
                      (L, Acc) when is_list(L) ->
                           K = hd(L),
-                          KeyName = get_key_name(Pfix, K),
+                          KeyName = <<(get_key_name(Pfix, K))/binary, "_">>,
                           Acc#{K => Rec(KeyName, L, DB)}
                   end,
                   #{},
