@@ -913,10 +913,12 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
             rocksdb:transaction_commit(Txn),
             {SerState, ModState, KT};
         not_found ->
+            lager:info("loading via key tree"),
             {SerState, ModState, KeyTree} =
                 case rocksdb:get(DB, ?stored_key_tree, []) of
                     {ok, KeyTreeBin} ->
                         KT = binary_to_term(KeyTreeBin),
+                        lager:info("disk key tree ~p", [KT]),
                         do_deserialize(Module, ModuleState0, ?stored_key_prefix, KT, DB);
                     not_found ->
                         {undefined, ModuleState0, bin}
