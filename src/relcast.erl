@@ -1174,8 +1174,12 @@ maybe_serialize(#state{module_state = New0,
     New = Mod:serialize(New0),
     _KeyTree = do_serialize(Mod, Old, New, ?stored_key_prefix, Transaction),
     KeyTree = get_key_tree(Mod, New),
-    ok = rocksdb:transaction_put(Transaction, ?stored_key_tree,
-                                 term_to_binary(KeyTree, [compressed])),
+    case KeyTree of
+        bin -> ok;
+        _ ->
+            ok = rocksdb:transaction_put(Transaction, ?stored_key_tree,
+                                         term_to_binary(KeyTree, [compressed]))
+    end,
     S#state{old_serialized = New, old_module_state = New0, transaction_dirty = true}.
 
 old_size(M) when is_map(M) ->
