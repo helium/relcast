@@ -1257,7 +1257,7 @@ do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
     R = fun Rec(Pfix, [_Top | KT], DB) ->
                 lists:foldl(
                   fun(K, Acc) when is_atom(K); is_binary(K); is_integer(K) ->
-                          KeyName = get_key_name(Pfix, K),
+                          KeyName = <<(get_key_name(Pfix, K))/binary, "_">>,
                           Term = case rocksdb:get(DB, KeyName, []) of
                                      {ok, Bin} ->
                                          Bin;
