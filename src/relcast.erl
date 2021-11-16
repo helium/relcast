@@ -1263,8 +1263,10 @@ do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
                           KeyName = get_key_name(Pfix, K),
                           Term = case rocksdb:get(DB, KeyName, []) of
                                      {ok, Bin} ->
+                                         lager:info("k ~s found sz ~p", [KeyName, byte_size(Bin)]),
                                          Bin;
                                      not_found ->
+                                         lager:info("k ~s not found", [KeyName]),
                                          undefined
                                  end,
                           Acc#{K => Term};
