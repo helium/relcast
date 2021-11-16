@@ -936,10 +936,10 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
                 %% new tree, write the structure to disk
                 KeyTreeNew ->
                     %% lager:info("writing initial struct to disk"),
-                    ok = rocksdb:put(DB, ?stored_key_tree,
-                                     term_to_binary(KeyTreeNew, [compressed]), [{sync, true}]),
                     %% force disk sync on first startup, don't wait for messages
                     {ok, Txn} = transaction(DB, WriteOpts),
+                    ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
+                                     term_to_binary(KeyTreeNew, [compressed])),
                     _KeyTree = do_serialize(Module, undefined, NewSer, ?stored_key_prefix, Txn),
                     rocksdb:transaction_commit(Txn),
                     {NewSer, ModState, KeyTreeNew}
