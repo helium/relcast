@@ -900,11 +900,12 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
             {SerState, ModState, _} = rehydrate(Module, SerializedModuleState, ModuleState0),
             {ok, Txn} = transaction(DB, WriteOpts),
             New = Module:serialize(ModState),
+            KeyTree = get_key_tree(Module, New),
             KT =
                 case do_serialize(Module, undefined, New, ?stored_key_prefix, Txn) of
                     bin ->
                         bin;
-                    KeyTree ->
+                    _KeyTree ->
                         ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
                                                      term_to_binary(KeyTree, [compressed])),
                         ok = rocksdb:transaction_delete(Txn, ?stored_module_state),
