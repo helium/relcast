@@ -112,6 +112,7 @@
 -record(state,
          {
           db :: rocksdb:db_handle(),
+          dir :: binary(),
           module :: atom(),
           module_state :: any(),
           old_module_state :: any(),
@@ -238,11 +239,12 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                                 end,
             case Module:init(Arguments) of
                 {ok, ModuleState0} ->
-                    {OldSer, ModuleState, KeyTree} = get_mod_state(DB, Module, ModuleState0, WriteOpts),
+                    {OldSer, ModuleState, KeyTree} = get_mod_state(DB, Module, ModuleState0, WriteOpts, Create),
                     LastKeyIn = get_last_key_in(DB, InboundCF),
                     LastKeyOut = get_last_key_out(DB, ActiveCF),
                     BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
                     State = #state{module = Module,
+                                   dir = DataDir,
                                    id = ActorID,
                                    inbound_cf = InboundCF,
                                    active_cf = ActiveCF,
@@ -625,14 +627,15 @@ process_inbound(State, Tries) ->
 
 %% @doc Stop the relcast instance.
 -spec stop(any(), relcast_state()) -> ok.
-stop(lite, State = #state{module=Module, module_state=ModuleState})->
-    case erlang:function_exported(Module, terminate, 2) of
-        true ->
-            Module:terminate(normal, ModuleState);
-        false ->
-            ok
-    end,
-    rocksdb:close(State#state.db);
+%% stop(lite, State = #state{module=Module, module_state=ModuleState})->
+%%     case erlang:function_exported(Module, terminate, 2) of
+%%         true ->
+%%             Module:terminate(normal, ModuleState);
+%%         false ->
+%%             ok
+%%     end,
+%%     rocksdb:flush(State#state.db, [{wait, true}, {allow_write_stall, true}]),
+%%     rocksdb:close(State#state.db);
 stop(Reason, State = #state{module=Module, module_state=ModuleState})->
     case erlang:function_exported(Module, terminate, 2) of
         true ->
@@ -642,7 +645,17 @@ stop(Reason, State = #state{module=Module, module_state=ModuleState})->
     end,
     State1 = maybe_serialize(State),
     catch rocksdb:transaction_commit(State1#state.transaction),
+    lager:info("ZZZZ stopping for ~p", [Reason]),
+    rocksdb:flush(State#state.db, [{wait, true}, {allow_write_stall, true}]),
     rocksdb:close(State#state.db).
+%%     check_stop(State#state.dir).
+
+%% check_stop(Dir) ->
+%%     Stop = Dir ++ "/check_stop",
+%%     ok = file:write_file(Stop, <<"check stop">>, [sync]),
+%%     ok = file:delete(Stop),
+%%     lager:info("stoppppp"),
+%%     ok.
 
 %% @doc Get a representation of the relcast's module state, inbound queue and
 %% outbound queue.
@@ -894,7 +907,7 @@ round_to_nearest_byte(Bits) ->
             Bits + (8 - Extra)
     end.
 
-get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
+get_mod_state(DB, Module, ModuleState0, WriteOpts, Create) ->
     case rocksdb:get(DB, ?stored_module_state, []) of
         {ok, SerializedModuleState} ->
             {SerState, ModState, _} = rehydrate(Module, SerializedModuleState, ModuleState0),
@@ -919,7 +932,7 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
                     {ok, KeyTreeBin} ->
                         KT = binary_to_term(KeyTreeBin),
                         do_deserialize(Module, ModuleState0, ?stored_key_prefix, KT, DB);
-                    not_found ->
+                    not_found when Create ->
                         {undefined, ModuleState0, bin}
                 end,
             NewSer = Module:serialize(ModState),
