@@ -640,8 +640,8 @@ stop(Reason, State = #state{module=Module, module_state=ModuleState})->
         false ->
             ok
     end,
-    State1 = maybe_serialize(State),
-    catch rocksdb:transaction_commit(State1#state.transaction),
+    %% State1 = maybe_serialize(State),
+    %% catch rocksdb:transaction_commit(State1#state.transaction),
     rocksdb:close(State#state.db).
 
 %% @doc Get a representation of the relcast's module state, inbound queue and
@@ -782,6 +782,10 @@ handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module
 %% write all resulting messages and keys in an atomic transaction
 handle_actions([], _Transaction, State) ->
     {ok, State};
+handle_actions([commit|Tail], _Transaction, State) ->
+    State1 = maybe_commit(force, State),
+    {ok, Transaction1} = transaction(State#state.db, State#state.write_opts),
+    handle_actions(Tail, Transaction1, State1);
 handle_actions([new_epoch|Tail], Transaction, State) ->
     ok = rocksdb:transaction_commit(Transaction),
     {ok, NewCF} = rocksdb:create_column_family(State#state.db, make_column_family_name(State#state.epoch + 1),
