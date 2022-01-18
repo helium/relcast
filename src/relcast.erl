@@ -1012,16 +1012,16 @@ find_next_outbound_(_ActorId, _, Iter, _State, 0, Acc) when Acc /= [] ->
     lists:reverse(Acc);
 find_next_outbound_(_ActorId, {error, _}, Iter, State, _, Acc) ->
     %% try to return the *highest* key we saw, so we can try starting here next time
-    case Acc of
+    Res = case Acc of
         [] ->
-            Res = case rocksdb:iterator_move(Iter, prev) of
-                      {ok, Key, _} ->
-                          {not_found, Key, State#state.active_cf};
-                      _ ->
-                          not_found
-                  end;
+            case rocksdb:iterator_move(Iter, prev) of
+               {ok, Key, _} ->
+                  {not_found, Key, State#state.active_cf};
+               _ ->
+                  not_found
+            end;
         _ ->
-            Res = lists:reverse(Acc)
+            lists:reverse(Acc)
     end,
     rocksdb:iterator_close(Iter),
     Res;
