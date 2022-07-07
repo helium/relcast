@@ -1227,9 +1227,16 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                           case is_map(V) of
                               true ->
                                   do_serialize(K, fixup_old_map(OV), V, <<KeyName/binary, "_">>, Transaction);
-                              false ->
-                                  %% lager:info("writing ~p to disk", [K]),
+                              false when is_binary(V) ->
                                   ok = rocksdb:transaction_put(Transaction, KeyName, V),
+                                  K;
+                              false ->
+                                  %% some other term, try to term to binary as close to the edge
+                                  %% as possible to avoid the relcast modules
+                                  %% creating large binaries that have to be compared byte by byte
+                                  Encoded = term_to_binary(V, [compressed]),
+                                  %% store it tagged so we know to b2t it on deserialize
+                                  ok = rocksdb:transaction_put(Transaction, KeyName, <<"relcast-", Encoded/binary>>),
                                   K
                           end
                   end,
@@ -1267,6 +1274,8 @@ do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
                   fun(K, Acc) when is_atom(K); is_binary(K); is_integer(K) ->
                           KeyName = get_key_name(Pfix, K),
                           Term = case rocksdb:get(DB, KeyName, []) of
+                                     {ok, <<"relcast-", Encoded/binary>>} ->
+                                         binary_to_term(Encoded);
                                      {ok, Bin} ->
                                          Bin;
                                      not_found ->
