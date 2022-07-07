@@ -1224,7 +1224,7 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                           K;
                      ({{K, V}, {_, OV}}) ->
                           KeyName = get_key_name(Prefix, K),
-                          case is_map(V) of
+                          case is_keytree_map(V) of
                               true ->
                                   do_serialize(K, fixup_old_map(OV), V, <<KeyName/binary, "_">>, Transaction);
                               false when is_binary(V) ->
@@ -1243,6 +1243,11 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                   L),
             [Mod | KeyTree]
     end.
+
+is_keytree_map(M) when is_map(M) ->
+    lists:all(fun is_atom/1, maps:keys(M));
+is_keytree_map(_M) ->
+    false.
 
 get_key_name(Prefix, K) when is_atom(K) ->
     <<Prefix/binary, (atom_to_binary(K, utf8))/binary>>;
