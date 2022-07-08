@@ -1245,7 +1245,7 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
     end.
 
 is_keytree_map(M) when is_map(M) ->
-    lists:all(fun is_atom/1, maps:keys(M));
+    lists:all(fun(E) -> is_atom(E) orelse is_integer(E) orelse is_binary(E) end, maps:keys(M));
 is_keytree_map(_M) ->
     false.
 
