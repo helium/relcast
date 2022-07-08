@@ -1261,7 +1261,12 @@ get_key_tree(_, B) when is_binary(B) ->
 get_key_tree(Mod, Map) ->
     KT = lists:map(
            fun({K, V}) when is_map(V)->
-                   get_key_tree(K, V);
+                   case is_keytree_map(V) of
+                       true ->
+                           get_key_tree(K, V);
+                       false ->
+                           K
+                   end;
               ({K, _V}) ->
                    K
            end,
