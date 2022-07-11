@@ -907,7 +907,7 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
                         bin;
                     _KeyTree ->
                         ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
-                                                     term_to_binary(KeyTree, [compressed])),
+                                                     term_to_binary(KeyTree, t2b_opts())),
                         ok = rocksdb:transaction_delete(Txn, ?stored_module_state),
                         KeyTree
                 end,
@@ -939,7 +939,7 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
                     %% force disk sync on first startup, don't wait for messages
                     {ok, Txn} = transaction(DB, WriteOpts),
                     ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
-                                     term_to_binary(KeyTreeNew, [compressed])),
+                                     term_to_binary(KeyTreeNew, t2b_opts())),
                     _KeyTree = do_serialize(Module, undefined, NewSer, ?stored_key_prefix, Txn),
                     rocksdb:transaction_commit(Txn),
                     {NewSer, ModState, KeyTreeNew}
@@ -1178,7 +1178,7 @@ maybe_serialize(#state{module_state = New0,
         bin -> ok;
         _ ->
             ok = rocksdb:transaction_put(Transaction, ?stored_key_tree,
-                                         term_to_binary(KeyTree, [compressed]))
+                                         term_to_binary(KeyTree, t2b_opts()))
     end,
     S#state{old_serialized = New, old_module_state = New0, transaction_dirty = true}.
 
@@ -1224,18 +1224,30 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                           K;
                      ({{K, V}, {_, OV}}) ->
                           KeyName = get_key_name(Prefix, K),
-                          case is_map(V) of
+                          case is_keytree_map(V) of
                               true ->
                                   do_serialize(K, fixup_old_map(OV), V, <<KeyName/binary, "_">>, Transaction);
-                              false ->
-                                  %% lager:info("writing ~p to disk", [K]),
+                              false when is_binary(V) ->
                                   ok = rocksdb:transaction_put(Transaction, KeyName, V),
+                                  K;
+                              false ->
+                                  %% some other term, try to term to binary as close to the edge
+                                  %% as possible to avoid the relcast modules
+                                  %% creating large binaries that have to be compared byte by byte
+                                  Encoded = term_to_binary(V, t2b_opts()),
+                                  %% store it tagged so we know to b2t it on deserialize
+                                  ok = rocksdb:transaction_put(Transaction, KeyName, <<"relcast-", Encoded/binary>>),
                                   K
                           end
                   end,
                   L),
             [Mod | KeyTree]
     end.
+
+is_keytree_map(M) when is_map(M) ->
+    lists:all(fun(E) -> is_atom(E) orelse is_integer(E) orelse is_binary(E) end, maps:keys(M));
+is_keytree_map(_M) ->
+    false.
 
 get_key_name(Prefix, K) when is_atom(K) ->
     <<Prefix/binary, (atom_to_binary(K, utf8))/binary>>;
@@ -1249,7 +1261,12 @@ get_key_tree(_, B) when is_binary(B) ->
 get_key_tree(Mod, Map) ->
     KT = lists:map(
            fun({K, V}) when is_map(V)->
-                   get_key_tree(K, V);
+                   case is_keytree_map(V) of
+                       true ->
+                           get_key_tree(K, V);
+                       false ->
+                           K
+                   end;
               ({K, _V}) ->
                    K
            end,
@@ -1267,6 +1284,8 @@ do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
                   fun(K, Acc) when is_atom(K); is_binary(K); is_integer(K) ->
                           KeyName = get_key_name(Pfix, K),
                           Term = case rocksdb:get(DB, KeyName, []) of
+                                     {ok, <<"relcast-", Encoded/binary>>} ->
+                                         binary_to_term(Encoded);
                                      {ok, Bin} ->
                                          Bin;
                                      not_found ->
@@ -1359,6 +1378,14 @@ get_acks(Keys, #state{floated_acks = Acks, outbound_keys = OutKeys} = S) ->
             {none, S}
     end.
 
+t2b_opts() ->
+    case application:get_env(relcast, compression_level, 1) of
+        N when is_integer(N) andalso N /= 0 ->
+            [{compressed, N}];
+        _ ->
+            []
+    end.
+
 -ifdef(TEST).
 
 -include_lib("eunit/include/eunit.hrl").
@@ -1383,5 +1410,4 @@ seq_rollover_test() ->
     {Seq1, State1} = make_seq(1, State),
     {Seq2, _State2} = make_seq(1, State1),
     ?assert(Seq1 > Seq2).
-
 -endif.

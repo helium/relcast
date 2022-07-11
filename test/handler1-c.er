@@ -63,6 +63,7 @@ serialize(#state{a = A,
           f => F,
           g => G},
     maps:map(fun(d, V) -> V;
+                (g, V) -> V;
                 (_K, V) -> term_to_binary(V) end, M).
 
 ser_d(#dstate{a = A,
@@ -89,6 +90,7 @@ deserialize(B) when is_binary(B) ->
 deserialize(M) ->
     cthr:pal("Deserialize c map: ~p~n", [M]),
     M1 = maps:map(fun(d, V) -> deser_d(V);
+                     (g, V) when not is_binary(V) -> V;
                      (_K, V) -> binary_to_term(V) end, M),
     case M1 of
         #{a := A,
