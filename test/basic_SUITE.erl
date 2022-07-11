@@ -22,7 +22,8 @@
          self_callback_message/1,
          pipeline/1,
          write_reduction/1,
-         state_split/1
+         state_split/1,
+         perf/1
         ]).
 
 all() ->
@@ -572,7 +573,6 @@ state_split(_Config) ->
 
     ok.
 
-
 write_reduction(_Config) ->
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data12"}]),
@@ -596,6 +596,31 @@ write_reduction(_Config) ->
          end
          || CF <- [get_active(RCF), get_inbound(RCF)]],
     ?assertEqual(ok, Stats),
+    ok.
+
+perf(_Config) ->
+    Actors = lists:seq(1, 2),
+
+    {ok, RC1} = relcast:start(1, Actors, perf_handler, [1], [{create, true}, {data_dir, "data13"}]),
+    {ok, RC2} = relcast:command({store, crypto:strong_rand_bytes(20 *1024 *1024)}, RC1),
+
+    %% emulate a ping-pong message/ack pattern and time how long stores take
+    {USecTime, RC3} =
+        timer:tc(
+          fun() ->
+                  lists:foldl(
+                    fun(_, R) ->
+                            {ok, R2} = relcast:deliver(1, <<"ping">>, 2, R),
+                            {ok, Ref, _, _, R3} = relcast:take(2, R2),
+                            {ok, R5} = relcast:ack(2, Ref, R3),
+                            R5
+                    end,
+                    RC2,
+                    lists:seq(1, 1000))
+          end),
+    ct:pal("took ~p ms", [USecTime div 1000]),
+    relcast:stop(normal, RC3),
+    error(print),
     ok.
 
 get_active(S) ->
