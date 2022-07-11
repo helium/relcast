@@ -907,7 +907,7 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
                         bin;
                     _KeyTree ->
                         ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
-                                                     term_to_binary(KeyTree, [compressed])),
+                                                     term_to_binary(KeyTree, t2b_opts())),
                         ok = rocksdb:transaction_delete(Txn, ?stored_module_state),
                         KeyTree
                 end,
@@ -939,7 +939,7 @@ get_mod_state(DB, Module, ModuleState0, WriteOpts) ->
                     %% force disk sync on first startup, don't wait for messages
                     {ok, Txn} = transaction(DB, WriteOpts),
                     ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
-                                     term_to_binary(KeyTreeNew, [compressed])),
+                                     term_to_binary(KeyTreeNew, t2b_opts())),
                     _KeyTree = do_serialize(Module, undefined, NewSer, ?stored_key_prefix, Txn),
                     rocksdb:transaction_commit(Txn),
                     {NewSer, ModState, KeyTreeNew}
@@ -1178,7 +1178,7 @@ maybe_serialize(#state{module_state = New0,
         bin -> ok;
         _ ->
             ok = rocksdb:transaction_put(Transaction, ?stored_key_tree,
-                                         term_to_binary(KeyTree, [compressed]))
+                                         term_to_binary(KeyTree, t2b_opts()))
     end,
     S#state{old_serialized = New, old_module_state = New0, transaction_dirty = true}.
 
@@ -1234,7 +1234,7 @@ do_serialize(Mod, Old, New, Prefix, Transaction) ->
                                   %% some other term, try to term to binary as close to the edge
                                   %% as possible to avoid the relcast modules
                                   %% creating large binaries that have to be compared byte by byte
-                                  Encoded = term_to_binary(V, [compressed]),
+                                  Encoded = term_to_binary(V, t2b_opts()),
                                   %% store it tagged so we know to b2t it on deserialize
                                   ok = rocksdb:transaction_put(Transaction, KeyName, <<"relcast-", Encoded/binary>>),
                                   K
@@ -1378,6 +1378,14 @@ get_acks(Keys, #state{floated_acks = Acks, outbound_keys = OutKeys} = S) ->
             {none, S}
     end.
 
+t2b_opts() ->
+    case application:get_env(relcast, compression_level, 1) of
+        N when is_integer(N) andalso N /= 0 ->
+            [{compressed, N}];
+        _ ->
+            []
+    end.
+
 -ifdef(TEST).
 
 -include_lib("eunit/include/eunit.hrl").
@@ -1402,5 +1410,4 @@ seq_rollover_test() ->
     {Seq1, State1} = make_seq(1, State),
     {Seq2, _State2} = make_seq(1, State1),
     ?assert(Seq1 > Seq2).
-
 -endif.
