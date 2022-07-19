@@ -3,7 +3,7 @@
  {<<"lager">>,{pkg,<<"lager">>,<<"3.6.7">>},0},
  {<<"rocksdb">>,
   {git,"https://gitlab.com/vagabond1/erlang-rocksdb",
-       {ref,"e391336db73ca3644050b308d20071fb79667022"}},
+       {ref,"e8a9a3907a2ecab225122b1cd7c7cb7973a14aee"}},
   0}]}.
 [
 {pkg_hash,[
