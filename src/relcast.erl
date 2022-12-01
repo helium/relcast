@@ -1103,7 +1103,7 @@ build_outbound_status({ok, <<"o", _/binary>>, <<1:2/integer, ActorID:14/integer,
                       Iter, BFS, OutboundQueue) ->
     %% unicast message
     build_outbound_status(rocksdb:iterator_move(Iter, next), Iter, BFS, prepend_message([ActorID], Value, OutboundQueue));
-build_outbound_status({ok, <<"o", _/binary>>, <<0:2/integer, Tail/bits>>}, Iter, BFS, OutboundQueue) ->
+build_outbound_status({ok, <<"o", _/binary>>, <<I:2/integer, Tail/bits>>}, Iter, BFS, OutboundQueue) when I == 0; I == 2 ->
     <<ActorMask:BFS/bits, Value/binary>> = Tail,
     ActorIDs = actor_list(ActorMask, 1, []),
     build_outbound_status(rocksdb:iterator_move(Iter, next), Iter, BFS, prepend_message(ActorIDs, Value, OutboundQueue));
